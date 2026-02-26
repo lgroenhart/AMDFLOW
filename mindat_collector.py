@@ -60,7 +60,7 @@ def main(region, material_id = 3314, mineral_strings = "(Fe|S)", material_name =
     return
 
 if __name__ == "__main__":
-    main(region = "Portugal")
+    main(region = "Spain")
         
 
     
