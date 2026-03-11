@@ -5,16 +5,16 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 from scipy.spatial import cKDTree
+from tqdm import tqdm
 
 
 class AMDModel:
 
-    def __init__(self, dataset, t_unit, do = 10, h_plus = 1e-7):
+    def __init__(self, dataset, t_unit, do = 0.2500094):
         self.dataset = dataset.copy(deep=True)
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
         self.do = do
-        self.h_plus = h_plus
 
         self.dataset = self.dataset.assign(ferrous_iron=xr.full_like(self.dataset.Q, 0))
         self.dataset = self.dataset.assign(ferric_iron=xr.full_like(self.dataset.Q, 0))
@@ -33,7 +33,11 @@ class AMDModel:
             self.dataset[var_name].attrs = attrs
 
         self.dataset = self.dataset.set_coords("ID")
-        self.time_step_seconds = {"month": 2628000, "week" : 604800}[self.t_unit]
+        self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400}[self.t_unit]
+
+        # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre
+        volume = self.dataset["Q"] * self.time_step_seconds * 1000  # L per timestep as m3/s * seconds per timestep * 1000
+        self.dataset["hydrogen_ion"] = 1e-7 * volume
 
     def run(self):
 
@@ -47,9 +51,7 @@ class AMDModel:
         most_upstream_reactive_ores = self.dataset.where(mask, drop = True)
 
         # start timestep t
-        for ti, t in enumerate(self.time_steps.values):
-            print(f"Start timestep: {ti + 1} of {len(self.time_steps.values)}")
-
+        for ti, t in tqdm(enumerate(self.dataset.time.values)):
             # add mass from previous timestep to current timestep
             if ti > 0:
                 prev_t = self.time_steps.values[ti - 1]
@@ -123,8 +125,8 @@ class AMDModel:
     def process_slice(self, current_slice):
 
         k = 10**-8.19
-        do_term = self.do * 0.5
-        h_background = self.h_plus
+        do_term = self.do ** 0.5
+        
 
        
         # 1) pyrite oxidation by ferric iron 
@@ -133,14 +135,14 @@ class AMDModel:
 
         ferric_consumed = xr.where(
             mask_ferric,
-            current_slice["ferric_iron"] * 1.07,
+            current_slice["ferric_iron"],
             0
         )
 
-        ferrous_produced = ferric_consumed
+        ferrous_produced = ferric_consumed * 1.07
         hydrogen_produced = xr.where(
             mask_ferric,
-            current_slice["ferric_iron"] * 1.14,
+            ferric_consumed * 1.14,
             0
         )
 
@@ -151,13 +153,19 @@ class AMDModel:
         )
 
         # 2) rate-limited pyrite oxidation 
-        effective_h = xr.where(
-            (current_slice["hydrogen_ion"] <= 0) | current_slice["hydrogen_ion"].isnull(),
-            h_background,
-            current_slice["hydrogen_ion"]
+        h_conc = xr.where(
+            current_slice["Q"] * self.time_step_seconds * 1000 > 0,
+            current_slice["hydrogen_ion"] / (current_slice["Q"] * self.time_step_seconds * 1000) ,
+            1e-7                     
         )
 
-        rate = k * do_term / (effective_h ** 0.01)
+        h_safe = xr.where(
+            (h_conc <= 0) | h_conc.isnull(),
+            1e-7,                
+            h_conc
+        )
+
+        rate = k * (do_term) / (h_safe ** 0.11)
 
         reaction_amount = xr.where(
             mask_rate,
@@ -188,6 +196,7 @@ class AMDModel:
         # 4) ferric <> iron III hydroxide equilibrium
         ferric = current_slice["ferric_iron"]
         hydroxide = current_slice["iron_III_hydroxide"]
+        hydrogen_ion = current_slice["hydrogen_ion"]
 
         diff = ferric - hydroxide
         adjustment = 0.5 * diff
@@ -195,6 +204,7 @@ class AMDModel:
         current_slice = current_slice.assign(
             ferric_iron=ferric - adjustment,
             iron_III_hydroxide=hydroxide + adjustment,
+            hydrogen_ion = hydrogen_ion + (adjustment * 3)
         )
 
 
