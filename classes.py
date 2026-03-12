@@ -6,6 +6,7 @@ import xarray as xr
 import pandas as pd
 from scipy.spatial import cKDTree
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 
 class AMDModel:
@@ -16,11 +17,8 @@ class AMDModel:
         self.time_steps = self.dataset["time"]
         self.do = do
 
-        self.dataset = self.dataset.assign(ferrous_iron=xr.full_like(self.dataset.Q, 0))
-        self.dataset = self.dataset.assign(ferric_iron=xr.full_like(self.dataset.Q, 0))
-        self.dataset = self.dataset.assign(sulphate=xr.full_like(self.dataset.Q, 0))
-        self.dataset = self.dataset.assign(hydrogen_ion=xr.full_like(self.dataset.Q, 0))
-        self.dataset = self.dataset.assign(iron_III_hydroxide=xr.full_like(self.dataset.Q, 0))
+        for var in ["ferrous_iron", "ferric_iron", "sulphate", "hydrogen_ion", "iron_III_hydroxide"]:
+            self.dataset[var] = xr.full_like(self.dataset["Q"], 0, dtype=float)
 
         attrs_dict = {
         "ferrous_iron": {"units": "mol/timestep", "description": "Fe²⁺"},
@@ -35,9 +33,10 @@ class AMDModel:
         self.dataset = self.dataset.set_coords("ID")
         self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400}[self.t_unit]
 
-        # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre
-        volume = self.dataset["Q"] * self.time_step_seconds * 1000  # L per timestep as m3/s * seconds per timestep * 1000
-        self.dataset["hydrogen_ion"] = 1e-7 * volume
+        # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
+        self.dataset["volume"] = self.dataset["Q"] * self.time_step_seconds * 1000  # L per timestep
+        first_time = self.time_steps.values[0]
+        self.dataset["hydrogen_ion"].loc[dict(time=first_time)] = 1e-7 * self.dataset["volume"].sel(time=first_time)
 
     def run(self):
 
@@ -76,7 +75,6 @@ class AMDModel:
             # check for water > 0
             mask = current_slice["Q"] > 0
             current_slice = current_slice.where(mask, drop=True)
-
             current_slice = self.process_slice(current_slice)
 
             # safety checks
@@ -87,7 +85,7 @@ class AMDModel:
                 current_slice = current_slice.set_coords(["lon", "lat"])
 
             self.update_dataset(t, current_slice)
-           # transport only the processed cells
+        #    transport only the processed cells
             if ti < len(self.time_steps) - 1:
                 self.transport(t, current_slice)
 
@@ -123,15 +121,9 @@ class AMDModel:
             # -----------------------------------------------------------------------------------------------
 
     def process_slice(self, current_slice):
-
-        k = 10**-8.19
-        do_term = self.do ** 0.5
-        
-
-       
-        # 1) pyrite oxidation by ferric iron 
+        # # 1) pyrite oxidation by ferric iron 
         mask_ferric = (current_slice["ferric_iron"] > 0) & (current_slice["ore"] > 0)
-        mask_rate = (current_slice["ore"] > 0) & (~mask_ferric)
+        
 
         ferric_consumed = xr.where(
             mask_ferric,
@@ -153,11 +145,10 @@ class AMDModel:
         )
 
         # 2) rate-limited pyrite oxidation 
-        h_conc = xr.where(
-            current_slice["Q"] * self.time_step_seconds * 1000 > 0,
-            current_slice["hydrogen_ion"] / (current_slice["Q"] * self.time_step_seconds * 1000) ,
-            1e-7                     
-        )
+        k = 10**-8.19
+        
+        mask_rate = (current_slice["ore"] > 0) & (~mask_ferric)
+        h_conc = current_slice["hydrogen_ion"] / current_slice["volume"]
 
         h_safe = xr.where(
             (h_conc <= 0) | h_conc.isnull(),
@@ -165,12 +156,13 @@ class AMDModel:
             h_conc
         )
 
-        rate = k * (do_term) / (h_safe ** 0.11)
+
+        rate = k * ((self.do ** 0.5) / (h_safe ** 0.11))
 
         reaction_amount = xr.where(
             mask_rate,
             rate * current_slice["ore"] * self.time_step_seconds,
-            0
+            0.0
         )
 
         current_slice = current_slice.assign(
@@ -181,7 +173,7 @@ class AMDModel:
 
 
 
-        # 3) ferrous to ferric oxidation
+        # # 3) ferrous to ferric oxidation
         ferrous_available = current_slice["ferrous_iron"]
         current_slice = current_slice.assign(
             ferric_iron=current_slice["ferric_iron"] + ferrous_available,
@@ -193,7 +185,7 @@ class AMDModel:
         current_slice["hydrogen_ion"] = current_slice["hydrogen_ion"].clip(min=0)
 
         
-        # 4) ferric <> iron III hydroxide equilibrium
+        # # 4) ferric <> iron III hydroxide equilibrium
         ferric = current_slice["ferric_iron"]
         hydroxide = current_slice["iron_III_hydroxide"]
         hydrogen_ion = current_slice["hydrogen_ion"]
@@ -214,6 +206,7 @@ class AMDModel:
                     "sulphate", "iron_III_hydroxide"]:
             current_slice[var] = current_slice[var].fillna(0)
             current_slice[var] = current_slice[var].clip(min=0)
+
 
         return current_slice
 
@@ -387,6 +380,10 @@ class AMDModel:
     
     def output_calc(self):
 
+        # safety check to make sure calculations are not run twice
+        if self.dataset["ferric_iron"].attrs["units"] == "g/L":
+            print("Output calculations already run, skipped to ensure calculations are not run twice")
+        
         # average molar mass per mole dict
         molar_masses = {
             "ferrous_iron": 55.845,

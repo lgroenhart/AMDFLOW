@@ -262,8 +262,17 @@ def cleanup_and_metadata(ds):
 
 def add_time(ds, year, length, frequency):
     date_range = pd.date_range(f"{year}-01-01", periods = length, freq = frequency)
-    ds = ds.expand_dims(time = date_range)
+    # Rename before expanding to avoid issues
     ds = ds.rename({"qav": "Q"})
+    # Expand Q with the time dimension
+    ds["Q"] = ds["Q"].expand_dims(time=date_range)
+    ds = ds.set_coords('time')
+    
+    # Broadcast all other variables to match Q's dimensions and coordinates
+    for var in ds.data_vars:
+        if var != "Q":
+            ds[var] = ds[var].broadcast_like(ds["Q"])
+    
     ds["Q"].attrs = {"units": "m3/s", "description": "Average annual streamflow divided by length of time within year (e.g.: 12 for months)"}
     ds["Q"] = ds["Q"] / length
     return ds
