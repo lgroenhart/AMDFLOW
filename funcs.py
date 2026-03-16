@@ -281,7 +281,7 @@ def estimate_ore(ds, H, F):
     # uses ds["mines"] values, might be useful when it is filled with area, but not right now
     #ds["ore"] = ds["mines"].where(ds["mines"].notnull(), 0) * (H * ((4 * 1000) / 4) * F * 27)
 
-    constant = H * ((4 * 1000) / 4) * F * 27
+    constant = H * 1000 * F * 27
     ds["ore"] = xr.where(ds["mines"].notnull(), constant, np.nan)
     ds["ore"].attrs = {"description": "Estimation of reactive ore per cell", "unit": "m2",}
     ds = ds.drop_vars(["mines"])
