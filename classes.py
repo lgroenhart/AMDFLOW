@@ -17,6 +17,9 @@ class AMDModel:
         self.time_steps = self.dataset["time"]
         self.do = do
         self.transport_operator = transport_operator
+        self.tree = None
+        self.target_lon_idx = None
+        self.target_lat_idx = None
 
         for var in ["ferrous_iron", "ferric_iron", "sulphate", "hydrogen_ion", "iron_III_hydroxide"]:
             self.dataset[var] = xr.full_like(self.dataset["Q"], 0, dtype=float)
@@ -39,6 +42,8 @@ class AMDModel:
         # first_time = self.time_steps.values[0]
         # self.dataset["hydrogen_ion"].loc[dict(time=first_time)] = 1e-7 * self.dataset["volume"].sel(time=first_time)
         
+        self.build_tree()
+
     def run(self):
 
         # get only cells where reactive ores are present
@@ -235,9 +240,6 @@ class AMDModel:
 
         return current_slice
 
-
-
-
     def update_dataset(self, t, current_slice):
         """Update main dataset using vectorised scatter operation."""
         key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion",
@@ -259,28 +261,14 @@ class AMDModel:
         src_lat = stacked["lat"].values
         src_points = np.column_stack([src_lon, src_lat])
 
-        # Target grid (all lon/lat points of the main dataset)
-        target_lon = self.dataset.lon.values
-        target_lat = self.dataset.lat.values
-        
-        n_lon = len(target_lon)
-        n_lat = len(target_lat)
-        
-        # Create a grid of target points
-        # Use sparse=False to get full meshgrid, and ravel in 'C' order
-        lon_grid, lat_grid = np.meshgrid(target_lon, target_lat, indexing='xy', sparse=False)
-        target_points = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
-
-        # Build KD‑Tree of target points
-        tree = cKDTree(target_points)
 
         # For each source point, find the nearest target grid cell (index)
-        distances, target_indices_flat = tree.query(src_points, k=1)  # shape (n_cells,)
+        distances, target_indices_flat = self.tree.query(src_points, k=1)  # shape (n_cells,)
 
         # Convert flat indices to 2D (lat, lon) indices
         # Since ravel order is (lon varies fastest), the conversion is:
-        target_lon_idx = target_indices_flat % n_lon
-        target_lat_idx = target_indices_flat // n_lon
+        target_lon_idx = target_indices_flat % self.n_lon
+        target_lat_idx = target_indices_flat // self.n_lon
 
         # Process each variable
         for var in key_vars:
@@ -302,7 +290,7 @@ class AMDModel:
             valid_src_vals = src_vals[valid_indices]
 
             # Create unique cell IDs and keep last occurrence
-            cell_ids = valid_target_lat_idx * n_lon + valid_target_lon_idx
+            cell_ids = valid_target_lat_idx * self.n_lon + valid_target_lon_idx
             _, unique_idx = np.unique(cell_ids[::-1], return_index=True)
             unique_idx = len(cell_ids) - 1 - unique_idx
 
@@ -478,4 +466,17 @@ class AMDModel:
             self.dataset["pH"].attrs = {"units": "pH", "description": "pH value"}
             self.dataset["hydrogen_ion"] = h_conc
             self.dataset["hydrogen_ion"].attrs["units"] = "mol/L"
+    
+    def build_tree(self):
+
+        target_lon = self.dataset.lon.values
+        target_lat = self.dataset.lat.values
+        lon_grid, lat_grid = np.meshgrid(target_lon, target_lat, indexing = "xy")
+
+        target_points = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
+
+        self.tree = cKDTree(target_points)
+        self.n_lon = len(target_lon)
+
+
         
