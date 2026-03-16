@@ -11,11 +11,12 @@ import matplotlib.pyplot as plt
 
 class AMDModel:
 
-    def __init__(self, dataset, t_unit, do = 0.2500094):
+    def __init__(self, dataset, t_unit, do = 0.2500094, transport_operator = 0.1):
         self.dataset = dataset.copy(deep=True)
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
         self.do = do
+        self.transport_operator = transport_operator
 
         for var in ["ferrous_iron", "ferric_iron", "sulphate", "hydrogen_ion", "iron_III_hydroxide"]:
             self.dataset[var] = xr.full_like(self.dataset["Q"], 0, dtype=float)
@@ -35,9 +36,9 @@ class AMDModel:
 
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
         self.dataset["volume"] = self.dataset["Q"] * self.time_step_seconds * 1000  # L per timestep
-        first_time = self.time_steps.values[0]
-        self.dataset["hydrogen_ion"].loc[dict(time=first_time)] = 1e-7 * self.dataset["volume"].sel(time=first_time)
-
+        # first_time = self.time_steps.values[0]
+        # self.dataset["hydrogen_ion"].loc[dict(time=first_time)] = 1e-7 * self.dataset["volume"].sel(time=first_time)
+        
     def run(self):
 
         # get only cells where reactive ores are present
@@ -75,7 +76,7 @@ class AMDModel:
             # check for water > 0
             mask = current_slice["Q"] > 0
             current_slice = current_slice.where(mask, drop=True)
-            current_slice = self.process_slice(current_slice)
+            current_slice = self.process_slice(current_slice, ti)
 
             # safety checks
             if current_slice.sizes == {}:
@@ -105,7 +106,7 @@ class AMDModel:
                 mask = current_slice["Q"] > 0
                 current_slice = current_slice.where(mask, drop=True)
 
-                current_slice = self.process_slice(current_slice)
+                current_slice = self.process_slice(current_slice, ti)
                 
                 # safety_checks
                 if current_slice.sizes == {}:
@@ -120,7 +121,17 @@ class AMDModel:
                     self.transport(t, current_slice)
             # -----------------------------------------------------------------------------------------------
 
-    def process_slice(self, current_slice):
+    def process_slice(self, current_slice, ti):
+
+        # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
+        if ti == 0: 
+            current_slice["hydrogen_ion"] = 1e-7 * current_slice["volume"]
+
+        # h2o availability as: (density * (volume (l) * 1000)) / molar mass = total mol
+        # molar mass = 18.01528(33) g/mol
+        # density = 0.99704702(83) g/ml
+        h2o = (0.99704702 * (current_slice["volume"] * 1000))  / 18.01528
+
         # # 1) pyrite oxidation by ferric iron 
         mask_ferric = (current_slice["ferric_iron"] > 0) & (current_slice["ore"] > 0)
         
@@ -131,7 +142,14 @@ class AMDModel:
             0
         )
 
-        ferrous_produced = ferric_consumed * 1.07
+        max_ferric = 1.75 * h2o
+        ferric_consumed_limited = xr.where(
+            ferric_consumed > max_ferric,
+            max_ferric,
+            ferric_consumed
+        )
+
+        ferrous_produced = ferric_consumed_limited * 1.07
         hydrogen_produced = xr.where(
             mask_ferric,
             ferric_consumed * 1.14,
@@ -139,7 +157,7 @@ class AMDModel:
         )
 
         current_slice = current_slice.assign(
-            ferric_iron=current_slice["ferric_iron"] - ferric_consumed,
+            ferric_iron=current_slice["ferric_iron"] - ferric_consumed_limited,
             ferrous_iron=current_slice["ferrous_iron"] + ferrous_produced,
             hydrogen_ion=current_slice["hydrogen_ion"] + hydrogen_produced,
         )
@@ -159,21 +177,28 @@ class AMDModel:
 
         rate = k * ((self.do ** 0.5) / (h_safe ** 0.11))
 
-        reaction_amount = xr.where(
+        ferrous_amount = xr.where(
             mask_rate,
             rate * current_slice["ore"] * self.time_step_seconds,
             0.0
         )
 
+        max_ferrous = 1 * h2o 
+        ferrous_amount_limited = xr.where(
+            ferrous_amount > max_ferrous,
+            max_ferrous,
+            ferrous_amount
+        )
+
         current_slice = current_slice.assign(
-            ferrous_iron=current_slice["ferrous_iron"] + reaction_amount,
-            sulphate=current_slice["sulphate"] + 2 * reaction_amount,
-            hydrogen_ion=current_slice["hydrogen_ion"] + 2 * reaction_amount,
+            ferrous_iron=current_slice["ferrous_iron"] + ferrous_amount_limited,
+            sulphate=current_slice["sulphate"] + 2 * ferrous_amount_limited,
+            hydrogen_ion=current_slice["hydrogen_ion"] + 2 * ferrous_amount_limited,
         )
 
 
 
-        # # 3) ferrous to ferric oxidation
+        # 3) ferrous to ferric oxidation
         ferrous_available = current_slice["ferrous_iron"]
         current_slice = current_slice.assign(
             ferric_iron=current_slice["ferric_iron"] + ferrous_available,
@@ -185,7 +210,7 @@ class AMDModel:
         current_slice["hydrogen_ion"] = current_slice["hydrogen_ion"].clip(min=0)
 
         
-        # # 4) ferric <> iron III hydroxide equilibrium
+        # 4) ferric <> iron III hydroxide equilibrium
         ferric = current_slice["ferric_iron"]
         hydroxide = current_slice["iron_III_hydroxide"]
         hydrogen_ion = current_slice["hydrogen_ion"]
@@ -303,7 +328,7 @@ class AMDModel:
                     self.dataset[var].values[idx_tuple] = val
 
     def transport(self, t, current_slice):
-        """Accumulate mass to downstream cells using vectorised operations."""
+        """Move a fraction of mass from source cells to downstream cells."""
         key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion", "sulphate"]
         next_time = self._next_time(t)
         if next_time is None:
@@ -314,63 +339,93 @@ class AMDModel:
         if source.sizes["lat"] == 0:
             return
 
-        # Convert source to DataFrame for fast groupby
-        source_df = source[key_vars + ["outID"]].to_dataframe().reset_index()
+        # Convert source to DataFrame for fast manipulation
+        source_df = source[key_vars + ["outID", "lon", "lat"]].to_dataframe().reset_index()
         source_df = source_df.dropna(subset=["outID"])
+        if source_df.empty:
+            return
 
-        # Group by outID and sum each variable
-        grouped = source_df.groupby("outID")[key_vars].sum()
+        # Compute moved amounts (fraction of current mass)
+        moved_df = source_df.copy()
+        for var in key_vars:
+            moved_df[var] = source_df[var] * self.transport_operator
+
+        # ---- Subtract moved amounts from source cells at current time t ----
+        lon_to_idx = {lon: i for i, lon in enumerate(self.dataset.lon.values)}
+        lat_to_idx = {lat: i for i, lat in enumerate(self.dataset.lat.values)}
+        time_idx_t = np.where(self.dataset.time.values == t)[0][0]
+
+        for var in key_vars:
+            lon_vals = moved_df["lon"].values
+            lat_vals = moved_df["lat"].values
+            moved_vals = moved_df[var].values
+
+            lon_idx = np.array([lon_to_idx[lon] for lon in lon_vals])
+            lat_idx = np.array([lat_to_idx[lat] for lat in lat_vals])
+
+            dims = self.dataset[var].dims
+            if dims == ('time', 'lat', 'lon'):
+                current_vals = self.dataset[var].values[time_idx_t, lat_idx, lon_idx]
+                current_vals = np.nan_to_num(current_vals, nan=0.0)
+                new_vals = np.maximum(current_vals - moved_vals, 0)
+                self.dataset[var].values[time_idx_t, lat_idx, lon_idx] = new_vals
+            elif dims == ('time', 'lon', 'lat'):
+                current_vals = self.dataset[var].values[time_idx_t, lon_idx, lat_idx]
+                current_vals = np.nan_to_num(current_vals, nan=0.0)
+                new_vals = np.maximum(current_vals - moved_vals, 0)
+                self.dataset[var].values[time_idx_t, lon_idx, lat_idx] = new_vals
+            else:
+                # Fallback loop (should not happen)
+                for i, (lat_i, lon_i, val) in enumerate(zip(lat_idx, lon_idx, moved_vals)):
+                    idx_dict = {'time': time_idx_t, 'lat': lat_i, 'lon': lon_i}
+                    idx_tuple = tuple(idx_dict.get(dim, slice(None)) for dim in dims)
+                    current_val = self.dataset[var].values[idx_tuple]
+                    if np.isnan(current_val):
+                        current_val = 0.0
+                    self.dataset[var].values[idx_tuple] = max(current_val - val, 0)
+
+        # ---- Add moved amounts to downstream cells at next_time ----
+        grouped = moved_df.groupby("outID")[key_vars].sum()
 
         # Get target grid at next_time
         ds_next = self.dataset.sel(time=next_time)
-
-        # Build mapping from ID to (lon, lat)
         target_df = ds_next[["ID", "lon", "lat"]].to_dataframe().reset_index()[["ID", "lon", "lat"]]
         target_df = target_df.set_index("ID")
 
-        # Merge grouped sums with target coordinates
         merged = grouped.join(target_df, how="inner")
         if merged.empty:
             return
 
-        # Prepare coordinate to index mappings
-        lon_to_idx = {lon: i for i, lon in enumerate(self.dataset.lon.values)}
-        lat_to_idx = {lat: i for i, lat in enumerate(self.dataset.lat.values)}
-        time_idx = np.where(self.dataset.time.values == next_time)[0][0]
+        time_idx_next = np.where(self.dataset.time.values == next_time)[0][0]
 
-        # For each variable, add contributions
         for var in key_vars:
             sum_vals = merged[var].values
             lon_vals = merged["lon"].values
             lat_vals = merged["lat"].values
 
-            # Convert coordinates to indices
             lon_idx = np.array([lon_to_idx[lon] for lon in lon_vals])
             lat_idx = np.array([lat_to_idx[lat] for lat in lat_vals])
 
-            # Check dimension order before assignment
             dims = self.dataset[var].dims
             if dims == ('time', 'lat', 'lon'):
-                # Current values
-                current_vals = self.dataset[var].values[time_idx, lat_idx, lon_idx]
+                current_vals = self.dataset[var].values[time_idx_next, lat_idx, lon_idx]
                 current_vals = np.nan_to_num(current_vals, nan=0.0)
-                
-                # New values
                 new_vals = current_vals + sum_vals
-                
-                # Assign back
-                self.dataset[var].values[time_idx, lat_idx, lon_idx] = new_vals
-                
+                self.dataset[var].values[time_idx_next, lat_idx, lon_idx] = new_vals
             elif dims == ('time', 'lon', 'lat'):
-                # Current values
-                current_vals = self.dataset[var].values[time_idx, lon_idx, lat_idx]
+                current_vals = self.dataset[var].values[time_idx_next, lon_idx, lat_idx]
                 current_vals = np.nan_to_num(current_vals, nan=0.0)
-                
-                # New values
                 new_vals = current_vals + sum_vals
-                
-                # Assign back
-                self.dataset[var].values[time_idx, lon_idx, lat_idx] = new_vals
+                self.dataset[var].values[time_idx_next, lon_idx, lat_idx] = new_vals
+            else:
+                # Fallback loop
+                for i, (lat_i, lon_i, val) in enumerate(zip(lat_idx, lon_idx, sum_vals)):
+                    idx_dict = {'time': time_idx_next, 'lat': lat_i, 'lon': lon_i}
+                    idx_tuple = tuple(idx_dict.get(dim, slice(None)) for dim in dims)
+                    current_val = self.dataset[var].values[idx_tuple]
+                    if np.isnan(current_val):
+                        current_val = 0.0
+                    self.dataset[var].values[idx_tuple] = current_val + val
                 
     def _next_time(self, t):
         idx = np.where(self.time_steps.values == t)[0][0]
