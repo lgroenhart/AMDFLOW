@@ -18,8 +18,6 @@ class AMDModel:
         self.do = do
         self.transport_operator = transport_operator
         self.tree = None
-        self.target_lon_idx = None
-        self.target_lat_idx = None
 
         for var in ["ferrous_iron", "ferric_iron", "sulphate", "hydrogen_ion", "iron_III_hydroxide"]:
             self.dataset[var] = xr.full_like(self.dataset["Q"], 0, dtype=float)
@@ -42,7 +40,7 @@ class AMDModel:
         # first_time = self.time_steps.values[0]
         # self.dataset["hydrogen_ion"].loc[dict(time=first_time)] = 1e-7 * self.dataset["volume"].sel(time=first_time)
         
-        self.build_tree()
+        self._build_tree()
 
     def run(self):
 
@@ -81,7 +79,7 @@ class AMDModel:
             # check for water > 0
             mask = current_slice["Q"] > 0
             current_slice = current_slice.where(mask, drop=True)
-            current_slice = self.process_slice(current_slice, ti)
+            current_slice = self._process_slice(current_slice, ti)
 
             # safety checks
             if current_slice.sizes == {}:
@@ -90,10 +88,10 @@ class AMDModel:
             if "lon" not in current_slice.coords or "lat" not in current_slice.coords:
                 current_slice = current_slice.set_coords(["lon", "lat"])
 
-            self.update_dataset(t, current_slice)
+            self._update_dataset(t, current_slice)
         #    transport only the processed cells
             if ti < len(self.time_steps) - 1:
-                self.transport(t, current_slice)
+                self._transport(t, current_slice)
 
             # ----------------------------------------------------------------------------------------------
 
@@ -111,7 +109,7 @@ class AMDModel:
                 mask = current_slice["Q"] > 0
                 current_slice = current_slice.where(mask, drop=True)
 
-                current_slice = self.process_slice(current_slice, ti)
+                current_slice = self._process_slice(current_slice, ti)
                 
                 # safety_checks
                 if current_slice.sizes == {}:
@@ -120,13 +118,15 @@ class AMDModel:
                 if "lon" not in current_slice.coords or "lat" not in current_slice.coords:
                     current_slice = current_slice.set_coords(["lon", "lat"])
                     
-                self.update_dataset(t, current_slice)
+                self._update_dataset(t, current_slice)
                 dataset_t = self.dataset.sel(time=t)
                 if ti < len(self.time_steps) - 1:
-                    self.transport(t, current_slice)
+                    self._transport(t, current_slice)
             # -----------------------------------------------------------------------------------------------
 
-    def process_slice(self, current_slice, ti):
+    def _process_slice(self, current_slice, ti):
+
+        updates = {}
 
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
         if ti == 0: 
@@ -161,11 +161,9 @@ class AMDModel:
             0
         )
 
-        current_slice = current_slice.assign(
-            ferric_iron=current_slice["ferric_iron"] - ferric_consumed_limited,
-            ferrous_iron=current_slice["ferrous_iron"] + ferrous_produced,
-            hydrogen_ion=current_slice["hydrogen_ion"] + hydrogen_produced,
-        )
+        updates["ferric_iron"] = current_slice["ferric_iron"] - ferric_consumed_limited
+        updates["ferrous_iron"] = current_slice["ferrous_iron"] + ferrous_produced
+        updates["hydrogen_ion"]=current_slice["hydrogen_ion"] + hydrogen_produced
 
         # 2) rate-limited pyrite oxidation 
         k = 10**-8.19
@@ -195,21 +193,16 @@ class AMDModel:
             ferrous_amount
         )
 
-        current_slice = current_slice.assign(
-            ferrous_iron=current_slice["ferrous_iron"] + ferrous_amount_limited,
-            sulphate=current_slice["sulphate"] + 2 * ferrous_amount_limited,
-            hydrogen_ion=current_slice["hydrogen_ion"] + 2 * ferrous_amount_limited,
-        )
-
-
+        updates["ferrous_iron"]=current_slice["ferrous_iron"] + ferrous_amount_limited
+        updates["sulphate"]=current_slice["sulphate"] + 2 * ferrous_amount_limited
+        updates["hydrogen_ion"]=current_slice["hydrogen_ion"] + 2 * ferrous_amount_limited
 
         # 3) ferrous to ferric oxidation
         ferrous_available = current_slice["ferrous_iron"]
-        current_slice = current_slice.assign(
-            ferric_iron=current_slice["ferric_iron"] + ferrous_available,
-            ferrous_iron=xr.zeros_like(current_slice["Q"]),   
-            hydrogen_ion=current_slice["hydrogen_ion"] - 1 * ferrous_available,
-        )
+
+        updates["ferric_iron"]=current_slice["ferric_iron"] + ferrous_available
+        updates["ferrous_iron"]=xr.zeros_like(current_slice["Q"])
+        updates["hydrogen_ion"]=current_slice["hydrogen_ion"] - 1 * ferrous_available
 
         # prevent negative hydrogen
         current_slice["hydrogen_ion"] = current_slice["hydrogen_ion"].clip(min=0)
@@ -223,14 +216,13 @@ class AMDModel:
         diff = ferric - hydroxide
         adjustment = 0.5 * diff
 
-        current_slice = current_slice.assign(
-            ferric_iron=ferric - adjustment,
-            iron_III_hydroxide=hydroxide + adjustment,
-            hydrogen_ion = hydrogen_ion + (adjustment * 3)
-        )
+        updates["ferric_iron"]=ferric - adjustment
+        updates["iron_III_hydroxide"]=hydroxide + adjustment
+        updates["hydrogen_ion"] = hydrogen_ion + (adjustment * 3)
 
+        # 5) assignment and numerical cleanup
 
-        # 5) numerical cleanup
+        current_slice = current_slice.assign(**updates)
 
         for var in ["ferrous_iron", "ferric_iron", "hydrogen_ion",
                     "sulphate", "iron_III_hydroxide"]:
@@ -240,7 +232,7 @@ class AMDModel:
 
         return current_slice
 
-    def update_dataset(self, t, current_slice):
+    def _update_dataset(self, t, current_slice):
         """Update main dataset using vectorised scatter operation."""
         key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion",
                     "sulphate", "iron_III_hydroxide"]
@@ -315,7 +307,7 @@ class AMDModel:
                     idx_tuple = tuple(idx_dict.get(dim, slice(None)) for dim in dims)
                     self.dataset[var].values[idx_tuple] = val
 
-    def transport(self, t, current_slice):
+    def _transport(self, t, current_slice):
         """Move a fraction of mass from source cells to downstream cells."""
         key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion", "sulphate"]
         next_time = self._next_time(t)
@@ -421,7 +413,7 @@ class AMDModel:
             return None
         return self.time_steps.values[idx + 1]
     
-    def output_calc(self):
+    def _output_calc(self):
 
         # safety check to make sure calculations are not run twice
         if self.dataset["ferric_iron"].attrs["units"] == "g/L":
@@ -467,7 +459,7 @@ class AMDModel:
             self.dataset["hydrogen_ion"] = h_conc
             self.dataset["hydrogen_ion"].attrs["units"] = "mol/L"
     
-    def build_tree(self):
+    def _build_tree(self):
 
         target_lon = self.dataset.lon.values
         target_lat = self.dataset.lat.values
