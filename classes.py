@@ -7,16 +7,16 @@ import pandas as pd
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-
+from joblib import Parallel, delayed
+import os
 
 class AMDModel:
 
-    def __init__(self, dataset, t_unit, do = 0.2500094, transport_operator = 0.1):
+    def __init__(self, dataset, t_unit, do = 0.2500094):
         self.dataset = dataset.copy(deep=True)
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
         self.do = do
-        self.transport_operator = transport_operator
         self.tree = None
 
         for var in ["ferrous_iron", "ferric_iron", "sulphate", "hydrogen_ion", "iron_III_hydroxide"]:
@@ -40,197 +40,173 @@ class AMDModel:
         # first_time = self.time_steps.values[0]
         # self.dataset["hydrogen_ion"].loc[dict(time=first_time)] = 1e-7 * self.dataset["volume"].sel(time=first_time)
         
+        low, high = 0.01, 1.0
+        Q_ref = self.dataset["Q"].isel(time=0)
+        norm = low + (Q_ref - Q_ref.min()) / (Q_ref.max() - Q_ref.min() + 1e-12) * (high - low)
+        self._norm_transport = norm.values
+        
         self._build_tree()
+        self._build_cache()
 
-    def run(self):
-
-        # get only cells where reactive ores are present
+    def run(self, chunk_size=50, n_jobs = -1, backend = "loky"):
         mask_ores = self.dataset["ore"] > 0
         reactive_ores = self.dataset.where(mask_ores, drop=True)
-
-        # get the most upstream cells (cells with no inflow) with source == 1
-        # and ores
         mask = reactive_ores["source"].where(reactive_ores["source"] == 1)
-        most_upstream_reactive_ores = self.dataset.where(mask, drop = True)
+        most_upstream_reactive_ores = self.dataset.where(mask, drop=True)
 
-        # start timestep t
         for ti, t in tqdm(enumerate(self.dataset.time.values)):
-            # add mass from previous timestep to current timestep
             if ti > 0:
                 prev_t = self.time_steps.values[ti - 1]
-
-                for var in ["ferrous_iron", "ferric_iron",
-                            "hydrogen_ion", "sulphate",
-                            "iron_III_hydroxide"]:
+                for var in ["ferrous_iron", "ferric_iron", "hydrogen_ion",
+                            "sulphate", "iron_III_hydroxide"]:
                     prev_vals = self.dataset[var].sel(time=prev_t).fillna(0)
                     self.dataset[var].loc[dict(time=t)] = \
                         self.dataset[var].loc[dict(time=t)].fillna(0) + prev_vals
-                    
-            dataset_t = self.dataset.sel(time = t)
-            
-            if ti > 0:
-                current_slice = dataset_t.where(dataset_t["ID"].isin(most_upstream_reactive_ores["ID"].values), drop = True)
-            else:
-                current_slice = most_upstream_reactive_ores.sel(time = t)
 
-            # processing step of most upstream cells with water and reactive ores at t 
-            # --------------------------------------------------------------------------------------------
-                   
-            # check for water > 0
-            mask = current_slice["Q"] > 0
-            current_slice = current_slice.where(mask, drop=True)
-            current_slice = self._process_slice(current_slice, ti)
+            # fix 1: ravel to guarantee 1D flat array of IDs
+            upstream_ids = most_upstream_reactive_ores["ID"].values.ravel()
+            upstream_ids = upstream_ids[np.isfinite(upstream_ids)]
+            upstream_ids = upstream_ids.astype(np.int64)
 
-            # safety checks
-            if current_slice.sizes == {}:
-                print(f"Warning: Empty slice at time {t}, skipping update")
-                continue  
-            if "lon" not in current_slice.coords or "lat" not in current_slice.coords:
-                current_slice = current_slice.set_coords(["lon", "lat"])
+            # fix 2: track visited cells to prevent revisiting
+            visited = set(upstream_ids.tolist())
 
-            self._update_dataset(t, current_slice)
-        #    transport only the processed cells
+            groups  = self._get_parallel_groups(upstream_ids, chunk_size)
+            #results = [self._compute_slice(group, t, ti) for group in groups]
+            results = Parallel(n_jobs=n_jobs, backend = backend)(
+                delayed(self._compute_slice)(group, t, ti) for group in groups
+            )
+            results = [r for r in results if r is not None]
+
+            for result in results:
+                self._update_dataset(t, result)
             if ti < len(self.time_steps) - 1:
-                self._transport(t, current_slice)
+                for result in results:
+                    self._transport(t, result)
 
-            # ----------------------------------------------------------------------------------------------
+            dataset_t = self.dataset.sel(time=t)
+            current_ids = upstream_ids
 
-            # loop to process downstream cells until no more downstream cells exist
-            #-----------------------------------------------------------------------------------------------
-            while current_slice["ID"].size > 0:
-                
-                # get next current slice
-                out_ids = current_slice["outID"].values
-                out_ids = out_ids[out_ids != -1]
+            while len(current_ids) > 0:
+                # get downstream IDs from current frontier
+                current_ds = dataset_t.where(dataset_t["ID"].isin(current_ids), drop=True)
+                out_ids = current_ds["outID"].values.ravel()
+                out_ids = out_ids[np.isfinite(out_ids) & (out_ids != -1)]
+                out_ids = out_ids.astype(np.int64)
 
-                current_slice = dataset_t.where(dataset_t["ID"].isin(out_ids), drop = True)
-                
-                # process current slice cells 
-                mask = current_slice["Q"] > 0
-                current_slice = current_slice.where(mask, drop=True)
+                # fix 3: only process cells not yet visited this timestep
+                out_ids = np.array([i for i in out_ids if i not in visited])
 
-                current_slice = self._process_slice(current_slice, ti)
-                
-                # safety_checks
-                if current_slice.sizes == {}:
-                    print(f"Warning: Empty slice at time {t}, skipping update")
-                    continue  
-                if "lon" not in current_slice.coords or "lat" not in current_slice.coords:
-                    current_slice = current_slice.set_coords(["lon", "lat"])
-                    
-                self._update_dataset(t, current_slice)
+                if len(out_ids) == 0:
+                    break
+
+                visited.update(out_ids.tolist())
+
+                groups  = self._get_parallel_groups(out_ids, chunk_size)
+                #results = [self._compute_slice(group, t, ti) for group in groups]
+                results = Parallel(n_jobs=n_jobs, backend = backend)(
+                    delayed(self._compute_slice)(group, t, ti) for group in groups
+                )
+                results = [r for r in results if r is not None]
+
+                for result in results:
+                    self._update_dataset(t, result)
+
                 dataset_t = self.dataset.sel(time=t)
                 if ti < len(self.time_steps) - 1:
-                    self._transport(t, current_slice)
-            # -----------------------------------------------------------------------------------------------
+                    for result in results:
+                        self._transport(t, result)
+
+                # advance frontier to the newly processed IDs
+                current_ids = out_ids
 
     def _process_slice(self, current_slice, ti):
+        # extract all arrays to numpy once — no more xarray overhead inside the function
+        volume   = current_slice["volume"].values
+        ore      = current_slice["ore"].values
+        fe2      = current_slice["ferrous_iron"].values.copy()
+        fe3      = current_slice["ferric_iron"].values.copy()
+        so4      = current_slice["sulphate"].values.copy()
+        h        = current_slice["hydrogen_ion"].values.copy()
+        fe_oh3   = current_slice["iron_III_hydroxide"].values.copy()
 
-        updates = {}
+        if ti == 0:
+            h = 1e-7 * volume
 
-        # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
-        if ti == 0: 
-            current_slice["hydrogen_ion"] = 1e-7 * current_slice["volume"]
+        h2o = (0.99704702 * (volume * 1000)) / 18.01528
 
-        # h2o availability as: (density * (volume (l) * 1000)) / molar mass = total mol
-        # molar mass = 18.01528(33) g/mol
-        # density = 0.99704702(83) g/ml
-        h2o = (0.99704702 * (current_slice["volume"] * 1000))  / 18.01528
-
-        # # 1) pyrite oxidation by ferric iron 
-        mask_ferric = (current_slice["ferric_iron"] > 0) & (current_slice["ore"] > 0)
-        
-
-        ferric_consumed = xr.where(
-            mask_ferric,
-            current_slice["ferric_iron"],
-            0
-        )
-
+        # 1) pyrite oxidation by ferric iron
+        mask_ferric = (fe3 > 0) & (ore > 0)
+        ferric_consumed = np.where(mask_ferric, fe3, 0)
         max_ferric = 1.75 * h2o
-        ferric_consumed_limited = xr.where(
-            ferric_consumed > max_ferric,
-            max_ferric,
-            ferric_consumed
-        )
+        ferric_consumed = np.minimum(ferric_consumed, max_ferric)
 
-        ferrous_produced = ferric_consumed_limited * 1.07
-        hydrogen_produced = xr.where(
-            mask_ferric,
-            ferric_consumed * 1.14,
-            0
-        )
+        fe2 += ferric_consumed * 1.07
+        fe3 -= ferric_consumed
+        h   += np.where(mask_ferric, ferric_consumed * 1.14, 0)
 
-        updates["ferric_iron"] = current_slice["ferric_iron"] - ferric_consumed_limited
-        updates["ferrous_iron"] = current_slice["ferrous_iron"] + ferrous_produced
-        updates["hydrogen_ion"]=current_slice["hydrogen_ion"] + hydrogen_produced
-
-        # 2) rate-limited pyrite oxidation 
+        # 2) rate-limited pyrite oxidation
         k = 10**-8.19
-        
-        mask_rate = (current_slice["ore"] > 0) & (~mask_ferric)
-        h_conc = current_slice["hydrogen_ion"] / current_slice["volume"]
+        mask_rate = (ore > 0) & ~mask_ferric
+        h_conc = h / np.where(volume > 0, volume, 1)
+        h_safe = np.where((h_conc <= 0) | ~np.isfinite(h_conc), 1e-7, h_conc)
+        rate = k * (self.do ** 0.5) / (h_safe ** 0.11)
 
-        h_safe = xr.where(
-            (h_conc <= 0) | h_conc.isnull(),
-            1e-7,                
-            h_conc
-        )
+        ferrous_amount = np.where(mask_rate, rate * ore * self.time_step_seconds, 0.0)
+        ferrous_amount = np.minimum(ferrous_amount, 1 * h2o)
 
-
-        rate = k * ((self.do ** 0.5) / (h_safe ** 0.11))
-
-        ferrous_amount = xr.where(
-            mask_rate,
-            rate * current_slice["ore"] * self.time_step_seconds,
-            0.0
-        )
-
-        max_ferrous = 1 * h2o 
-        ferrous_amount_limited = xr.where(
-            ferrous_amount > max_ferrous,
-            max_ferrous,
-            ferrous_amount
-        )
-
-        updates["ferrous_iron"]=current_slice["ferrous_iron"] + ferrous_amount_limited
-        updates["sulphate"]=current_slice["sulphate"] + 2 * ferrous_amount_limited
-        updates["hydrogen_ion"]=current_slice["hydrogen_ion"] + 2 * ferrous_amount_limited
+        fe2 += ferrous_amount
+        so4 += 2 * ferrous_amount
+        h   += 2 * ferrous_amount
 
         # 3) ferrous to ferric oxidation
-        ferrous_available = current_slice["ferrous_iron"]
+        fe3 += fe2
+        h   -= fe2
+        fe2  = np.zeros_like(fe2)
+        h    = np.maximum(h, 0)
 
-        updates["ferric_iron"]=current_slice["ferric_iron"] + ferrous_available
-        updates["ferrous_iron"]=xr.zeros_like(current_slice["Q"])
-        updates["hydrogen_ion"]=current_slice["hydrogen_ion"] - 1 * ferrous_available
-
-        # prevent negative hydrogen
-        current_slice["hydrogen_ion"] = current_slice["hydrogen_ion"].clip(min=0)
-
-        
         # 4) ferric <> iron III hydroxide equilibrium
-        ferric = current_slice["ferric_iron"]
-        hydroxide = current_slice["iron_III_hydroxide"]
-        hydrogen_ion = current_slice["hydrogen_ion"]
-
-        diff = ferric - hydroxide
+        diff       = fe3 - fe_oh3
         adjustment = 0.5 * diff
+        fe3    -= adjustment
+        fe_oh3 += adjustment
+        h      += adjustment * 3
 
-        updates["ferric_iron"]=ferric - adjustment
-        updates["iron_III_hydroxide"]=hydroxide + adjustment
-        updates["hydrogen_ion"] = hydrogen_ion + (adjustment * 3)
+        # 5) clip negatives
+        fe2    = np.maximum(fe2,    0)
+        fe3    = np.maximum(fe3,    0)
+        h      = np.maximum(h,      0)
+        so4    = np.maximum(so4,    0)
+        fe_oh3 = np.maximum(fe_oh3, 0)
 
-        # 5) assignment and numerical cleanup
-
-        current_slice = current_slice.assign(**updates)
-
-        for var in ["ferrous_iron", "ferric_iron", "hydrogen_ion",
-                    "sulphate", "iron_III_hydroxide"]:
-            current_slice[var] = current_slice[var].fillna(0)
-            current_slice[var] = current_slice[var].clip(min=0)
-
+        # write back to slice — one assignment per variable, no align/reindex
+        current_slice = current_slice.assign({
+            "ferrous_iron":       (current_slice["ferrous_iron"].dims,       fe2),
+            "ferric_iron":        (current_slice["ferric_iron"].dims,        fe3),
+            "sulphate":           (current_slice["sulphate"].dims,           so4),
+            "hydrogen_ion":       (current_slice["hydrogen_ion"].dims,       h),
+            "iron_III_hydroxide": (current_slice["iron_III_hydroxide"].dims, fe_oh3),
+        })
 
         return current_slice
+    
+    def _compute_slice(self, cell_ids, t, ti):
+
+        dataset_t = self.dataset.sel(time = t)
+        cell_slice = dataset_t.where(dataset_t["ID"].isin(cell_ids), drop = True)
+        cell_slice = cell_slice.where(cell_slice["Q"] > 0, drop = True)
+
+        if cell_slice.sizes.get("lat", 0) == 0:
+            return None
+        return self._process_slice(cell_slice, ti)
+    
+    def _get_parallel_groups(self, cell_ids, chunk_size=None):
+        cell_ids = list(cell_ids)
+        if chunk_size is None:
+            n_workers = os.cpu_count()
+            chunk_size = max(1, len(cell_ids) // n_workers)
+            self.chunk_size = chunk_size
+        return [cell_ids[i:i+chunk_size] for i in range(0, len(cell_ids), chunk_size)]
 
     def _update_dataset(self, t, current_slice):
         """Update main dataset using vectorised scatter operation."""
@@ -292,7 +268,7 @@ class AMDModel:
             final_vals = valid_src_vals[unique_idx]
 
             # Get time index
-            time_idx = np.where(self.dataset.time.values == t)[0][0]
+            time_idx = self._time_index[t]#[0][0]
 
             # Determine dimension order and assign
             dims = self.dataset[var].dims
@@ -308,104 +284,81 @@ class AMDModel:
                     self.dataset[var].values[idx_tuple] = val
 
     def _transport(self, t, current_slice):
-        """Move a fraction of mass from source cells to downstream cells."""
         key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion", "sulphate"]
         next_time = self._next_time(t)
         if next_time is None:
             return
 
-        # Filter source cells with valid outflow
-        source = current_slice.where(current_slice["outID"] != -1, drop=True)
-        if source.sizes["lat"] == 0:
+        ids      = current_slice["ID"].values.ravel()
+        out_ids  = current_slice["outID"].values.ravel()
+        valid   = np.isfinite(out_ids) & (out_ids != -1)
+
+        if not valid.any():
             return
 
-        # Convert source to DataFrame for fast manipulation
-        source_df = source[key_vars + ["outID", "lon", "lat"]].to_dataframe().reset_index()
-        source_df = source_df.dropna(subset=["outID"])
-        if source_df.empty:
-            return
+        src_ids     = ids[valid]
+        dst_ids     = out_ids[valid]
 
-        # Compute moved amounts (fraction of current mass)
-        moved_df = source_df.copy()
+        # look up (row, col) directly from cache — no unravel needed
+        src_rc = np.array([self._id_to_rc[int(i)] for i in src_ids])
+        dst_rc = np.array([self._id_to_rc[int(i)] for i in dst_ids if int(i) in self._id_to_rc])
+
+
+        # filter to dst IDs that exist in the grid
+        dst_exists = np.array([int(i) in self._id_to_rc for i in dst_ids])
+        valid_both = valid.copy()
+        valid_both[valid] = dst_exists
+
+        src_ids = ids[valid_both]
+        dst_ids = out_ids[valid_both]
+
+        src_rc = np.array([self._id_to_rc[int(i)] for i in src_ids])
+        dst_rc = np.array([self._id_to_rc[int(i)] for i in dst_ids])
+
+        src_row, src_col = src_rc[:, 0], src_rc[:, 1]
+        dst_row, dst_col = dst_rc[:, 0], dst_rc[:, 1]
+
+        time_idx_t    = self._time_index[t]
+        time_idx_next = self._time_index[next_time]
+
+        src_trs = self._norm_transport[src_row, src_col]
+
         for var in key_vars:
-            moved_df[var] = source_df[var] * self.transport_operator
-
-        # ---- Subtract moved amounts from source cells at current time t ----
-        lon_to_idx = {lon: i for i, lon in enumerate(self.dataset.lon.values)}
-        lat_to_idx = {lat: i for i, lat in enumerate(self.dataset.lat.values)}
-        time_idx_t = np.where(self.dataset.time.values == t)[0][0]
-
-        for var in key_vars:
-            lon_vals = moved_df["lon"].values
-            lat_vals = moved_df["lat"].values
-            moved_vals = moved_df[var].values
-
-            lon_idx = np.array([lon_to_idx[lon] for lon in lon_vals])
-            lat_idx = np.array([lat_to_idx[lat] for lat in lat_vals])
-
+            arr = self.dataset[var].values  # (time, lat, lon) or (time, lon, lat)
             dims = self.dataset[var].dims
+
             if dims == ('time', 'lat', 'lon'):
-                current_vals = self.dataset[var].values[time_idx_t, lat_idx, lon_idx]
-                current_vals = np.nan_to_num(current_vals, nan=0.0)
-                new_vals = np.maximum(current_vals - moved_vals, 0)
-                self.dataset[var].values[time_idx_t, lat_idx, lon_idx] = new_vals
+                src_vals  = arr[time_idx_t,    src_row, src_col]
+                moved     = src_vals * src_trs
+                np.subtract.at(arr[time_idx_t],
+                            (src_row, src_col), moved)
+                arr[time_idx_t, src_row, src_col] = np.maximum(
+                    arr[time_idx_t, src_row, src_col], 0)
+                np.add.at(arr[time_idx_next], (dst_row, dst_col), moved)
             elif dims == ('time', 'lon', 'lat'):
-                current_vals = self.dataset[var].values[time_idx_t, lon_idx, lat_idx]
-                current_vals = np.nan_to_num(current_vals, nan=0.0)
-                new_vals = np.maximum(current_vals - moved_vals, 0)
-                self.dataset[var].values[time_idx_t, lon_idx, lat_idx] = new_vals
-            else:
-                # Fallback loop (should not happen)
-                for i, (lat_i, lon_i, val) in enumerate(zip(lat_idx, lon_idx, moved_vals)):
-                    idx_dict = {'time': time_idx_t, 'lat': lat_i, 'lon': lon_i}
-                    idx_tuple = tuple(idx_dict.get(dim, slice(None)) for dim in dims)
-                    current_val = self.dataset[var].values[idx_tuple]
-                    if np.isnan(current_val):
-                        current_val = 0.0
-                    self.dataset[var].values[idx_tuple] = max(current_val - val, 0)
+                src_vals  = arr[time_idx_t,    src_col, src_row]
+                moved     = src_vals * src_trs
+                np.subtract.at(arr[time_idx_t],
+                            (src_col, src_row), moved)
+                arr[time_idx_t, src_col, src_row] = np.maximum(
+                    arr[time_idx_t, src_col, src_row], 0)
+                np.add.at(arr[time_idx_next], (dst_col, dst_row), moved)
 
-        # ---- Add moved amounts to downstream cells at next_time ----
-        grouped = moved_df.groupby("outID")[key_vars].sum()
+            self.dataset[var].values[:] = arr
 
-        # Get target grid at next_time
-        ds_next = self.dataset.sel(time=next_time)
-        target_df = ds_next[["ID", "lon", "lat"]].to_dataframe().reset_index()[["ID", "lon", "lat"]]
-        target_df = target_df.set_index("ID")
-
-        merged = grouped.join(target_df, how="inner")
-        if merged.empty:
-            return
-
-        time_idx_next = np.where(self.dataset.time.values == next_time)[0][0]
-
-        for var in key_vars:
-            sum_vals = merged[var].values
-            lon_vals = merged["lon"].values
-            lat_vals = merged["lat"].values
-
-            lon_idx = np.array([lon_to_idx[lon] for lon in lon_vals])
-            lat_idx = np.array([lat_to_idx[lat] for lat in lat_vals])
-
-            dims = self.dataset[var].dims
-            if dims == ('time', 'lat', 'lon'):
-                current_vals = self.dataset[var].values[time_idx_next, lat_idx, lon_idx]
-                current_vals = np.nan_to_num(current_vals, nan=0.0)
-                new_vals = current_vals + sum_vals
-                self.dataset[var].values[time_idx_next, lat_idx, lon_idx] = new_vals
-            elif dims == ('time', 'lon', 'lat'):
-                current_vals = self.dataset[var].values[time_idx_next, lon_idx, lat_idx]
-                current_vals = np.nan_to_num(current_vals, nan=0.0)
-                new_vals = current_vals + sum_vals
-                self.dataset[var].values[time_idx_next, lon_idx, lat_idx] = new_vals
-            else:
-                # Fallback loop
-                for i, (lat_i, lon_i, val) in enumerate(zip(lat_idx, lon_idx, sum_vals)):
-                    idx_dict = {'time': time_idx_next, 'lat': lat_i, 'lon': lon_i}
-                    idx_tuple = tuple(idx_dict.get(dim, slice(None)) for dim in dims)
-                    current_val = self.dataset[var].values[idx_tuple]
-                    if np.isnan(current_val):
-                        current_val = 0.0
-                    self.dataset[var].values[idx_tuple] = current_val + val
+    def _build_cache(self):
+        id_2d = self.dataset["ID"].isel(time=0) if "time" in self.dataset["ID"].dims else self.dataset["ID"]
+        self._nrows, self._ncols = id_2d.shape
+        self._time_index = {t: i for i, t in enumerate(self.dataset.time.values)}
+        
+        # map ID value → (row, col) directly — safe regardless of ID range
+        id_vals = id_2d.values
+        rows, cols = np.indices(id_vals.shape)
+        self._id_to_rc = {
+            int(id_vals[r, c]): (r, c)
+            for r in range(self._nrows)
+            for c in range(self._ncols)
+        }
                 
     def _next_time(self, t):
         idx = np.where(self.time_steps.values == t)[0][0]
@@ -413,7 +366,7 @@ class AMDModel:
             return None
         return self.time_steps.values[idx + 1]
     
-    def _output_calc(self):
+    def output_calc(self):
 
         # safety check to make sure calculations are not run twice
         if self.dataset["ferric_iron"].attrs["units"] == "g/L":
