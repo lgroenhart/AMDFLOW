@@ -10,6 +10,9 @@ from osgeo import ogr
 import xarray as xr
 import geopandas as gpd
 import numpy as np
+import matplotlib.colors as mcolors
+import matplotlib.animation as animation
+import matplotlib.pyplot as plt
 
 def mindat_collector(region, material_id = 3314, mineral_strings = "(Fe|S)", material_name = "pyrite", path_str = "../data/", mindat_api_str = "mindat_API_key.txt"):
 
@@ -286,3 +289,40 @@ def estimate_ore(ds, H, F):
     ds["ore"].attrs = {"description": "Estimation of reactive ore per cell", "unit": "m2",}
     ds = ds.drop_vars(["mines"])
     return ds
+
+def animation_plot(model, var, aoi = None, size = (10, 8), cmap = "Reds"):
+
+    def _ani_update(t):
+        im.set_data(plot_data[t].values)
+        ax.set_title(f"{date_range[t][0]}/{date_range[t][1]}/{date_range[t][2]}")
+        return [im]
+    
+    fig, ax = plt.subplots(figsize = size)
+    if var != "pH":
+        plot_data = model.dataset[var].where(model.dataset[var] > 0)
+    else:
+        plot_data = model.dataset[var].where(model.dataset[var] < 7)
+    
+    im = ax. imshow(plot_data[0].values, cmap = cmap, 
+                    extent=[plot_data.lon.min(), plot_data.lon.max(), 
+                            plot_data.lat.min(), plot_data.lat.max()],
+                            origin='lower', aspect='auto')
+    
+    cbar = fig.colorbar(im, ax = ax, label = f"{var} {model.dataset[var].attrs["units"]}")
+
+    date_range = [(day, month, year) for day, month, year in zip(
+        model.dataset.time.dt.day.values,  
+        model.dataset.time.dt.month.values, 
+        model.dataset.time.dt.year.values)]
+    
+    title = ax.set_title(f"{date_range[0][0]}/{date_range[0][1]}/{date_range[0][2]}")
+
+    if aoi is not None:
+        aoi.boundary.plot(ax = ax, color = "k")
+    
+    ani = animation.FuncAnimation(fig, _ani_update, frames = len(date_range), 
+                                  repeat = True, interval = 500, blit = True)
+    plt.close()
+    return ani
+
+
