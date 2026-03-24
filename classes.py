@@ -33,7 +33,7 @@ class AMDModel:
             self.dataset[var_name].attrs = attrs
 
         self.dataset = self.dataset.set_coords("ID")
-        self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400}[self.t_unit]
+        self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400, "hour": 3600, "minute": 60}[self.t_unit]
 
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
         self.dataset["volume"] = self.dataset["Q"] * self.time_step_seconds * 1000  # L per timestep
