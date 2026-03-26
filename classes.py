@@ -12,7 +12,7 @@ import os
 
 class AMDModel:
 
-    def __init__(self, dataset, t_unit, do = 0.2500094):
+    def __init__(self, dataset, t_unit, do = 10 / 31998):
         self.dataset = dataset.copy(deep=True)
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
@@ -37,8 +37,8 @@ class AMDModel:
 
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
         self.dataset["volume"] = self.dataset["Q"] * self.time_step_seconds * 1000  # L per timestep
-        # first_time = self.time_steps.values[0]
-        # self.dataset["hydrogen_ion"].loc[dict(time=first_time)] = 1e-7 * self.dataset["volume"].sel(time=first_time)
+        first_time = self.time_steps.values[0]
+        self.dataset["hydrogen_ion"].loc[dict(time=first_time)] = 1e-7 * self.dataset["volume"].sel(time=first_time)
         
         low, high = 0.01, 1.0
         Q_ref = self.dataset["Q"].isel(time=0)
@@ -63,12 +63,12 @@ class AMDModel:
                     self.dataset[var].loc[dict(time=t)] = \
                         self.dataset[var].loc[dict(time=t)].fillna(0) + prev_vals
 
-            # fix 1: ravel to guarantee 1D flat array of IDs
+            # ravel to guarantee 1D flat array of IDs
             upstream_ids = most_upstream_reactive_ores["ID"].values.ravel()
             upstream_ids = upstream_ids[np.isfinite(upstream_ids)]
             upstream_ids = upstream_ids.astype(np.int64)
 
-            # fix 2: track visited cells to prevent revisiting
+            # track visited cells to prevent revisiting
             visited = set(upstream_ids.tolist())
 
             groups  = self._get_parallel_groups(upstream_ids, chunk_size)
@@ -94,7 +94,7 @@ class AMDModel:
                 out_ids = out_ids[np.isfinite(out_ids) & (out_ids != -1)]
                 out_ids = out_ids.astype(np.int64)
 
-                # fix 3: only process cells not yet visited this timestep
+                # only process cells not yet visited this timestep
                 out_ids = np.array([i for i in out_ids if i not in visited])
 
                 if len(out_ids) == 0:
@@ -102,17 +102,22 @@ class AMDModel:
 
                 visited.update(out_ids.tolist())
 
-                groups  = self._get_parallel_groups(out_ids, chunk_size)
-                #results = [self._compute_slice(group, t, ti) for group in groups]
-                results = Parallel(n_jobs=n_jobs, backend = backend)(
-                    delayed(self._compute_slice)(group, t, ti) for group in groups
-                )
+                groups = self._get_parallel_groups(out_ids, chunk_size)
+                
+                # parallel only when there are multiple groups
+                if len(groups) > 4:
+                    results = Parallel(n_jobs=n_jobs, backend = backend)(
+                        delayed(self._compute_slice)(group, t, ti) for group in groups
+                    )
+                else:
+                    results = [self._compute_slice(group, t, ti) for group in groups]
+                
                 results = [r for r in results if r is not None]
 
                 for result in results:
                     self._update_dataset(t, result)
 
-                dataset_t = self.dataset.sel(time=t)
+                
                 if ti < len(self.time_steps) - 1:
                     for result in results:
                         self._transport(t, result)
@@ -121,70 +126,104 @@ class AMDModel:
                 current_ids = out_ids
 
     def _process_slice(self, current_slice, ti):
-        # extract all arrays to numpy once — no more xarray overhead inside the function
-        volume   = current_slice["volume"].values
-        ore      = current_slice["ore"].values
-        fe2      = current_slice["ferrous_iron"].values.copy()
-        fe3      = current_slice["ferric_iron"].values.copy()
-        so4      = current_slice["sulphate"].values.copy()
-        h        = current_slice["hydrogen_ion"].values.copy()
-        fe_oh3   = current_slice["iron_III_hydroxide"].values.copy()
+        # extract all arrays to numpy once 
+        volume = current_slice["volume"].values
+        ore = current_slice["ore"].values
+        fe2 = current_slice["ferrous_iron"].values.copy()
+        fe3 = current_slice["ferric_iron"].values.copy()
+        so4 = current_slice["sulphate"].values.copy()
+        h = current_slice["hydrogen_ion"].values.copy()
+        fe_oh3 = current_slice["iron_III_hydroxide"].values.copy()
 
-        if ti == 0:
-            h = 1e-7 * volume
+        # if ti == 0:
+        #     h = 1e-7 * volume
 
+        # concentrations 
         h2o = (0.99704702 * (volume * 1000)) / 18.01528
+        vol_safe = np.where(volume > 0, volume, 1.0)
 
-        # 1) pyrite oxidation by ferric iron
+        
+        # 1) rate-limited pyrite oxidation by ferric iron
+        k = 10**-9.74 * 10**4 / 60
         mask_ferric = (fe3 > 0) & (ore > 0)
-        ferric_consumed = np.where(mask_ferric, fe3, 0)
+        fe3_conc = fe3 / vol_safe
+        h_conc = h / vol_safe
+        fe3_safe = np.where((fe3_conc  > 0) & np.isfinite(fe3_conc),  fe3_conc,  1e-10)
+        h_safe = np.where((h_conc    > 0) & np.isfinite(h_conc),    h_conc,    1e-7)
+        rate = k * (fe3_safe ** 0.5) * (h_safe ** -0.5)
+        ferric_consumed = np.where(mask_ferric, 
+                                   rate * ore * self.time_step_seconds,
+                                   0
+                                   )
         max_ferric = 1.75 * h2o
+        ferric_consumed = np.minimum(ferric_consumed, fe3)
         ferric_consumed = np.minimum(ferric_consumed, max_ferric)
 
         fe2 += ferric_consumed * 1.07
         fe3 -= ferric_consumed
-        h   += np.where(mask_ferric, ferric_consumed * 1.14, 0)
+        h += np.where(mask_ferric, ferric_consumed * 1.14, 0)
 
-        # 2) rate-limited pyrite oxidation
+        # 2) rate-limited pyrite oxidation by dissolved oxygen and hydrons
         k = 10**-8.19
-        mask_rate = (ore > 0) & ~mask_ferric
-        h_conc = h / np.where(volume > 0, volume, 1)
-        h_safe = np.where((h_conc <= 0) | ~np.isfinite(h_conc), 1e-7, h_conc)
-        rate = k * (self.do ** 0.5) / (h_safe ** 0.11)
+        mask_rate = (ore > 0)
+        h_conc_2 = h / vol_safe
+        h_safe_2 = np.where((h_conc_2 <= 0) | ~np.isfinite(h_conc_2), 1e-7, h_conc_2)
+        rate = k * (self.do ** 0.5) / (h_safe_2 ** 0.11)
 
         ferrous_amount = np.where(mask_rate, rate * ore * self.time_step_seconds, 0.0)
         ferrous_amount = np.minimum(ferrous_amount, 1 * h2o)
 
         fe2 += ferrous_amount
         so4 += 2 * ferrous_amount
-        h   += 2 * ferrous_amount
+        h += 2 * ferrous_amount
 
         # 3) ferrous to ferric oxidation
-        fe3 += fe2
-        h   -= fe2
-        fe2  = np.zeros_like(fe2)
-        h    = np.maximum(h, 0)
+        k1 = 8.0e13 / 60                  # 1st k term in min to sec
+        k2 = 1.0e-7 / 60                  # 2nd k term in min to sec
+        p02 = 0.21
+
+        fe2_conc = fe2 / vol_safe
+        h_conc_3 = h   / vol_safe
+
+       
+        fe2_safe = np.where(np.isfinite(fe2_conc) & (fe2_conc > 0), fe2_conc, 0.0)
+        h_safe_3 = np.where(np.isfinite(h_conc_3) & (h_conc_3 > 0), h_conc_3, 1e-7)
+        h_safe_3 = np.maximum(h_safe_3, 1e-14)
+
+        Kw = 1e14
+        oh_conc = Kw / h_safe_3        # [OH⁻] = Kw / [H⁺]
+
+        ox_rate = (k1 * p02 + k2 * (oh_conc ** 2) * p02) * fe2_safe
+        fe2_oxidised = np.minimum(
+            ox_rate * vol_safe * self.time_step_seconds,
+            fe2
+        )
+        fe2_oxidised = np.where(np.isfinite(fe2_oxidised), fe2_oxidised, 0.0)  # final NaN guard
+
+        fe3 += fe2_oxidised
+        h -= fe2_oxidised
+        fe2 -= fe2_oxidised
 
         # 4) ferric <> iron III hydroxide equilibrium
-        diff       = fe3 - fe_oh3
+        diff = fe3 - fe_oh3
         adjustment = 0.5 * diff
-        fe3    -= adjustment
+        fe3 -= adjustment
         fe_oh3 += adjustment
-        h      += adjustment * 3
+        h += adjustment * 3
 
         # 5) clip negatives
-        fe2    = np.maximum(fe2,    0)
-        fe3    = np.maximum(fe3,    0)
-        h      = np.maximum(h,      0)
-        so4    = np.maximum(so4,    0)
+        fe2 = np.maximum(fe2, 0)
+        fe3 = np.maximum(fe3, 0)
+        h = np.maximum(h, 0)
+        so4 = np.maximum(so4, 0)
         fe_oh3 = np.maximum(fe_oh3, 0)
 
         # write back to slice — one assignment per variable, no align/reindex
         current_slice = current_slice.assign({
-            "ferrous_iron":       (current_slice["ferrous_iron"].dims,       fe2),
-            "ferric_iron":        (current_slice["ferric_iron"].dims,        fe3),
-            "sulphate":           (current_slice["sulphate"].dims,           so4),
-            "hydrogen_ion":       (current_slice["hydrogen_ion"].dims,       h),
+            "ferrous_iron": (current_slice["ferrous_iron"].dims, fe2),
+            "ferric_iron": (current_slice["ferric_iron"].dims, fe3),
+            "sulphate": (current_slice["sulphate"].dims, so4),
+            "hydrogen_ion": (current_slice["hydrogen_ion"].dims, h),
             "iron_III_hydroxide": (current_slice["iron_III_hydroxide"].dims, fe_oh3),
         })
 
@@ -289,15 +328,15 @@ class AMDModel:
         if next_time is None:
             return
 
-        ids      = current_slice["ID"].values.ravel()
-        out_ids  = current_slice["outID"].values.ravel()
-        valid   = np.isfinite(out_ids) & (out_ids != -1)
+        ids = current_slice["ID"].values.ravel()
+        out_ids = current_slice["outID"].values.ravel()
+        valid = np.isfinite(out_ids) & (out_ids != -1)
 
         if not valid.any():
             return
 
-        src_ids     = ids[valid]
-        dst_ids     = out_ids[valid]
+        src_ids = ids[valid]
+        dst_ids = out_ids[valid]
 
         # look up (row, col) directly from cache — no unravel needed
         src_rc = np.array([self._id_to_rc[int(i)] for i in src_ids])
@@ -318,7 +357,7 @@ class AMDModel:
         src_row, src_col = src_rc[:, 0], src_rc[:, 1]
         dst_row, dst_col = dst_rc[:, 0], dst_rc[:, 1]
 
-        time_idx_t    = self._time_index[t]
+        time_idx_t = self._time_index[t]
         time_idx_next = self._time_index[next_time]
 
         src_trs = self._norm_transport[src_row, src_col]
@@ -328,37 +367,44 @@ class AMDModel:
             dims = self.dataset[var].dims
 
             if dims == ('time', 'lat', 'lon'):
-                src_vals  = arr[time_idx_t,    src_row, src_col]
-                moved     = src_vals * src_trs
-                np.subtract.at(arr[time_idx_t],
-                            (src_row, src_col), moved)
+                src_vals = arr[time_idx_t,    src_row, src_col]
+                moved = src_vals * src_trs
+
+                arr[time_idx_t, src_row, src_col]
+                
                 arr[time_idx_t, src_row, src_col] = np.maximum(
                     arr[time_idx_t, src_row, src_col], 0)
+                
                 np.add.at(arr[time_idx_next], (dst_row, dst_col), moved)
+
             elif dims == ('time', 'lon', 'lat'):
-                src_vals  = arr[time_idx_t,    src_col, src_row]
-                moved     = src_vals * src_trs
-                np.subtract.at(arr[time_idx_t],
-                            (src_col, src_row), moved)
+                src_vals = arr[time_idx_t,    src_col, src_row]
+                moved = src_vals * src_trs
+
+                arr[time_idx_t, src_row, src_col] -= moved
+                
                 arr[time_idx_t, src_col, src_row] = np.maximum(
                     arr[time_idx_t, src_col, src_row], 0)
+                
                 np.add.at(arr[time_idx_next], (dst_col, dst_row), moved)
 
             self.dataset[var].values[:] = arr
 
     def _build_cache(self):
-        id_2d = self.dataset["ID"].isel(time=0) if "time" in self.dataset["ID"].dims else self.dataset["ID"]
-        self._nrows, self._ncols = id_2d.shape
-        self._time_index = {t: i for i, t in enumerate(self.dataset.time.values)}
-        
-        # map ID value → (row, col) directly — safe regardless of ID range
-        id_vals = id_2d.values
+        id_vals = self.dataset["ID"].isel(time = 0).values
         rows, cols = np.indices(id_vals.shape)
-        self._id_to_rc = {
-            int(id_vals[r, c]): (r, c)
-            for r in range(self._nrows)
-            for c in range(self._ncols)
-        }
+
+        flat_ids = id_vals.ravel().astype(np.int64)
+        flat_rows = rows.ravel()
+        flat_cols = cols.ravel()
+
+        self._id_to_rc = dict(zip(
+            flat_ids.tolist(),
+            zip(
+                flat_rows.tolist(),
+                flat_cols.tolist()
+            )
+        ))
                 
     def _next_time(self, t):
         idx = np.where(self.time_steps.values == t)[0][0]
@@ -386,10 +432,13 @@ class AMDModel:
             if var in self.dataset.data_vars:
                 self.dataset[var] = self.dataset[var] * mass
                 self.dataset[var].attrs["units"] = "g"
-        
-        # calculate volume in liters for each cell and timestep
-        volume = self.dataset["Q"] * self.time_step_seconds * 1000  # L
-        volume.attrs = {"units": "L", "description": "Water volume per timestep"}
+        steps_total = np.arange(1, len(self.time_steps) + 1)
+
+        # calculate volume in liters through cell cumulative 
+        cumulative_vol = (
+            self.dataset["Q"] * self.time_step_seconds * 1000
+        ) * xr.DataArray(steps_total, dims = ["time"])
+
         
         # convert to concentration (g/L) except hydrogen_ion
         for var in molar_masses.keys():
@@ -397,14 +446,19 @@ class AMDModel:
                 continue
             if var in self.dataset.data_vars:
                 # avoid division by zero: replace zero volume with NaN or 0
-                conc = xr.where(volume > 0, self.dataset[var] / volume, 0)
+                conc = xr.where(cumulative_vol > 0, 
+                    self.dataset[var] / cumulative_vol, 
+                    0
+                    )
                 self.dataset[var] = conc
                 self.dataset[var].attrs["units"] = "g/L"
         
         # compute pH from H⁺ concentration (mol/L)
         if "hydrogen_ion" in self.dataset.data_vars:
             # H⁺ in mol/L = (H⁺ moles) / volume
-            h_conc = xr.where(volume > 0, self.dataset["hydrogen_ion"] / volume, np.nan)
+            h_conc = xr.where(cumulative_vol > 0, 
+                              self.dataset["hydrogen_ion"] / cumulative_vol, 
+                              np.nan)
             # pH = -log10([H⁺]), clip to avoid log of zero/negative
             pH = -np.log10(h_conc.where(h_conc > 0, np.nan))
             self.dataset["pH"] = pH
@@ -422,6 +476,8 @@ class AMDModel:
 
         self.tree = cKDTree(target_points)
         self.n_lon = len(target_lon)
+
+        self._time_index = {t: i for i, t in enumerate(self.dataset.time.values)}
 
 
         
