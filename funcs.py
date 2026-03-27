@@ -69,7 +69,7 @@ def mindat_collector(region, material_id = 3314, mineral_strings = "(Fe|S)", mat
     print(f"\nSuccesfully saved data to: {path_str}mindat_data/{region}_{material_name}.csv")
     return
 
-def vecor_rasterisation(output_path = "../data/mines_raster.tif", flo1k_path = "../data/flo_IPB_2015.nc", vector_path = "../data/mine_polygons/74548_projected polygons.shp"):
+def vector_rasterisation(output_path = "../data/mines_raster.tif", flo1k_path = "../data/flo_IPB_2015.nc", vector_path = "../data/mine_polygons/74548_projected polygons.shp"):
     # rasterise mining polygons
     # code sourced from: K. Haven 2019 https://medium.com/data-science/use-python-to-convert-polygons-to-raster-with-gdal-rasterizelayer-b0de1ec3267
     nc_path = flo1k_path
@@ -117,7 +117,7 @@ def vecor_rasterisation(output_path = "../data/mines_raster.tif", flo1k_path = "
 def flo1k_prep(flo1k_path = "../data/FLO1K.ts.1960.2015.qav.nc", 
                basins_path = "../data/hybas_eu_lev01-06_v1c/hybas_eu_lev04_v1c.shp",
                basins_iloc = (45, 53),
-               date = pd.Timestamp(year = 2015, month = 1, day = 1),
+               date = np.datetime64("2015-01-01"),
                output_path = f"../data/flo_IPB_"):
     
     
@@ -127,12 +127,22 @@ def flo1k_prep(flo1k_path = "../data/FLO1K.ts.1960.2015.qav.nc",
     aoi = basins.iloc[basins_iloc[0]:basins_iloc[1]]
     aoi_lat = [float(aoi.total_bounds[1]), float(aoi.total_bounds[3])]
     aoi_lon = [float(aoi.total_bounds[0]), float(aoi.total_bounds[2])]
-    flo_aoi_date = flo_one_k["qav"].sel(time = date,
-                                  lon = slice(aoi_lon[0], aoi_lon[1]),
-                                  lat = slice(aoi_lat[0], aoi_lat[1]))
+
+    if isinstance(date, np.datetime64):
+        flo_aoi_date = flo_one_k["qav"].sel(time = date,
+                                lon = slice(aoi_lon[0], aoi_lon[1]),
+                                lat = slice(aoi_lat[0], aoi_lat[1]))
+    elif isinstance(date, np.ndarray):
+            flo_aoi_date = flo_one_k["qav"].sel(time = slice(date[0], date[-1]),
+                            lon = slice(aoi_lon[0], aoi_lon[1]),
+                            lat = slice(aoi_lat[0], aoi_lat[1]))
+
     flo_aoi_date.rio.write_crs(aoi.crs, inplace = True)
     flo_aoi_date = flo_aoi_date.rio.clip(aoi.geometry, aoi.crs)
-    output_path = f"{output_path}{date.year}.nc"
+    if isinstance(date, np.datetime64):
+        output_path = f"{output_path}{pd.Timestamp(date).year}.nc"
+    if isinstance(date, np.ndarray):
+        output_path = f"{output_path}{pd.Timestamp(date[0]).year}-{pd.Timestamp(date[-1]).year}.nc"
     flo_aoi_date.to_netcdf(output_path)
 
 def hydir_IDs(ds, aoi):
@@ -263,22 +273,49 @@ def cleanup_and_metadata(ds):
     ds["mines"] = ds["mines"].squeeze("band", drop=True)
     return ds
 
-def add_time(ds, year, length, frequency):
-    date_range = pd.date_range(f"{year}-01-01", periods = length, freq = frequency)
-    # Rename before expanding to avoid issues
-    ds = ds.rename({"qav": "Q"})
-    # Expand Q with the time dimension
-    ds["Q"] = ds["Q"].expand_dims(time=date_range)
-    ds = ds.set_coords('time')
-    
-    # Broadcast all other variables to match Q's dimensions and coordinates
+def add_time(ds, length, frequency):
+    start = ds.time.values[0]
+    n_years = len(ds.time)
+    date_range = pd.date_range(start, periods=n_years * length, freq=frequency)
+
+    Q_repeated = np.repeat(ds["qav"].values, length, axis=0)
+
+    Q_new = xr.DataArray(
+        Q_repeated,
+        dims=["time", "lat", "lon"],
+        coords={
+            "time": date_range,
+            "lat": ds.lat,
+            "lon": ds.lon,
+        },
+        attrs={
+            "units": "m3/s",
+            "description": f"Annual streamflow divided into {length} timesteps per year",
+        }
+    )
+    Q_new = Q_new / length
+
+    # Start with Q, then add back every other data variable from the original
+    ds_new = xr.Dataset({"Q": Q_new})
     for var in ds.data_vars:
-        if var != "Q":
-            ds[var] = ds[var].broadcast_like(ds["Q"])
-    
-    ds["Q"].attrs = {"units": "m3/s", "description": "Average annual streamflow divided by length of time within year (e.g.: 12 for months)"}
-    ds["Q"] = ds["Q"] / length
-    return ds
+        if var != "qav":
+            # Repeat static variables to match the new time dimension
+            if "time" in ds[var].dims:
+                var_repeated = np.repeat(ds[var].values, length, axis=0)
+                ds_new[var] = xr.DataArray(
+                    var_repeated,
+                    dims=["time", "lat", "lon"],
+                    coords={"time": date_range, "lat": ds.lat, "lon": ds.lon}
+                )
+            else:
+                ds_new[var] = ds[var]
+
+    # Restore non-time scalar coordinates (e.g. spatial_ref)
+    for coord in ds.coords:
+        if coord not in ("time", "lat", "lon") and coord not in ds_new.coords:
+            ds_new[coord] = ds[coord]
+
+    return ds_new
 
 def estimate_ore(ds, H, F):
     # uses ds["mines"] values, might be useful when it is filled with area, but not right now
@@ -319,10 +356,14 @@ def animation_plot(model, var, aoi = None, size = (10, 8), cmap = "Reds"):
 
     if aoi is not None:
         aoi.boundary.plot(ax = ax, color = "k")
-    
+        
     ani = animation.FuncAnimation(fig, _ani_update, frames = len(date_range), 
                                   repeat = True, interval = 500, blit = True)
     plt.close()
     return ani
 
+def vector_to_raster_sens(raster_file, vector_file):
+    vectors = gpd.read_file(vector_file)
+    raster = xr.load_dataset(raster_file)
 
+    return
