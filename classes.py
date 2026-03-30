@@ -10,18 +10,19 @@ import matplotlib.pyplot as plt
 from joblib import Parallel, delayed
 import os
 import netCDF4
+import dask
 
 
 class AMDModel:
 
-    def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc"):
+    def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc", calculation_output_path = "amdflow_calculated_output.nc"):
         self.dataset = dataset.copy(deep=True)
         self._Q = dataset["Q"].copy(deep=True)
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
         self.do = do
         self.output_path = output_path
-
+        self.calculation_output_path = calculation_output_path
         spatial_shape = (len(self.dataset.lat), len(self.dataset.lon))
         n_steps = len(self.dataset.time)
 
@@ -43,6 +44,7 @@ class AMDModel:
         self._buffer["hydrogen_ion"][0] = (1e-7 * volume_0).astype(np.float32)
 
         self._volume = self.dataset["Q"].values * self.time_step_seconds * 1000
+        self._cumulative_vol = np.zeros(spatial_shape, dtype = np.float64)
 
         self._create_output_file(n_steps, spatial_shape)
         
@@ -126,6 +128,7 @@ class AMDModel:
                 # advance frontier to the newly processed IDs
                 current_ids = out_ids
 
+            self._cumulative_vol += self._volume[ti]
             self._write_timestep(ti)
 
             # write back to buffer
@@ -303,63 +306,6 @@ class AMDModel:
     def _next_time(self, t):
         return self._next_time_map[t]
     
-    def output_calc(self):
-        # safety check to make sure calculations are not run twice
-        try:
-            if self.dataset["ferric_iron"].attrs["units"] == "g/L":
-                print("Output calculations already run, skipped to ensure calculations are not run twice")
-        except:
-            output = xr.load_dataset("amdflow_output.nc")
-            self.dataset = xr.merge([output, self.dataset])
-
-            # average molar mass per mole dict
-            molar_masses = {
-                "ferrous_iron": 55.845,
-                "ferric_iron": 55.845,
-                "sulphate": 96.056,
-                "hydrogen_ion": 1.008,
-                "iron_III_hydroxide": 106.866,
-            }
-
-            # convert moles to grams total per cell
-            for var, mass in molar_masses.items():
-                if var in self.dataset.data_vars:
-                    self.dataset[var] = self.dataset[var] * mass
-                    self.dataset[var].attrs["units"] = "g"
-            steps_total = np.arange(1, len(self.time_steps) + 1)
-
-            # calculate volume in liters through cell cumulative 
-            cumulative_vol = (
-                self._Q * self.time_step_seconds * 1000
-            ) * xr.DataArray(steps_total, dims = ["time"])
-
-            
-            # convert to concentration (g/L) except hydrogen_ion
-            for var in molar_masses.keys():
-                if var == "hydrogen_ion":
-                    continue
-                if var in self.dataset.data_vars:
-                    # avoid division by zero: replace zero volume with NaN or 0
-                    conc = xr.where(cumulative_vol > 0, 
-                        self.dataset[var] / cumulative_vol, 
-                        0
-                        )
-                    self.dataset[var] = conc
-                    self.dataset[var].attrs["units"] = "g/L"
-            
-            # compute pH from H⁺ concentration (mol/L)
-            if "hydrogen_ion" in self.dataset.data_vars:
-                # H⁺ in mol/L = (H⁺ moles) / volume
-                h_conc = xr.where(cumulative_vol > 0, 
-                                self.dataset["hydrogen_ion"] / cumulative_vol, 
-                                np.nan)
-                # pH = -log10([H⁺]), clip to avoid log of zero/negative
-                pH = -np.log10(h_conc.where(h_conc > 0, np.nan))
-                self.dataset["pH"] = pH
-                self.dataset["pH"].attrs = {"units": "pH", "description": "pH value"}
-                self.dataset["hydrogen_ion"] = h_conc
-                self.dataset["hydrogen_ion"].attrs["units"] = "mol/L"
-    
     def _create_output_file(self, n_steps, spatial_shape):
         with netCDF4.Dataset(self.output_path, "w", format = "NETCDF4") as nc:
 
@@ -386,11 +332,11 @@ class AMDModel:
 
             # chem vars
             attrs = {
-                "ferrous_iron": ("mol/timestep", "Fe²⁺"),
-                "ferric_iron": ("mol/timestep", "Fe³⁺"),
-                "sulphate": ("mol/timestep", "SO₄²⁻"),
-                "hydrogen_ion": ("mol/timestep", "H⁺"),
-                "iron_III_hydroxide": ("mol/timestep", "Fe(OH)₃")
+                "ferrous_iron": ("g/L", "Fe²⁺"),
+                "ferric_iron": ("g/L", "Fe³⁺"),
+                "sulphate": ("g/L", "SO₄²⁻"),
+                "hydrogen_ion": ("g/L", "H⁺"),
+                "iron_III_hydroxide": ("g/L", "Fe(OH)₃")
                 }
 
             for var in self._chem_vars:
@@ -406,8 +352,42 @@ class AMDModel:
                 v.units = attrs[var][0]
                 v.description = attrs[var][1]
             
+            ph_var = nc.createVariable(
+                "pH", "f4",
+                ("time", "lat", "lon"),
+                chunksizes=(1, spatial_shape[0], spatial_shape[1]),
+                zlib=True, complevel=4, fill_value=np.nan   
+            )
+
+            ph_var.units = "pH"
+            ph_var.description = "pH value calculated from hydron concentration"
+            
     def _write_timestep(self, ti):
+        vol = self._cumulative_vol
+        molar_masses = {
+            "ferrous_iron":       55.845,
+            "ferric_iron":        55.845,
+            "sulphate":           96.056,
+            "hydrogen_ion":       1.008,
+            "iron_III_hydroxide": 106.866,
+            }
+        
         with netCDF4.Dataset(self.output_path, "r+") as nc:
             for var in self._chem_vars:
-                nc[var][ti, :, :] = self._buffer[var][0]
-        
+                data = self._buffer[var][0]
+                mass = molar_masses[var]
+                if var == "hydrogen_ion":
+                    
+                    with np.errstate(divide = "ignore", invalid = "ignore"):
+                        conc = np.where(vol > 0, data / vol, np.nan)
+                    nc[var][ti, :, :] = conc.astype(np.float32)
+
+                    with np.errstate(divide = "ignore", invalid = "ignore"):
+                        ph = np.where(conc > 0, -np.log10(conc), np.nan)
+                    nc["pH"][ti, :, :] = ph.astype(np.float32)
+
+                else:
+                    grams = data * mass
+                    with np.errstate(divide = "ignore", invalid = "ignore"):
+                        conc = np.where(vol > 0, grams / vol, np.nan)
+                    nc[var][ti, :, :] = conc.astype(np.float32)
