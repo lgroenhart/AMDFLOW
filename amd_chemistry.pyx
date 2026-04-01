@@ -39,7 +39,7 @@ def process_chemistry(
     cdef double k1_ox      = 8.0e13 / 60.0
     cdef double k2_ox      = 1.0e-7 / 60.0
     cdef double p02        = 0.21
-    cdef double Kw         = 1.0e14
+    cdef double Kw         = 1.0e-14
     cdef double do_sqrt    = do_val ** 0.5
 
     # Per-iteration temporaries — declared once at C scope
@@ -54,7 +54,16 @@ def process_chemistry(
     for i in range(n):
         if not isfinite(volume[i]) or not isfinite(ore[i]) or not isfinite(fe2[i]):
             continue
-        vol_safe = volume[i] if volume[i] > 0.0 else 1.0
+        
+        if volume[i] <= 0.0:
+            continue
+        
+        if (not isfinite(fe2[i]) or not isfinite(fe3[i]) or
+            not isfinite(so4[i]) or not isfinite(h[i]) or
+            not isfinite(fe_oh3[i])):
+            continue
+        
+        vol_safe = volume[i]
         h2o = (0.99704702 * (volume[i] * 1000.0)) / 18.01528
 
         # ── Step 1: pyrite oxidation by ferric iron ──────────────────────
@@ -72,6 +81,12 @@ def process_chemistry(
             fe3[i]  -= ferric_consumed
             h[i]    += ferric_consumed * 1.14
 
+        fe2[i] = fmax(fe2[i], 0.0)
+        fe3[i] = fmax(fe3[i], 0.0)
+        so4[i] = fmax(so4[i], 0.0)
+        h[i]   = fmax(h[i],   0.0)
+        fe_oh3[i] = fmax(fe_oh3[i], 0.0)
+
         # ── Step 2: pyrite oxidation by dissolved O₂ ─────────────────────
         if ore[i] > 0.0:
             h_conc_2  = h[i] / vol_safe
@@ -82,6 +97,12 @@ def process_chemistry(
             so4[i]  += 2.0 * ferrous_amount
             h[i]    += 2.0 * ferrous_amount
 
+        fe2[i] = fmax(fe2[i], 0.0)
+        fe3[i] = fmax(fe3[i], 0.0)
+        so4[i] = fmax(so4[i], 0.0)
+        h[i]   = fmax(h[i],   0.0)
+        fe_oh3[i] = fmax(fe_oh3[i], 0.0)
+
         # ── Step 3: Fe²⁺ → Fe³⁺ oxidation (Singer & Stumm) ──────────────
         fe2_conc  = fe2[i] / vol_safe
         h_conc_3  = h[i]   / vol_safe
@@ -89,7 +110,9 @@ def process_chemistry(
         h_safe_3  = h_conc_3 if (isfinite(h_conc_3) and h_conc_3 > 0.0) else 1e-7
         h_safe_3  = fmax(h_safe_3, 1e-14)
         oh_conc   = Kw / h_safe_3
-        ox_rate   = (k1_ox * p02 + k2_ox * (oh_conc * oh_conc) * p02) * fe2_safe
+        # maybe correct rate expression?
+        ox_rate = (k1_ox * (oh_conc * oh_conc) * p02 + k2_ox * p02) * fe2_safe
+        #ox_rate   = (k1_ox * p02 + k2_ox * (oh_conc * oh_conc) * p02) * fe2_safe
         fe2_oxidised = fmin(ox_rate * vol_safe * time_step_seconds, fe2[i])
         if not isfinite(fe2_oxidised):
             fe2_oxidised = 0.0
@@ -97,12 +120,19 @@ def process_chemistry(
         h[i]    -= fe2_oxidised
         fe2[i]  -= fe2_oxidised
 
+        fe2[i] = fmax(fe2[i], 0.0)
+        fe3[i] = fmax(fe3[i], 0.0)
+        so4[i] = fmax(so4[i], 0.0)
+        h[i]   = fmax(h[i],   0.0)
+        fe_oh3[i] = fmax(fe_oh3[i], 0.0)
+
         # ── Step 4: Fe³⁺ ↔ Fe(OH)₃ equilibrium ──────────────────────────
-        diff        = fe3[i] - fe_oh3[i]
-        adjustment  = 0.5 * diff
-        fe3[i]     -= adjustment
-        fe_oh3[i]  += adjustment
-        h[i]       += adjustment * 3.0
+        diff = fe3[i] - fe_oh3[i]
+        adjustment = 0.5 * diff
+        fe3[i] = fmax(fe3[i] - adjustment, 0.0)
+        fe_oh3[i] = fmax(fe_oh3[i] + adjustment, 0.0)
+        h[i] = fmax(h[i] + adjustment * 3.0, 0.0)
+
 
         # ── Step 5: clip negatives ────────────────────────────────────────
         fe2[i]   = fmax(fe2[i],   0.0)

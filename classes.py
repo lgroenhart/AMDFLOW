@@ -10,14 +10,25 @@ import matplotlib.pyplot as plt
 from joblib import Parallel, delayed
 import os
 import netCDF4
-import dask
 
 
 class AMDModel:
 
     def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc", calculation_output_path = "amdflow_calculated_output.nc"):
         self.dataset = dataset.copy(deep=True)
-        self._Q = dataset["Q"].copy(deep=True)
+        self.dataset["Q"] = self.dataset["Q"].fillna(0.0)
+        self.dataset["ore"] = self.dataset["ore"].fillna(0.0)
+        self.dataset["ID"] = self.dataset["ID"].where(self.dataset["ID"] >= 0, -1)
+        self.dataset["outID"] = self.dataset["outID"].where(self.dataset["outID"] >= 0, -1)
+        self.dataset["source"] = self.dataset["source"].where(self.dataset["source"] == 1, 0)
+        
+        mask_source = (self.dataset["source"] == 1)
+        cond1 = ~mask_source.values
+        cond2 = (self.dataset["Q"].values > 0)
+        condition = np.logical_or(cond1, cond2)
+        self.dataset["Q"] = self.dataset["Q"].where(condition, 1e-12)
+        self._Q = self.dataset["Q"].copy(deep=True)
+        
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
         self.do = do
@@ -37,20 +48,23 @@ class AMDModel:
         self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400, "hour": 3600, "minute": 60}[self.t_unit]
         
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
-        # self._buffer["volume"] = self.dataset["Q"] * self.time_step_seconds * 1000  # L per timestep
-        # first_time = self.time_steps.values[0]
-        # self._buffer["hydrogen_ion"].loc[dict(time=first_time)] = (1e-7 * self._buffer["volume"].sel(time=first_time).astype(np.float32))
         volume_0 = self.dataset["Q"].isel(time=0).values * self.time_step_seconds * 1000
         self._buffer["hydrogen_ion"][0] = (1e-7 * volume_0).astype(np.float32)
 
         self._volume = self.dataset["Q"].values * self.time_step_seconds * 1000
         self._cumulative_vol = np.zeros(spatial_shape, dtype = np.float64)
+        self._prev_buffer = {
+            var: np.zeros(spatial_shape, dtype = np.float32)
+            for var in self._chem_vars
+        }
 
         self._create_output_file(n_steps, spatial_shape)
         
         low, high = 0.01, 1.0
         Q_ref = self.dataset["Q"].isel(time=0)
         norm = low + (Q_ref - Q_ref.min()) / (Q_ref.max() - Q_ref.min() + 1e-12) * (high - low)
+        if np.any(np.isnan(norm.values)):
+            raise ValueError("_norm_transport contains NaN – check Q_ref for NaN/inf")
         self._norm_transport = norm.values
         
         self._build_cache()
@@ -58,7 +72,8 @@ class AMDModel:
         
 
     def run(self, chunk_size=1000, n_jobs = -1, backend = "threading"):
-
+        # debug!!!!!!!
+        np.seterr(all='raise')
         ore_vals = self.dataset["ore"].values
         source_vals = self.dataset["source"].values
         id_vals = self.dataset["ID"].values
@@ -66,78 +81,81 @@ class AMDModel:
         upstream_mask = (ore_vals > 0) & (source_vals == 1)
         upstream_ids = id_vals[upstream_mask].astype(np.int64)
         upstream_ids = upstream_ids[upstream_ids >= 0]
+        with netCDF4.Dataset(self.output_path, "r+") as nc:
+            for ti, t in tqdm(enumerate(self.dataset.time.values)):
 
-        for ti, t in tqdm(enumerate(self.dataset.time.values)):
+                # track visited cells to prevent revisiting
+                visited = set(upstream_ids.tolist())
 
-            # track visited cells to prevent revisiting
-            visited = set(upstream_ids.tolist())
-
-            groups  = self._get_parallel_groups(upstream_ids, chunk_size)
-            #results = [self._compute_slice(group, t, ti) for group in groups]
-            results = Parallel(n_jobs=n_jobs, backend = backend)(
-                delayed(self._compute_slice)(group, t, ti) for group in groups
-            )
-            results = [r for r in results if r is not None]
-
-            for result in results:
-                self._update_dataset(t, result)
-            if ti < len(self.time_steps) - 1:
-                for result in results:
-                    self._transport(t, result)
-
-            
-            current_ids = upstream_ids
-
-            while len(current_ids) > 0:
-                # get downstream IDs from current frontier
-                valid_mask = (current_ids <= len(self._id_to_outid) -1)
-                out_ids = self._id_to_outid[current_ids[valid_mask]]
-                out_ids = out_ids[
-                    np.isfinite(out_ids) & (out_ids >= 0)
-                ]
-
-                # only process cells not yet visited this timestep
-                out_ids = np.unique(out_ids)
-                out_ids = out_ids[[i not in visited for i in out_ids]]
-
-                if len(out_ids) == 0:
-                    break
-
-                visited.update(out_ids.tolist())
-
-                groups = self._get_parallel_groups(out_ids, chunk_size)
-                
-                # parallel only when there are multiple groups
-                if len(groups) > 4:
-                    results = Parallel(n_jobs=n_jobs, backend = backend)(
-                        delayed(self._compute_slice)(group, t, ti) for group in groups
-                    )
-                else:
-                    results = [self._compute_slice(group, t, ti) for group in groups]
-                
+                groups  = self._get_parallel_groups(upstream_ids, chunk_size)
+                #results = [self._compute_slice(group, t, ti) for group in groups]
+                results = Parallel(n_jobs=n_jobs, backend = backend)(
+                    delayed(self._compute_slice)(group, t, ti) for group in groups
+                )
                 results = [r for r in results if r is not None]
 
                 for result in results:
                     self._update_dataset(t, result)
-
-                
                 if ti < len(self.time_steps) - 1:
                     for result in results:
                         self._transport(t, result)
 
-                # advance frontier to the newly processed IDs
-                current_ids = out_ids
+                
+                current_ids = upstream_ids
 
-            self._cumulative_vol += self._volume[ti]
-            self._write_timestep(ti)
+                while len(current_ids) > 0:
+                    # get downstream IDs from current frontier
+                    valid_mask = (current_ids <= len(self._id_to_outid) -1)
+                    out_ids = self._id_to_outid[current_ids[valid_mask]]
+                    out_ids = out_ids[
+                        np.isfinite(out_ids) & (out_ids >= 0)
+                    ]
 
-            # write back to buffer
-            for var in self._chem_vars:
-                self._buffer[var][0] = self._buffer[var][0] + self._buffer[var][1]
-                self._buffer[var][1] = 0.0
+                    # only process cells not yet visited this timestep
+                    out_ids = np.unique(out_ids)
+                    out_ids = out_ids[[i not in visited for i in out_ids]]
+
+                    if len(out_ids) == 0:
+                        break
+
+                    visited.update(out_ids.tolist())
+
+                    groups = self._get_parallel_groups(out_ids, chunk_size)
+                    
+                    # parallel only when there are multiple groups
+                    if len(groups) > 4:
+                        results = Parallel(n_jobs=n_jobs, backend = backend)(
+                            delayed(self._compute_slice)(group, t, ti) for group in groups
+                        )
+                    else:
+                        results = [self._compute_slice(group, t, ti) for group in groups]
+                    
+                    results = [r for r in results if r is not None]
+
+                    for result in results:
+                        self._update_dataset(t, result)
+
+                    
+                    if ti < len(self.time_steps) - 1:
+                        for result in results:
+                            self._transport(t, result)
+
+                    # advance frontier to the newly processed IDs
+                    current_ids = out_ids
+
+                self._cumulative_vol += self._volume[ti]
+                self._write_timestep(ti, nc)
+
+                # write back to buffers
+                for var in self._chem_vars:
+                    self._buffer[var][0] = self._buffer[var][0] + self._buffer[var][1]
+                    self._buffer[var][1] = 0.0
+                
+                # needs to be outside of previous loop to prevent weird behaviour at first timestep
+                for var in self._chem_vars:
+                    self._prev_buffer[var] = self._buffer[var][0].copy()
 
     def _compute_slice(self, cell_ids, t, ti):
-
         # Convert IDs → indices (vectorized, no Python loops)
         cell_ids = np.asarray(cell_ids, dtype=np.int64)
 
@@ -173,6 +191,13 @@ class AMDModel:
         so4    = np.ascontiguousarray(so4, dtype=np.float64)
         h      = np.ascontiguousarray(h, dtype=np.float64)
         fe_oh3 = np.ascontiguousarray(fe_oh3, dtype=np.float64)
+
+        # debug!!!!!!!
+        if np.isnan(fe2).any():
+            print(f"NaN in fe2 at timestep {ti}, cell IDs: {cell_ids[np.isnan(fe2)]}")
+        # debug!!!!!!!
+        if np.isnan(fe3).any():
+            print(f"NaN in fe3 at timestep {ti}, cell IDs: {cell_ids[np.isnan(fe3)]}")
 
         # CPython chemistry call
         process_chemistry(
@@ -221,8 +246,8 @@ class AMDModel:
         # Reconstruct IDs and outIDs from the dataset using (rows, cols)
         ids     = self.dataset["ID"].values[rows, cols]
         out_ids = self.dataset["outID"].values[rows, cols]
-
-        valid = np.isfinite(out_ids) & (out_ids != -1)
+        
+        valid = np.isfinite(out_ids) & (out_ids >= 0)
 
         if not valid.any():
             return
@@ -246,10 +271,32 @@ class AMDModel:
 
         src_trs = self._norm_transport[src_row, src_col]
 
+        # make and use mask for volume > 0
+        time_idx = self._time_index[t]
+        src_vol = self._volume[time_idx, src_row, src_col]
+        valid_vol = src_vol > 0
+
+        if not valid_vol.any():
+            return
+        
+        src_row = src_row[valid_vol]
+        src_col = src_col[valid_vol]
+        dst_row = dst_row[valid_vol]
+        dst_col = dst_col[valid_vol]
+        src_trs = src_trs[valid_vol]
+        
         for var in key_vars:
             arr  = self._arrays[var]
 
             src_vals = arr[0, src_row, src_col]
+
+            # debug!!!!!!!!!!!!!!
+            if np.isnan(src_vals).any():
+                print(f"NaN in source values for variable '{var}' at timestep {t}, cell IDs: {src_ids[np.isnan(src_vals)]}")
+            if np.isnan(src_trs).any():
+                print(f"NaN in transport factors for variable '{var}' at timestep {t}, cell IDs: {src_ids[np.isnan(src_trs)]}")
+            # debug!!!!!!!!!!!!!!
+
             moved    = src_vals * src_trs
             arr[0, src_row, src_col] -= moved
             arr[0, src_row, src_col] = np.maximum(arr[0, src_row, src_col], 0)
@@ -273,7 +320,7 @@ class AMDModel:
             )
         ))
 
-        max_id = int(np.nanmax(self.dataset["ID"].values))
+        max_id = int(np.nanmax(self.dataset["ID"].values[self.dataset["ID"].values >= 0]))
         self._id_to_row = np.full(max_id + 1, -1, dtype=np.int32)
         self._id_to_col = np.full(max_id + 1, -1, dtype=np.int32)
         self._id_to_outid = np.full(max_id + 1, -1, dtype=np.int64)
@@ -284,7 +331,7 @@ class AMDModel:
             if id_val >= 0:
                 self._id_to_row[id_val] = r
                 self._id_to_col[id_val] = c
-                self._id_to_outid[id_val] = int(out) if np.isfinite(out) else -1
+                self._id_to_outid[id_val] = int(out) if out >= 0 else -1
 
         self._arrays = {
             var: self._buffer[var]
@@ -350,8 +397,18 @@ class AMDModel:
                 )
 
                 v.units = attrs[var][0]
-                v.description = attrs[var][1]
+                v.description = f"{attrs[var][1]} - flow weighted mean (cumulative volume) concentration"
             
+                v_instant = nc.createVariable(
+                    f"{var}_instant", "f4",
+                    ("time", "lat", "lon"),
+                    chunksizes=(1, spatial_shape[0], spatial_shape[1]),
+                    zlib=True, complevel=4, fill_value=np.nan
+                )
+
+                v_instant.units = attrs[var][0]
+                v_instant.description = f"{attrs[var][1]} - instant concentration at timestep"
+
             ph_var = nc.createVariable(
                 "pH", "f4",
                 ("time", "lat", "lon"),
@@ -362,32 +419,60 @@ class AMDModel:
             ph_var.units = "pH"
             ph_var.description = "pH value calculated from hydron concentration"
             
-    def _write_timestep(self, ti):
-        vol = self._cumulative_vol
+            ph_instant = nc.createVariable(
+                "pH_instant", "f4",
+                ("time", "lat", "lon"),
+                chunksizes=(1, spatial_shape[0], spatial_shape[1]),
+                zlib=True, complevel=4, fill_value=np.nan
+            )
+
+            ph_instant.units = "pH"
+            ph_instant.description = "pH value calculated from instant hydron concentration at timestep"
+
+    def _write_timestep(self, ti, nc):
+        cum_vol = self._cumulative_vol
+        step_vol = self._volume[ti]
+
         molar_masses = {
             "ferrous_iron":       55.845,
             "ferric_iron":        55.845,
             "sulphate":           96.056,
             "hydrogen_ion":       1.008,
             "iron_III_hydroxide": 106.866,
-            }
-        
-        with netCDF4.Dataset(self.output_path, "r+") as nc:
-            for var in self._chem_vars:
-                data = self._buffer[var][0]
-                mass = molar_masses[var]
-                if var == "hydrogen_ion":
-                    
-                    with np.errstate(divide = "ignore", invalid = "ignore"):
-                        conc = np.where(vol > 0, data / vol, np.nan)
-                    nc[var][ti, :, :] = conc.astype(np.float32)
+        }
 
-                    with np.errstate(divide = "ignore", invalid = "ignore"):
-                        ph = np.where(conc > 0, -np.log10(conc), np.nan)
+        with np.errstate(under='ignore', divide='ignore', invalid='ignore'):
+            for var in self._chem_vars:
+                total_moles = self._buffer[var][0]
+                delta_moles = total_moles - self._prev_buffer[var]
+                delta_moles = np.maximum(delta_moles, 0)  # prevent negative deltas
+                mass = molar_masses[var]
+
+                if var == "hydrogen_ion":
+                    conc_cum = np.where(cum_vol > 0, total_moles / cum_vol, np.nan)
+                    nc[var][ti, :, :] = conc_cum.astype(np.float32)
+
+                    ph = np.where(conc_cum > 0, -np.log10(conc_cum), np.nan)
                     nc["pH"][ti, :, :] = ph.astype(np.float32)
 
+                    if ti == len(self.time_steps) - 1:
+                        conc_instant = np.full_like(conc_cum, np.nan)
+                    else:
+                        conc_instant = np.where(step_vol > 0, delta_moles / step_vol, np.nan)
+                    nc[f"{var}_instant"][ti, :, :] = conc_instant.astype(np.float32)
+
+                    ph_instant = np.where(conc_instant > 0, -np.log10(conc_instant), np.nan)
+                    nc["pH_instant"][ti, :, :] = ph_instant.astype(np.float32)
+
                 else:
-                    grams = data * mass
-                    with np.errstate(divide = "ignore", invalid = "ignore"):
-                        conc = np.where(vol > 0, grams / vol, np.nan)
-                    nc[var][ti, :, :] = conc.astype(np.float32)
+                    total_grams = total_moles * mass
+                    conc_cum = np.where(cum_vol > 0, total_grams / cum_vol, np.nan)
+                    nc[var][ti, :, :] = conc_cum.astype(np.float32)
+
+                    delta_grams = delta_moles * mass
+                    if ti == len(self.time_steps) - 1:
+                        conc_instant = np.full_like(conc_cum, np.nan)
+                    else:
+                        conc_instant = np.where(step_vol > 0, delta_grams / step_vol, np.nan)
+                    nc[f"{var}_instant"][ti, :, :] = conc_instant.astype(np.float32)
+

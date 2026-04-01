@@ -317,17 +317,17 @@ def add_time(ds, length, frequency):
 
     return ds_new
 
-def estimate_ore(ds, H, F):
+def estimate_ore(ds, F):
     # uses ds["mines"] values, might be useful when it is filled with area, but not right now
     #ds["ore"] = ds["mines"].where(ds["mines"].notnull(), 0) * (H * ((4 * 1000) / 4) * F * 27)
 
-    constant = H * 1000 * F * 27
+    constant = 27000 * F
     ds["ore"] = xr.where(ds["mines"].notnull(), constant, np.nan)
     ds["ore"].attrs = {"description": "Estimation of reactive ore per cell", "unit": "m2",}
     ds = ds.drop_vars(["mines"])
     return ds
 
-def animation_plot(model, var, aoi = None, size = (10, 8), cmap = "Reds"):
+def animation_plot(dataarray, aoi = None, size = (10, 8), cmap = "Reds"):
 
     def _ani_update(t):
         im.set_data(plot_data[t].values)
@@ -335,22 +335,18 @@ def animation_plot(model, var, aoi = None, size = (10, 8), cmap = "Reds"):
         return [im]
     
     fig, ax = plt.subplots(figsize = size)
-    if var != "pH":
-        plot_data = model.dataset[var].where(model.dataset[var] > 0)
-    else:
-        plot_data = model.dataset[var].where(model.dataset[var] < 7)
-    
+    plot_data = dataarray
     im = ax. imshow(plot_data[0].values, cmap = cmap, 
                     extent=[plot_data.lon.min(), plot_data.lon.max(), 
                             plot_data.lat.min(), plot_data.lat.max()],
                             origin='lower', aspect='auto')
     
-    cbar = fig.colorbar(im, ax = ax, label = f"{var} {model.dataset[var].attrs["units"]}")
+    cbar = fig.colorbar(im, ax = ax, label = f"{dataarray.name} ({dataarray.units})")
 
     date_range = [(day, month, year) for day, month, year in zip(
-        model.dataset.time.dt.day.values,  
-        model.dataset.time.dt.month.values, 
-        model.dataset.time.dt.year.values)]
+        dataarray.time.dt.day.values,  
+        dataarray.time.dt.month.values, 
+        dataarray.time.dt.year.values)]
     
     title = ax.set_title(f"{date_range[0][0]}/{date_range[0][1]}/{date_range[0][2]}")
 
@@ -367,3 +363,42 @@ def vector_to_raster_sens(raster_file, vector_file):
     raster = xr.load_dataset(raster_file)
 
     return
+
+def sel_nearest_where(da, lat, lon, condition):
+    """
+    Select the nearest lat/lon point in ds[var] that satisfies condition.
+    
+    Parameters
+    ----------
+    ds        : xr.Dataset
+    var       : variable name to apply condition to
+    lat, lon  : target coordinates
+    condition : callable applied to ds[var], e.g. lambda x: x > 0
+    """
+    lat = float(lat)
+    lon = float(lon)
+    # mask to valid cells only
+    valid = condition(da)           # DataArray of bools
+    da_valid = da.where(valid)           # NaN everywhere condition is False
+
+    lats = da.lat.values.astype(float)
+    lons = da.lon.values.astype(float)
+
+    # compute distance from target point to every grid cell
+    dlat = lats - lat
+    dlon = lons - lon
+    dlat_2d, dlon_2d = np.meshgrid(dlat, dlon, indexing = "ij")
+    dist = np.sqrt(dlat_2d**2 + dlon_2d**2)   # shape (lat, lon)
+
+    # mask distances where condition is not met
+    valid_mask = valid.any(dim="time") if "time" in valid.dims else valid
+    dist[~valid_mask] = np.nan
+
+    # find the lat/lon of the minimum valid distance
+    flat_idx  = np.nanargmin(dist)
+    best_lat_idx, best_lon_idx = np.unravel_index(flat_idx, dist.shape)
+
+    best_lat = float(lats[best_lat_idx])
+    best_lon = float(lons[best_lon_idx])
+
+    return da_valid.sel(lat=best_lat, lon=best_lon)
