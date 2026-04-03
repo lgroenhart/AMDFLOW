@@ -15,7 +15,7 @@ ctypedef np.float64_t DTYPE_t
 @cython.cdivision(True)
 @cython.nonecheck(False)
 def process_chemistry(
-    # Memoryviews — direct pointer to the NumPy buffer, no Python overhead
+    # Memoryviews — direct pointer to the NumPy buffer
     double[::1] fe2,
     double[::1] fe3,
     double[::1] so4,
@@ -27,13 +27,12 @@ def process_chemistry(
     double time_step_seconds  # scalar
 ):
     """
-    Runs all 5 chemistry steps in a single C-speed loop over n cells.
-    Modifies arrays in-place — no copies, no return value needed.
-    """
+    chemistry steps in a single C-speed loop over n cells.
+    """"
     cdef Py_ssize_t n = fe2.shape[0]
     cdef Py_ssize_t i
 
-    # Pre-compute constants outside the loop (hoisted to C scope)
+    # pre-compute constants
     cdef double k_ferric   = 10.0**-9.74 * 10.0**4 / 60.0
     cdef double k_do       = 10.0**-8.19
     cdef double k1_ox      = 1.33e12
@@ -42,7 +41,7 @@ def process_chemistry(
     cdef double Kw         = 1.0e-14
     cdef double do_sqrt    = do_val ** 0.5
 
-    # Per-iteration temporaries — declared once at C scope
+    # per-iteration temporaries
     cdef double vol_safe, h2o
     cdef double fe3_conc, h_conc, fe3_safe, h_safe
     cdef double rate, ferric_consumed, max_ferric
