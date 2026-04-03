@@ -13,8 +13,31 @@ import netCDF4
 
 
 class AMDModel:
-
+    """AMDModel class for Acid Mine Drainage modelling
+    This class takes in a dataset containing variables (Q, ore, ID, outID, source) and runs the AMD flow model over time (.run()),
+    results are written to output_path as a netCDF file
+    """
     def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc", calculation_output_path = "amdflow_calculated_output.nc"):
+        """_summary_
+
+        Parameters
+        ----------
+        dataset : _type_
+            _description_
+        t_unit : _type_
+            _description_
+        do : _type_, optional
+            _description_, by default 10/31998
+        output_path : str, optional
+            _description_, by default "amdflow_output.nc"
+        calculation_output_path : str, optional
+            _description_, by default "amdflow_calculated_output.nc"
+
+        Raises
+        ------
+        ValueError
+            _description_
+        """
         self.dataset = dataset.copy(deep=True)
         self.dataset["Q"] = self.dataset["Q"].fillna(0.0)
         self.dataset["ore"] = self.dataset["ore"].fillna(0.0)
@@ -143,13 +166,13 @@ class AMDModel:
                     # advance frontier to the newly processed IDs
                     current_ids = out_ids
 
-                self._cumulative_vol += self._volume[ti]
-                self._write_timestep(ti, nc)
-
                 # write back to buffers
                 for var in self._chem_vars:
                     self._buffer[var][0] = self._buffer[var][0] + self._buffer[var][1]
                     self._buffer[var][1] = 0.0
+                
+                self._cumulative_vol += self._volume[ti]
+                self._write_timestep(ti, nc)
                 
                 # needs to be outside of previous loop to prevent weird behaviour at first timestep
                 for var in self._chem_vars:
@@ -227,12 +250,12 @@ class AMDModel:
         
         rows, cols, fe2, fe3, so4, h, fe_oh3 = result
         time_idx = self._time_index[t]
-
-        self._buffer["ferrous_iron"][0, rows, cols] = fe2
-        self._buffer["ferric_iron"][0, rows, cols] = fe3
-        self._buffer["sulphate"][0, rows, cols] = so4
-        self._buffer["hydrogen_ion"][0, rows, cols] = h
-        self._buffer["iron_III_hydroxide"][0, rows, cols] = fe_oh3
+        with np.errstate(under='ignore'):
+            self._buffer["ferrous_iron"][0, rows, cols] = fe2
+            self._buffer["ferric_iron"][0, rows, cols] = fe3
+            self._buffer["sulphate"][0, rows, cols] = so4
+            self._buffer["hydrogen_ion"][0, rows, cols] = h
+            self._buffer["iron_III_hydroxide"][0, rows, cols] = fe_oh3
         
     def _transport(self, t, result):
         key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion", "sulphate"]
@@ -284,23 +307,23 @@ class AMDModel:
         dst_row = dst_row[valid_vol]
         dst_col = dst_col[valid_vol]
         src_trs = src_trs[valid_vol]
-        
-        for var in key_vars:
-            arr  = self._arrays[var]
+        with np.errstate(under='ignore'):
+            for var in key_vars:
+                arr  = self._arrays[var]
 
-            src_vals = arr[0, src_row, src_col]
+                src_vals = arr[0, src_row, src_col]
 
-            # debug!!!!!!!!!!!!!!
-            if np.isnan(src_vals).any():
-                print(f"NaN in source values for variable '{var}' at timestep {t}, cell IDs: {src_ids[np.isnan(src_vals)]}")
-            if np.isnan(src_trs).any():
-                print(f"NaN in transport factors for variable '{var}' at timestep {t}, cell IDs: {src_ids[np.isnan(src_trs)]}")
-            # debug!!!!!!!!!!!!!!
+                # debug!!!!!!!!!!!!!!
+                if np.isnan(src_vals).any():
+                    print(f"NaN in source values for variable '{var}' at timestep {t}, cell IDs: {src_ids[np.isnan(src_vals)]}")
+                if np.isnan(src_trs).any():
+                    print(f"NaN in transport factors for variable '{var}' at timestep {t}, cell IDs: {src_ids[np.isnan(src_trs)]}")
+                # debug!!!!!!!!!!!!!!
 
-            moved    = src_vals * src_trs
-            arr[0, src_row, src_col] -= moved
-            arr[0, src_row, src_col] = np.maximum(arr[0, src_row, src_col], 0)
-            np.add.at(arr[1], (dst_row, dst_col), moved) 
+                moved    = src_vals * src_trs
+                arr[0, src_row, src_col] -= moved
+                arr[0, src_row, src_col] = np.maximum(arr[0, src_row, src_col], 0)
+                np.add.at(arr[1], (dst_row, dst_col), moved) 
 
     def _build_cache(self):
         id_vals = self.dataset["ID"].values
