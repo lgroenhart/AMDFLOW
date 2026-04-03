@@ -17,26 +17,24 @@ class AMDModel:
     This class takes in a dataset containing variables (Q, ore, ID, outID, source) and runs the AMD flow model over time (.run()),
     results are written to output_path as a netCDF file
     """
-    def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc", calculation_output_path = "amdflow_calculated_output.nc"):
-        """_summary_
+    def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc"):
+        """class initialisation
 
         Parameters
         ----------
-        dataset : _type_
-            _description_
-        t_unit : _type_
-            _description_
-        do : _type_, optional
-            _description_, by default 10/31998
+        dataset : xr.Dataset
+            dataset containing variables: Q (time, lat, lon), ore (lat, lon), ID (lat, lon), outID (lat, lon), source (lat, lon)
+        t_unit : str
+            time unit for the model: "month", "week", "day", "hour", or "minute", should align with timesteps of the dataset
+        do : float, optional
+            dissolved oxygen concentration, by default 10/31998
         output_path : str, optional
-            _description_, by default "amdflow_output.nc"
-        calculation_output_path : str, optional
-            _description_, by default "amdflow_calculated_output.nc"
+            path to the output netCDF file, by default "amdflow_output.nc"
 
         Raises
         ------
         ValueError
-            _description_
+            ValueError if _norm_transport contains nan values, issue with dataset Q variable
         """
         self.dataset = dataset.copy(deep=True)
         self.dataset["Q"] = self.dataset["Q"].fillna(0.0)
@@ -56,7 +54,6 @@ class AMDModel:
         self.time_steps = self.dataset["time"]
         self.do = do
         self.output_path = output_path
-        self.calculation_output_path = calculation_output_path
         spatial_shape = (len(self.dataset.lat), len(self.dataset.lon))
         n_steps = len(self.dataset.time)
 
@@ -95,8 +92,20 @@ class AMDModel:
         
 
     def run(self, chunk_size=1000, n_jobs = -1, backend = "threading"):
-        # debug!!!!!!!
-        np.seterr(all='raise')
+        """Runs model over all time steps and spatial extent, writes results to output_path netCDF file
+
+        Parameters
+        ----------
+        chunk_size : int, optional
+            size of chunks to process in parallel, by default 1000
+                should be tuned based on dataset size, system memory, etc.
+        n_jobs : int, optional
+            number of parallel jobs to run, by default -1
+                should be tuned based on dataset size, system memory, etc.
+        backend : str, optional
+            parallel processing backend, by default "threading"
+                should be tuned based on dataset size, system memory, etc.
+        """
         ore_vals = self.dataset["ore"].values
         source_vals = self.dataset["source"].values
         id_vals = self.dataset["ID"].values
@@ -106,19 +115,18 @@ class AMDModel:
         upstream_ids = upstream_ids[upstream_ids >= 0]
         with netCDF4.Dataset(self.output_path, "r+") as nc:
             for ti, t in tqdm(enumerate(self.dataset.time.values)):
-
-                # track visited cells to prevent revisiting
+                # upper loop of all source cells with water and ore
                 visited = set(upstream_ids.tolist())
 
                 groups  = self._get_parallel_groups(upstream_ids, chunk_size)
-                #results = [self._compute_slice(group, t, ti) for group in groups]
+                
                 results = Parallel(n_jobs=n_jobs, backend = backend)(
                     delayed(self._compute_slice)(group, t, ti) for group in groups
                 )
                 results = [r for r in results if r is not None]
 
                 for result in results:
-                    self._update_dataset(t, result)
+                    self._update_buffer(t, result)
                 if ti < len(self.time_steps) - 1:
                     for result in results:
                         self._transport(t, result)
@@ -127,6 +135,8 @@ class AMDModel:
                 current_ids = upstream_ids
 
                 while len(current_ids) > 0:
+                    # lower loop to propagate through flow network from upper loop, until no more downstream cells to process
+                    
                     # get downstream IDs from current frontier
                     valid_mask = (current_ids <= len(self._id_to_outid) -1)
                     out_ids = self._id_to_outid[current_ids[valid_mask]]
@@ -156,7 +166,7 @@ class AMDModel:
                     results = [r for r in results if r is not None]
 
                     for result in results:
-                        self._update_dataset(t, result)
+                        self._update_buffer(t, result)
 
                     
                     if ti < len(self.time_steps) - 1:
@@ -179,13 +189,30 @@ class AMDModel:
                     self._prev_buffer[var] = self._buffer[var][0].copy()
 
     def _compute_slice(self, cell_ids, t, ti):
-        # Convert IDs → indices (vectorized, no Python loops)
+        """Calculate chemistry for slice of cells at timestep t/ti, passes arrays to CPython file (see: amd_chemistry.pyx) for processing,
+        returns arrays of row/col indices and chemistry outputs for input cells to be written back to main dataset
+
+        Parameters
+        ----------
+        cell_ids : np.ndarray
+            array of cell IDs to process in slice
+        t : np.datetime64
+            timestep to process
+        ti : int
+            index of timestep to process
+
+        Returns
+        -------
+        rows, cols, fe2, fe3, so4, h, fe_oh3: tuple of np.ndarrays
+            arrays containing the row, column indices, and chemistry outputs for input cells at timestep t/ti
+        """
+        # convert IDs to indices 
         cell_ids = np.asarray(cell_ids, dtype=np.int64)
 
         rows = self._id_to_row[cell_ids]
         cols = self._id_to_col[cell_ids]
 
-        # Filter invalid IDs
+        # filter invalid IDs
         valid = (rows >= 0) & (cols >= 0)
         if not np.any(valid):
             return None
@@ -195,7 +222,7 @@ class AMDModel:
 
         time_idx = self._time_index[t]
 
-        # Direct NumPy access (NO xarray)
+        # xarray to numpy arrays for CPython
         volume = self._volume[time_idx, rows, cols]
         ore    = self.dataset["ore"].values[rows, cols]
 
@@ -205,7 +232,7 @@ class AMDModel:
         h      = self._buffer["hydrogen_ion"][0, rows, cols]
         fe_oh3 = self._buffer["iron_III_hydroxide"][0, rows, cols]
 
-        # Ensure contiguous arrays (NO unnecessary copies)
+
         volume = np.ascontiguousarray(volume, dtype=np.float64)
         ore    = np.ascontiguousarray(ore, dtype=np.float64)
 
@@ -214,13 +241,6 @@ class AMDModel:
         so4    = np.ascontiguousarray(so4, dtype=np.float64)
         h      = np.ascontiguousarray(h, dtype=np.float64)
         fe_oh3 = np.ascontiguousarray(fe_oh3, dtype=np.float64)
-
-        # debug!!!!!!!
-        if np.isnan(fe2).any():
-            print(f"NaN in fe2 at timestep {ti}, cell IDs: {cell_ids[np.isnan(fe2)]}")
-        # debug!!!!!!!
-        if np.isnan(fe3).any():
-            print(f"NaN in fe3 at timestep {ti}, cell IDs: {cell_ids[np.isnan(fe3)]}")
 
         # CPython chemistry call
         process_chemistry(
@@ -232,6 +252,21 @@ class AMDModel:
         return rows, cols, fe2, fe3, so4, h, fe_oh3
     
     def _get_parallel_groups(self, cell_ids, chunk_size=None):
+        """Groups cell IDs into chunks for parallel processing, if chunk_size is None, it will be automatically determined based on number of CPU cores and number of cell IDs
+
+        Parameters
+        ----------
+        cell_ids : np.ndarray
+            array of cell IDs to group into chunks
+        chunk_size : int, optional
+            size of chunk, by default None,
+                if None, automatic chunk size calculation: not that great, should be set by user
+
+        Returns
+        -------
+        list of np.ndarray
+            list of chunks, each containing an array of cell IDs
+        """
         cell_ids = list(cell_ids)
         if chunk_size is None:
             n_workers = os.cpu_count()
@@ -239,12 +274,20 @@ class AMDModel:
             self.chunk_size = chunk_size
         return [cell_ids[i:i+chunk_size] for i in range(0, len(cell_ids), chunk_size)]
 
-    def _update_dataset(self, t, result):
-        """Update main dataset using vectorised scatter operation."""
+    def _update_buffer(self, t, result):
+        """Updates self._buffer with chemistry results from the computation
+
+        Parameters
+        ----------
+        t : np.datetime64
+            timestep to update buffer for
+        result : tuple of np.ndarrays
+            arrays containing the chemistry outputs for input cells at timestep t
+        """
         key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion",
                     "sulphate", "iron_III_hydroxide"]
 
-        # Quick return if slice is empty
+        # quick return if slice is empty
         if result is None:
             return
         
@@ -258,6 +301,15 @@ class AMDModel:
             self._buffer["iron_III_hydroxide"][0, rows, cols] = fe_oh3
         
     def _transport(self, t, result):
+        """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
+
+        Parameters
+        ----------
+        t : _type_
+            _description_
+        result : _type_
+            _description_
+        """
         key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion", "sulphate"]
         next_time = self._next_time(t)
         if next_time is None:
@@ -313,19 +365,15 @@ class AMDModel:
 
                 src_vals = arr[0, src_row, src_col]
 
-                # debug!!!!!!!!!!!!!!
-                if np.isnan(src_vals).any():
-                    print(f"NaN in source values for variable '{var}' at timestep {t}, cell IDs: {src_ids[np.isnan(src_vals)]}")
-                if np.isnan(src_trs).any():
-                    print(f"NaN in transport factors for variable '{var}' at timestep {t}, cell IDs: {src_ids[np.isnan(src_trs)]}")
-                # debug!!!!!!!!!!!!!!
-
                 moved    = src_vals * src_trs
                 arr[0, src_row, src_col] -= moved
                 arr[0, src_row, src_col] = np.maximum(arr[0, src_row, src_col], 0)
                 np.add.at(arr[1], (dst_row, dst_col), moved) 
 
     def _build_cache(self):
+        """Build cache at initialisation to pre-process certain static variables and mappings for faster access during model run, 
+        such as ID to row/col mapping, chemistry variable arrays, and next time mapping for timesteps
+        """
         id_vals = self.dataset["ID"].values
         out_vals = self.dataset["outID"].values
 
@@ -374,9 +422,31 @@ class AMDModel:
         self._time_index = {t: i for i, t in enumerate(self.dataset["time"].values)}
                 
     def _next_time(self, t):
+        """Get next timestep from _next_time_map cache
+
+        Parameters
+        ----------
+        t : np.datetime64
+            current timestep
+
+        Returns
+        -------
+        np.datetime64 or None
+            timestep after t, or None if t is last timestep
+        """
         return self._next_time_map[t]
     
     def _create_output_file(self, n_steps, spatial_shape):
+        """Create the initial netCDF output file (output_path) with the right dimensions, variables, etc.
+        to be written back to during model run
+
+        Parameters
+        ----------
+        n_steps : int
+            amount of timesteps in dataset
+        spatial_shape : tuple of ints
+            shape of spatial dimensions (lat, lon) in dataset
+        """
         with netCDF4.Dataset(self.output_path, "w", format = "NETCDF4") as nc:
 
             # dims
@@ -453,6 +523,14 @@ class AMDModel:
             ph_instant.description = "pH value calculated from instant hydron concentration at timestep"
 
     def _write_timestep(self, ti, nc):
+        """Writes chemistry results for timestep index ti from self._buffer to netCDF dataset nc at output_path
+        Parameters
+        ----------
+        ti : int
+            index of timestep
+        nc : netCDF4.Dataset()
+            the open netCDF dataset to write to, created in _create_output_file
+        """
         cum_vol = self._cumulative_vol
         step_vol = self._volume[ti]
 
