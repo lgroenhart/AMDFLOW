@@ -472,11 +472,11 @@ class AMDModel:
 
             # chem vars
             attrs = {
-                "ferrous_iron": ("g/L", "Fe²⁺"),
-                "ferric_iron": ("g/L", "Fe³⁺"),
-                "sulphate": ("g/L", "SO₄²⁻"),
-                "hydrogen_ion": ("g/L", "H⁺"),
-                "iron_III_hydroxide": ("g/L", "Fe(OH)₃")
+                "ferrous_iron": ("mg/L", "Fe²⁺"),
+                "ferric_iron": ("mg/L", "Fe³⁺"),
+                "sulphate": ("mg/L", "SO₄²⁻"),
+                "hydrogen_ion": ("mg/L", "H⁺"),
+                "iron_III_hydroxide": ("mg/L", "Fe(OH)₃")
                 }
 
             for var in self._chem_vars:
@@ -535,11 +535,11 @@ class AMDModel:
         step_vol = self._volume[ti]
 
         molar_masses = {
-            "ferrous_iron":       55.845,
-            "ferric_iron":        55.845,
-            "sulphate":           96.056,
-            "hydrogen_ion":       1.008,
-            "iron_III_hydroxide": 106.866,
+            "ferrous_iron":       55.845 * 1000,
+            "ferric_iron":        55.845 * 1000,
+            "sulphate":           96.056 * 1000,
+            "hydrogen_ion":       1.008 * 1000,
+            "iron_III_hydroxide": 106.866 * 1000,
         }
 
         with np.errstate(under='ignore', divide='ignore', invalid='ignore'):
