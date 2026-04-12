@@ -17,7 +17,7 @@ class AMDModel:
     This class takes in a dataset containing variables (Q, ore, ID, outID, source) and runs the AMD flow model over time (.run()),
     results are written to output_path as a netCDF file
     """
-    def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc"):
+    def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc", v = 0.5, D = 10):
         """class initialisation
 
         Parameters
@@ -30,6 +30,10 @@ class AMDModel:
             dissolved oxygen concentration, by default 10/31998
         output_path : str, optional
             path to the output netCDF file, by default "amdflow_output.nc"
+        v : float, optional
+            average velocity used for area calculation in transport, by default 0.5 m/s
+        D : float, optional
+            dispersion coefficient used in transport, by default 10 m**2/s
 
         Raises
         ------
@@ -49,6 +53,9 @@ class AMDModel:
         condition = np.logical_or(cond1, cond2)
         self.dataset["Q"] = self.dataset["Q"].where(condition, 1e-12)
         self._Q = self.dataset["Q"].copy(deep=True)
+        self.v = v
+        self.D = D
+        self.dx = 1000 
         
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
@@ -71,8 +78,8 @@ class AMDModel:
         volume_0 = self.dataset["Q"].isel(time=0).values * self.time_step_seconds * 1000
         self._buffer["hydrogen_ion"][0] = (1e-7 * volume_0).astype(np.float32)
 
-        self._volume = self.dataset["Q"].values * self.time_step_seconds * 1000
-        self._cumulative_vol = np.zeros(spatial_shape, dtype = np.float64)
+        self._Q_dataset = self.dataset["Q"]
+
         self._prev_buffer = {
             var: np.zeros(spatial_shape, dtype = np.float32)
             for var in self._chem_vars
@@ -181,7 +188,6 @@ class AMDModel:
                     self._buffer[var][0] = self._buffer[var][0] + self._buffer[var][1]
                     self._buffer[var][1] = 0.0
                 
-                self._cumulative_vol += self._volume[ti]
                 self._write_timestep(ti, nc)
                 
                 # needs to be outside of previous loop to prevent weird behaviour at first timestep
@@ -223,7 +229,7 @@ class AMDModel:
         time_idx = self._time_index[t]
 
         # xarray to numpy arrays for CPython
-        volume = self._volume[time_idx, rows, cols]
+        volume = self._get_volume(time_idx)[rows, cols]
         ore    = self.dataset["ore"].values[rows, cols]
 
         fe2    = self._buffer["ferrous_iron"][0, rows, cols]
@@ -305,10 +311,10 @@ class AMDModel:
 
         Parameters
         ----------
-        t : _type_
-            _description_
-        result : _type_
-            _description_
+        t : np.datetime64
+            timestep of model
+        result : tuple of np.ndarrays
+            arrays containing the row, column indices and chemistry outputs for cells at timestep t
         """
         key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion", "sulphate"]
         next_time = self._next_time(t)
@@ -344,11 +350,27 @@ class AMDModel:
         src_row, src_col = src_rc[:, 0], src_rc[:, 1]
         dst_row, dst_col = dst_rc[:, 0], dst_rc[:, 1]
 
-        src_trs = self._norm_transport[src_row, src_col]
+        
+        time_idx = self._time_index[t]
+
+        # advective, dispersive, decay calculations for transport
+        Q_values = self.dataset["Q"].values[time_idx, src_row, src_col]
+        A = Q_values / self.v # area calculation assuming 0.5 velocity
+        Q = Q_values
+        D = self.D
+        alpha = 0.01
+        A = np.maximum(A, 1e-6)
+        V_cell = A * self.dx
+
+        dispersion = 1 - np.exp(-D * self.time_step_seconds / self.dx**2)
+        advection = 1 - np.exp(-Q * self.time_step_seconds / V_cell)
+        decay = np.exp(-alpha * self.time_step_seconds)
+        alpha = 0.01
+
+        transport_frac = np.clip((advection + dispersion) * decay, 0, 1)
 
         # make and use mask for volume > 0
-        time_idx = self._time_index[t]
-        src_vol = self._volume[time_idx, src_row, src_col]
+        src_vol = self._get_volume(time_idx)[src_row, src_col]
         valid_vol = src_vol > 0
 
         if not valid_vol.any():
@@ -358,14 +380,14 @@ class AMDModel:
         src_col = src_col[valid_vol]
         dst_row = dst_row[valid_vol]
         dst_col = dst_col[valid_vol]
-        src_trs = src_trs[valid_vol]
+        transport_frac = transport_frac[valid_vol]
         with np.errstate(under='ignore'):
             for var in key_vars:
                 arr  = self._arrays[var]
 
                 src_vals = arr[0, src_row, src_col]
 
-                moved    = src_vals * src_trs
+                moved    = src_vals * transport_frac
                 arr[0, src_row, src_col] -= moved
                 arr[0, src_row, src_col] = np.maximum(arr[0, src_row, src_col], 0)
                 np.add.at(arr[1], (dst_row, dst_col), moved) 
@@ -490,17 +512,7 @@ class AMDModel:
                 )
 
                 v.units = attrs[var][0]
-                v.description = f"{attrs[var][1]} - flow weighted mean (cumulative volume) concentration"
-            
-                v_instant = nc.createVariable(
-                    f"{var}_instant", "f4",
-                    ("time", "lat", "lon"),
-                    chunksizes=(1, spatial_shape[0], spatial_shape[1]),
-                    zlib=True, complevel=4, fill_value=np.nan
-                )
-
-                v_instant.units = attrs[var][0]
-                v_instant.description = f"{attrs[var][1]} - instant concentration at timestep"
+                v.description = f"{attrs[var][1]} - instant concentration at timestep"
 
             ph_var = nc.createVariable(
                 "pH", "f4",
@@ -511,16 +523,6 @@ class AMDModel:
 
             ph_var.units = "pH"
             ph_var.description = "pH value calculated from hydron concentration"
-            
-            ph_instant = nc.createVariable(
-                "pH_instant", "f4",
-                ("time", "lat", "lon"),
-                chunksizes=(1, spatial_shape[0], spatial_shape[1]),
-                zlib=True, complevel=4, fill_value=np.nan
-            )
-
-            ph_instant.units = "pH"
-            ph_instant.description = "pH value calculated from instant hydron concentration at timestep"
 
     def _write_timestep(self, ti, nc):
         """Writes chemistry results for timestep index ti from self._buffer to netCDF dataset nc at output_path
@@ -531,8 +533,9 @@ class AMDModel:
         nc : netCDF4.Dataset()
             the open netCDF dataset to write to, created in _create_output_file
         """
-        cum_vol = self._cumulative_vol
-        step_vol = self._volume[ti]
+        A_vals  = np.maximum(self.dataset["Q"].values[ti] / self.v, 1e-6)  # m²
+        V_cell  = A_vals * self.dx          # m³
+        step_vol = V_cell * 1000            # litres, storage volume
 
         molar_masses = {
             "ferrous_iron":       55.845 * 1000,
@@ -550,30 +553,22 @@ class AMDModel:
                 mass = molar_masses[var]
 
                 if var == "hydrogen_ion":
-                    conc_cum = np.where(cum_vol > 0, total_moles / cum_vol, np.nan)
-                    nc[var][ti, :, :] = conc_cum.astype(np.float32)
-
-                    ph = np.where(conc_cum > 0, -np.log10(conc_cum), np.nan)
-                    nc["pH"][ti, :, :] = ph.astype(np.float32)
-
                     if ti == len(self.time_steps) - 1:
-                        conc_instant = np.full_like(conc_cum, np.nan)
+                        conc_instant = np.full_like(step_vol, np.nan)
                     else:
                         conc_instant = np.where(step_vol > 0, delta_moles / step_vol, np.nan)
-                    nc[f"{var}_instant"][ti, :, :] = conc_instant.astype(np.float32)
+                    nc[var][ti, :, :] = conc_instant.astype(np.float32)
 
                     ph_instant = np.where(conc_instant > 0, -np.log10(conc_instant), np.nan)
-                    nc["pH_instant"][ti, :, :] = ph_instant.astype(np.float32)
+                    nc["pH"][ti, :, :] = ph_instant.astype(np.float32)
 
                 else:
-                    total_grams = total_moles * mass
-                    conc_cum = np.where(cum_vol > 0, total_grams / cum_vol, np.nan)
-                    nc[var][ti, :, :] = conc_cum.astype(np.float32)
-
                     delta_grams = delta_moles * mass
                     if ti == len(self.time_steps) - 1:
-                        conc_instant = np.full_like(conc_cum, np.nan)
+                        conc_instant = np.full_like(step_vol, np.nan)
                     else:
                         conc_instant = np.where(step_vol > 0, delta_grams / step_vol, np.nan)
-                    nc[f"{var}_instant"][ti, :, :] = conc_instant.astype(np.float32)
+                    nc[var][ti, :, :] = conc_instant.astype(np.float32)
 
+    def _get_volume(self, ti):
+        return self._Q_dataset.isel(time = ti).values * self.time_step_seconds * 1000
