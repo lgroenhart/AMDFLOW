@@ -13,6 +13,7 @@ import numpy as np
 import matplotlib.colors as mcolors
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
+from IPython.display import HTML
 
 def mindat_collector(region, material_id = 3314, mineral_strings = "(Fe|S)", material_name = "pyrite", path_str = "../data/", mindat_api_str = "mindat_API_key.txt"):
     """Mindat data collector, queries mindat API in specific region for a specific mineral and checks if those minerals are located at a mine/quarry, saves locations at lat/lon csv file
@@ -142,7 +143,7 @@ def vector_rasterisation(output_path = "../data/mines_raster.tif", flo1k_path = 
     return
 
 def flo1k_prep(flo1k_path = "../data/FLO1K.ts.1960.2015.qav.nc", 
-               basins_path = "../data/hybas_eu_lev01-06_v1c/hybas_eu_lev04_v1c.shp",
+               basins_path = "../data/hybas_eu_lev01-04/hybas_eu_lev04_v1c.shp",
                basins_iloc = (45, 53),
                date = np.datetime64("2015-01-01"),
                output_path = f"../data/flo_IPB_"):
@@ -459,7 +460,7 @@ def estimate_ore(ds, F, ox_range = 27):
     ds = ds.drop_vars(["mines"])
     return ds
 
-def animation_plot(dataarray, aoi = None, size = (10, 8), cmap = "Reds"):
+def animation_plot(dataarray, aoi = None, size = (10, 8), cmap = "Reds", frame_skip = 1, dpi = 100):
     """Function to animate timeseries dataset of AMDFLOW
 
     Parameters
@@ -472,25 +473,34 @@ def animation_plot(dataarray, aoi = None, size = (10, 8), cmap = "Reds"):
         size of plot in inches, by default (10, 8)
     cmap : str, optional
         colour map of plot, see matplotlib cmap documentatio, by default "Reds"
+    frame_skip : int, optional
+        show every Nth frame to reduce animation size, by default 1
+    dpi : int, optional
+        DPI for saved animation (lower = smaller file), by default 100
     """
     def _ani_update(t):
         im.set_data(plot_data[t].values)
         ax.set_title(f"{date_range[t][0]}/{date_range[t][1]}/{date_range[t][2]}")
         return [im]
     
-    fig, ax = plt.subplots(figsize = size)
-    plot_data = dataarray
-    im = ax. imshow(plot_data[0].values, cmap = cmap, 
+    fig, ax = plt.subplots(figsize = size, dpi = dpi)
+    
+    # Sample frames to reduce file size
+    plot_data = dataarray[::frame_skip]
+    
+    im = ax.imshow(plot_data[0].values, cmap = cmap, 
                     extent=[plot_data.lon.min(), plot_data.lon.max(), 
                             plot_data.lat.min(), plot_data.lat.max()],
                             origin='lower', aspect='auto')
     
-    cbar = fig.colorbar(im, ax = ax, label = f"{dataarray.name} ({dataarray.units})")
+    units = getattr(dataarray, 'units', '')
+    cbar_label = f"{dataarray.name} ({units})" if units else str(dataarray.name)
+    cbar = fig.colorbar(im, ax = ax, label = cbar_label)
 
     date_range = [(day, month, year) for day, month, year in zip(
-        dataarray.time.dt.day.values,  
-        dataarray.time.dt.month.values, 
-        dataarray.time.dt.year.values)]
+        plot_data.time.dt.day.values,  
+        plot_data.time.dt.month.values, 
+        plot_data.time.dt.year.values)]
     
     title = ax.set_title(f"{date_range[0][0]}/{date_range[0][1]}/{date_range[0][2]}")
 
@@ -500,7 +510,11 @@ def animation_plot(dataarray, aoi = None, size = (10, 8), cmap = "Reds"):
     ani = animation.FuncAnimation(fig, _ani_update, frames = len(date_range), 
                                   repeat = True, interval = 500, blit = True)
     plt.close()
-    return ani
+    
+    # Increase embed limit to allow larger animations
+    plt.rcParams['animation.embed_limit'] = 100
+    
+    return HTML(ani.to_jshtml())
 
 def vector_to_raster_sens(raster_file, vector_file):
     vectors = gpd.read_file(vector_file)
