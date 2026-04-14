@@ -35,10 +35,6 @@ class AMDModel:
         D : float, optional
             dispersion coefficient used in transport, by default 10 m**2/s
 
-        Raises
-        ------
-        ValueError
-            ValueError if _norm_transport contains nan values, issue with dataset Q variable
         """
         self.dataset = dataset.copy(deep=True)
         self.dataset["Q"] = self.dataset["Q"].fillna(0.0)
@@ -86,13 +82,6 @@ class AMDModel:
         }
 
         self._create_output_file(n_steps, spatial_shape)
-        
-        low, high = 0.01, 1.0
-        Q_ref = self.dataset["Q"].isel(time=0)
-        norm = low + (Q_ref - Q_ref.min()) / (Q_ref.max() - Q_ref.min() + 1e-12) * (high - low)
-        if np.any(np.isnan(norm.values)):
-            raise ValueError("_norm_transport contains NaN – check Q_ref for NaN/inf")
-        self._norm_transport = norm.values
         
         self._build_cache()
 
@@ -321,7 +310,7 @@ class AMDModel:
         if next_time is None:
             return
 
-        # ── unpack the tuple returned by _compute_slice ──────────────────────
+        # unpack the tuple returned by _compute_slice 
         rows, cols, fe2, fe3, so4, h, fe_oh3 = result
 
         # Reconstruct IDs and outIDs from the dataset using (rows, cols)
@@ -332,7 +321,7 @@ class AMDModel:
 
         if not valid.any():
             return
-
+        
         src_ids = ids[valid]
         dst_ids = out_ids[valid]
 
@@ -361,36 +350,57 @@ class AMDModel:
         alpha = 0.01
         A = np.maximum(A, 1e-6)
         V_cell = A * self.dx
+        C = Q * self.time_step_seconds / V_cell
+        n_sub = int(np.ceil(C.max()))
+        n_sub = max(1, min(n_sub, 50))
+        dt_sub = self.time_step_seconds / n_sub
 
-        dispersion = 1 - np.exp(-D * self.time_step_seconds / self.dx**2)
-        advection = 1 - np.exp(-Q * self.time_step_seconds / V_cell)
-        decay = np.exp(-alpha * self.time_step_seconds)
-        alpha = 0.01
+        for _ in range(n_sub):
+            dispersion = np.clip(D * dt_sub / self.dx**2, 0, 0.5)
+            advection = np.clip(Q_values * dt_sub / V_cell, 0, 1)
+            decay = np.exp(-alpha * dt_sub)
 
-        transport_frac = np.clip((advection + dispersion) * decay, 0, 1)
+            transport_frac = np.clip((advection + dispersion) * decay, 0, 1)
 
-        # make and use mask for volume > 0
-        src_vol = self._get_volume(time_idx)[src_row, src_col]
-        valid_vol = src_vol > 0
+            # make and use mask for volume > 0
+            src_vol = self._get_volume(time_idx)[src_row, src_col]
+            valid_vol = src_vol > 0
 
-        if not valid_vol.any():
-            return
-        
-        src_row = src_row[valid_vol]
-        src_col = src_col[valid_vol]
-        dst_row = dst_row[valid_vol]
-        dst_col = dst_col[valid_vol]
-        transport_frac = transport_frac[valid_vol]
-        with np.errstate(under='ignore'):
-            for var in key_vars:
-                arr  = self._arrays[var]
+            if not valid_vol.any():
+                break
+            
+            src_row = src_row[valid_vol]
+            src_col = src_col[valid_vol]
+            dst_row = dst_row[valid_vol]
+            dst_col = dst_col[valid_vol]
+            transport_frac = transport_frac[valid_vol]
+            with np.errstate(under='ignore'):
+                for var in key_vars:
+                    arr  = self._arrays[var]
 
-                src_vals = arr[0, src_row, src_col]
+                    src_vals = arr[0, src_row, src_col]
 
-                moved    = src_vals * transport_frac
-                arr[0, src_row, src_col] -= moved
-                arr[0, src_row, src_col] = np.maximum(arr[0, src_row, src_col], 0)
-                np.add.at(arr[1], (dst_row, dst_col), moved) 
+                    moved    = src_vals * transport_frac
+                    arr[0, src_row, src_col] -= moved
+                    arr[0, src_row, src_col] = np.maximum(arr[0, src_row, src_col], 0)
+                    np.add.at(arr[1], (dst_row, dst_col), moved) 
+
+            current_dst_ids = self.dataset["ID"].values[dst_row, dst_col]
+            next_dst_ids = self._id_to_outid[
+                np.clip(current_dst_ids, 0, len(self._id_to_outid) - 1)]
+            
+            valid_next = (next_dst_ids >= 0) & np.array(
+                [int(i) in self._id_to_rc for i in next_dst_ids])
+            
+            if not valid_next.any():
+                break
+
+            next_rc = np.array([self._id_to_rc[int(i)] if valid_next[j]
+                                else (dst_row[j], dst_col[j])
+                                for j, i in enumerate(next_dst_ids)])
+            
+            dst_row = next_rc[:, 0]
+            dst_col = next_rc[:, 1]
 
     def _build_cache(self):
         """Build cache at initialisation to pre-process certain static variables and mappings for faster access during model run, 
