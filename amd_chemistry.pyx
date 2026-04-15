@@ -28,7 +28,7 @@ def process_chemistry(
 ):
     """
     chemistry steps in a single C-speed loop over n cells.
-    """"
+    """
     cdef Py_ssize_t n = fe2.shape[0]
     cdef Py_ssize_t i
 
@@ -125,8 +125,8 @@ def process_chemistry(
         h[i] = fmax(h[i], 0.0)
         fe_oh3[i] = fmax(fe_oh3[i], 0.0)
 
-        # ── Step 4: Fe³⁺ ↔ Fe(OH)₃ hydrolysis and precipitation ──────────────────────────
-        h_safe_4 = fmax(h_safe_3, 1e-14)
+        # ── Step 4: Fe³⁺ <-> Fe(OH)₃ hydrolysis and precipitation ──────────────────────────
+        h_safe_4 = fmax(h[i] / vol_safe, 1e-14)
         oh_conc_2 = Kw / h_safe_4
         ph = -log10(h_safe_4)
 

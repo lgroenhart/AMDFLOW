@@ -2,6 +2,7 @@
 # contains main AMDModel class used for AMD modelling
 
 from amd_chemistry import process_chemistry
+from transport import _transport_cython
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -84,8 +85,6 @@ class AMDModel:
         self._create_output_file(n_steps, spatial_shape)
         
         self._build_cache()
-
-        
 
     def run(self, chunk_size=1000, n_jobs = -1, backend = "threading"):
         """Runs model over all time steps and spatial extent, writes results to output_path netCDF file
@@ -297,6 +296,7 @@ class AMDModel:
         
     def _transport(self, t, result):
         """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
+            uses transport_cython from transport.pyx 
 
         Parameters
         ----------
@@ -305,102 +305,47 @@ class AMDModel:
         result : tuple of np.ndarrays
             arrays containing the row, column indices and chemistry outputs for cells at timestep t
         """
-        key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion", "sulphate"]
         next_time = self._next_time(t)
         if next_time is None:
             return
 
-        # unpack the tuple returned by _compute_slice 
         rows, cols, fe2, fe3, so4, h, fe_oh3 = result
-
-        # Reconstruct IDs and outIDs from the dataset using (rows, cols)
-        ids     = self.dataset["ID"].values[rows, cols]
-        out_ids = self.dataset["outID"].values[rows, cols]
-        
-        valid = np.isfinite(out_ids) & (out_ids >= 0)
-
-        if not valid.any():
-            return
-        
-        src_ids = ids[valid]
-        dst_ids = out_ids[valid]
-
-        # filter to dst IDs that exist in the grid
-        dst_exists = np.array([int(i) in self._id_to_rc for i in dst_ids])
-        valid_both = valid.copy()
-        valid_both[valid] = dst_exists
-
-        src_ids = ids[valid_both]
-        dst_ids = out_ids[valid_both]
-
-        src_rc = np.array([self._id_to_rc[int(i)] for i in src_ids])
-        dst_rc = np.array([self._id_to_rc[int(i)] for i in dst_ids])
-
-        src_row, src_col = src_rc[:, 0], src_rc[:, 1]
-        dst_row, dst_col = dst_rc[:, 0], dst_rc[:, 1]
-
-        
         time_idx = self._time_index[t]
 
-        # advective, dispersive, decay calculations for transport
-        Q_values = self.dataset["Q"].values[time_idx, src_row, src_col]
-        A = Q_values / self.v # area calculation assuming 0.5 velocity
-        Q = Q_values
-        D = self.D
-        alpha = 0.01
-        A = np.maximum(A, 1e-6)
-        V_cell = A * self.dx
-        C = Q * self.time_step_seconds / V_cell
-        n_sub = int(np.ceil(C.max()))
-        n_sub = max(1, min(n_sub, 50))
-        dt_sub = self.time_step_seconds / n_sub
+        # Get source rows/cols (already filtered by _compute_slice)
+        # Convert to numpy arrays of int64 for Cython
+        src_rows = rows.astype(np.int64)
+        src_cols = cols.astype(np.int64)
 
-        for _ in range(n_sub):
-            dispersion = np.clip(D * dt_sub / self.dx**2, 0, 0.5)
-            advection = np.clip(Q_values * dt_sub / V_cell, 0, 1)
-            decay = np.exp(-alpha * dt_sub)
+        # Extract 2D arrays at current time step
+        Q_2d = self.dataset["Q"].values[time_idx, :, :].astype(np.float32)
+        ID_grid = self.dataset["ID"].values.astype(np.int32)
+        outID_grid = self.dataset["outID"].values.astype(np.int32)
 
-            transport_frac = np.clip((advection + dispersion) * decay, 0, 1)
-
-            # make and use mask for volume > 0
-            src_vol = self._get_volume(time_idx)[src_row, src_col]
-            valid_vol = src_vol > 0
-
-            if not valid_vol.any():
-                break
-            
-            src_row = src_row[valid_vol]
-            src_col = src_col[valid_vol]
-            dst_row = dst_row[valid_vol]
-            dst_col = dst_col[valid_vol]
-            transport_frac = transport_frac[valid_vol]
-            with np.errstate(under='ignore'):
-                for var in key_vars:
-                    arr  = self._arrays[var]
-
-                    src_vals = arr[0, src_row, src_col]
-
-                    moved    = src_vals * transport_frac
-                    arr[0, src_row, src_col] -= moved
-                    arr[0, src_row, src_col] = np.maximum(arr[0, src_row, src_col], 0)
-                    np.add.at(arr[1], (dst_row, dst_col), moved) 
-
-            current_dst_ids = self.dataset["ID"].values[dst_row, dst_col]
-            next_dst_ids = self._id_to_outid[
-                np.clip(current_dst_ids, 0, len(self._id_to_outid) - 1)]
-            
-            valid_next = (next_dst_ids >= 0) & np.array(
-                [int(i) in self._id_to_rc for i in next_dst_ids])
-            
-            if not valid_next.any():
-                break
-
-            next_rc = np.array([self._id_to_rc[int(i)] if valid_next[j]
-                                else (dst_row[j], dst_col[j])
-                                for j, i in enumerate(next_dst_ids)])
-            
-            dst_row = next_rc[:, 0]
-            dst_col = next_rc[:, 1]
+        # Call Cython kernel
+        _transport_cython(
+            self._buffer["ferrous_iron"],
+            self._buffer["ferric_iron"],
+            self._buffer["sulphate"],
+            self._buffer["hydrogen_ion"],
+            Q_2d,
+            ID_grid,
+            outID_grid,
+            self._id_to_row,      
+            self._id_to_col,      
+            self._id_to_outid,    
+            time_idx,
+            self.time_step_seconds,
+            self.v,
+            self.D,
+            self.dx,
+            alpha=1e-4,           
+            max_substeps=50,
+            nlat=len(self.dataset.lat),
+            nlon=len(self.dataset.lon),
+            src_rows=src_rows,
+            src_cols=src_cols,
+        )
 
     def _build_cache(self):
         """Build cache at initialisation to pre-process certain static variables and mappings for faster access during model run, 

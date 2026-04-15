@@ -412,7 +412,6 @@ def add_time(ds, length, frequency):
             "description": f"Annual streamflow divided into {length} timesteps per year",
         }
     )
-    Q_new = Q_new / length
 
     # start with Q, then add back every other data variable from the original
     ds_new = xr.Dataset({"Q": Q_new})
