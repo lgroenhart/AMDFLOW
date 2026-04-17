@@ -9,8 +9,8 @@ import os
 def load_datasets(amd_path, caravan_path, MGL_TO_UGL = 1e3):
     amd = xr.open_dataset(amd_path, chunks={})
     iron_vars = [v for v in amd.data_vars if "iron" in v]
-    amd = amd.assign({v: amd[v] * MGL_TO_UGL for v in iron_vars})
-    print(f"  Converted {iron_vars} from mg/L → µg/L")
+    # amd = amd.assign({v: amd[v] * MGL_TO_UGL for v in iron_vars})
+    # print(f"  Converted {iron_vars} from mg/L → µg/L")
     print("\nLoading Caravan-Qual Lite …")
 
     caravan = xr.open_dataset(caravan_path, engine="zarr",
@@ -66,7 +66,7 @@ def valid_masking(amd, VAR_MAP):
     # Sample 5 time steps evenly spread across the full run.
     # Robust to spin-up: flow-path cells that are NaN early will be caught
     # by later samples. Reads ~3.8 MB instead of the full 2 GB variable.
-    _sample_idx = np.linspace(0, amd.sizes["time"] - 1, 5, dtype=int)
+    _sample_idx = np.linspace(0, amd.sizes["time"] - 1, 10, dtype=int)
 
     valid_mask = (
         amd[ref_var]
@@ -77,7 +77,8 @@ def valid_masking(amd, VAR_MAP):
     )
 
     iron_mask = (
-        (amd["ferrous_iron"].isel(time=_sample_idx) > 0)
+        ((amd["ferrous_iron"] + amd["ferric_iron"] + amd["iron_III_hydroxide"])
+        .isel(time=_sample_idx) > 0)
         .any(dim="time")
         .compute()
     )
@@ -100,9 +101,14 @@ def valid_masking(amd, VAR_MAP):
     iron_ilon  = np.where(flat_iron)[0]  % len(lon_vals)
 
     print(f"  {flat_valid.sum():,} valid cells (pH mask)")
-    print(f"  {flat_iron.sum():,} iron cells (ferrous > 0 mask)")
+    print(f"  {flat_iron.sum():,} iron cells (iron data present mask)")
     return valid_ilat, valid_ilon, valid_lat, valid_lon, \
             iron_ilat, iron_ilon, iron_lat, iron_lon
+def _safe_kdtree(lon_arr, lat_arr, to_utm):
+    if len(lat_arr) == 0:
+        return cKDTree(np.empty((0, 2)))
+    east, north = to_utm.transform(lon_arr, lat_arr)
+    return cKDTree(np.column_stack([east, north]))
 
 def build_kdtree(amd, candidates, utm_crs, valid_lon, valid_lat,
                  iron_lon, iron_lat, ):
@@ -112,15 +118,24 @@ def build_kdtree(amd, candidates, utm_crs, valid_lon, valid_lat,
         candidates["lon"].values, candidates["lat"].values
     )
 
-    cell_east, cell_north = to_utm.transform(valid_lon, valid_lat)
-    tree = cKDTree(np.column_stack([cell_east, cell_north]))
+    tree = _safe_kdtree(valid_lon, valid_lat, to_utm)
+    tree_iron = _safe_kdtree(iron_lon, iron_lat, to_utm)
 
-    iron_east, iron_north = to_utm.transform(iron_lon, iron_lat)
-    tree_iron = cKDTree(np.column_stack([iron_east, iron_north]))
     return tree, tree_iron, st_east, st_north
 
 def match_stations(candidates, tree, ilat_arr, ilon_arr, lat_arr, lon_arr, 
-                   MAX_DIST_M = 5000):
+                   st_east, st_north, MAX_DIST_M = 5000):
+    
+    if len(ilat_arr) == 0:
+        empty = candidates.copy()
+        empty["dist_m"] = np.inf
+        empty["matched"] = False
+        empty["ilat"] = -1
+        empty["ilon"] = -1
+        empty["cell_lat"] = np.nan
+        empty["cell_lon"] = np.nan
+        return empty[empty["matched"]].reset_index(drop=True)
+    
     dist, idx = tree.query(
         np.column_stack([st_east, st_north]),
         k=1,
@@ -263,7 +278,7 @@ def extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq
         on="time",
         by="wqms_id",
         direction="nearest",
-        tolerance=pd.Timedelta("3D"),
+        tolerance=pd.Timedelta("7D"),
     )
     # result columns: time, wqms_id, modelled, dist_m, observed
 
@@ -279,6 +294,11 @@ def full_run(MIN_PAIRED_OBS = 3, resample_freq="W"):
 
     for caravan_var, amd_var in VAR_MAP.items():
         matches = matches_iron if caravan_var in IRON_VARS else matches_ph
+
+        if len(matches) == 0:
+            print(f"\n{caravan_var}: No matched stations found; skipping variable")
+            continue
+
         ts = extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq)
         
         # for sid, grp in ts.groupby("wqms_id"):
@@ -361,9 +381,9 @@ def validation_metrics(ts: pd.DataFrame) -> pd.DataFrame:
 
 if __name__ == "__main__":
     caravan_path = "../data/validation data/Caravan-Qual_lite.zarr"   # adjust extension if .nc
-    amd_path = "../data/validation data/AMDFLOW_CSI_2014-2015_W.nc"
-    output_path = "../data/validation data/CSI/"
-    utm_crs = "EPSG:5641"
+    amd_path = "../data/validation data/AMDFLOW_CSIII_1960-2015_W.nc"
+    output_path = "../data/validation data/CSIII/"
+    utm_crs = "EPSG:6312" # "EPSG:5641" (Brazil), "EPSG:32650" (China), "EPSG:25833" (N europe), "EPSG:6312" (Cyprus)
     resample_freq = "W"
     VAR_MAP = {
         "pH":    "pH",
@@ -383,10 +403,10 @@ if __name__ == "__main__":
                                          iron_lon, iron_lat)
     
     matches_ph = match_stations(candidates, tree, valid_ilat, valid_ilon,
-                                valid_lat, valid_lon)
+                                valid_lat, valid_lon, st_east, st_north)
     
     matches_iron = match_stations(candidates,tree_iron, iron_ilat, iron_ilon, 
-                                  iron_lat, iron_lon)
+                                  iron_lat, iron_lon, st_east, st_north)
     
     print(f"  pH mask:   {len(matches_ph)} stations matched")
     print(f"  Iron mask: {len(matches_iron)} stations matched")
