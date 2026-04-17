@@ -72,7 +72,7 @@ class AMDModel:
         self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400, "hour": 3600, "minute": 60}[self.t_unit]
         
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
-        volume_0 = self.dataset["Q"].isel(time=0).values * self.time_step_seconds * 1000
+        volume_0 = (self.dataset["Q"].isel(time=0).values / self.v) * self.dx * 1000 # V = (Q / v) * dx = m**3, *1000 = L
         self._buffer["hydrogen_ion"][0] = (1e-7 * volume_0).astype(np.float32)
 
         self._Q_dataset = self.dataset["Q"]
@@ -449,11 +449,11 @@ class AMDModel:
 
             # chem vars
             attrs = {
-                "ferrous_iron": ("mg/L", "Fe²⁺"),
-                "ferric_iron": ("mg/L", "Fe³⁺"),
-                "sulphate": ("mg/L", "SO₄²⁻"),
-                "hydrogen_ion": ("mg/L", "H⁺"),
-                "iron_III_hydroxide": ("mg/L", "Fe(OH)₃")
+                "ferrous_iron": ("µg/L", "Fe²⁺"),
+                "ferric_iron": ("µg/L", "Fe³⁺"),
+                "sulphate": ("µg/L", "SO₄²⁻"),
+                "hydrogen_ion": ("µg/L", "H⁺"),
+                "iron_III_hydroxide": ("µg/L", "Fe(OH)₃")
                 }
 
             for var in self._chem_vars:
@@ -501,29 +501,43 @@ class AMDModel:
         }
 
         with np.errstate(under='ignore', divide='ignore', invalid='ignore'):
+            # --------------------------------------new------------------------------
             for var in self._chem_vars:
-                total_moles = self._buffer[var][0]
-                delta_moles = total_moles - self._prev_buffer[var]
-                delta_moles = np.maximum(delta_moles, 0)  # prevent negative deltas
-                mass = molar_masses[var]
+                # Get both buffer indices and compute concentration
+                mol_amount = (self._buffer[var][0] + self._buffer[var][1])
+                concentration_molar = mol_amount / step_vol  # moles per litre
+                concentration_mg_per_L = concentration_molar * molar_masses[var]  # mg/L
+                concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
+                nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
+            # --------------------------------------new------------------------------
+            h_mol = self._buffer["hydrogen_ion"][0] + self._buffer["hydrogen_ion"][1]
+            h_conc = h_mol / step_vol  # mol/L
+            ph = np.where(h_conc > 0, -np.log10(np.maximum(h_conc, 1e-14)), np.nan)
+            nc.variables["pH"][ti, :, :] = ph.astype(np.float32)
 
-                if var == "hydrogen_ion":
-                    if ti == len(self.time_steps) - 1:
-                        conc_instant = np.full_like(step_vol, np.nan)
-                    else:
-                        conc_instant = np.where(step_vol > 0, delta_moles / step_vol, np.nan)
-                    nc[var][ti, :, :] = conc_instant.astype(np.float32)
+            # for var in self._chem_vars:
+            #     total_moles = self._buffer[var][0]
+            #     delta_moles = total_moles - self._prev_buffer[var]
+            #     delta_moles = np.maximum(delta_moles, 0)  # prevent negative deltas
+            #     mass = molar_masses[var]
 
-                    ph_instant = np.where(conc_instant > 0, -np.log10(conc_instant), np.nan)
-                    nc["pH"][ti, :, :] = ph_instant.astype(np.float32)
+            #     if var == "hydrogen_ion":
+            #         if ti == len(self.time_steps) - 1:
+            #             conc_instant = np.full_like(step_vol, np.nan)
+            #         else:
+            #             conc_instant = np.where(step_vol > 0, delta_moles / step_vol, np.nan)
+            #         nc[var][ti, :, :] = conc_instant.astype(np.float32)
 
-                else:
-                    delta_grams = delta_moles * mass
-                    if ti == len(self.time_steps) - 1:
-                        conc_instant = np.full_like(step_vol, np.nan)
-                    else:
-                        conc_instant = np.where(step_vol > 0, delta_grams / step_vol, np.nan)
-                    nc[var][ti, :, :] = conc_instant.astype(np.float32)
+            #         ph_instant = np.where(conc_instant > 0, -np.log10(conc_instant), np.nan)
+            #         nc["pH"][ti, :, :] = ph_instant.astype(np.float32)
+
+            #     else:
+            #         delta_grams = delta_moles * mass
+            #         if ti == len(self.time_steps) - 1:
+            #             conc_instant = np.full_like(step_vol, np.nan)
+            #         else:
+            #             conc_instant = np.where(step_vol > 0, delta_grams / step_vol, np.nan)
+            #         nc[var][ti, :, :] = conc_instant.astype(np.float32)
 
     def _get_volume(self, ti):
-        return self._Q_dataset.isel(time = ti).values * self.time_step_seconds * 1000
+        return (self._Q_dataset.isel(time = ti).values / self.v) * self.dx * 1000
