@@ -9,6 +9,7 @@ from libc.stdlib cimport malloc, free
 ctypedef np.float32_t FLOAT_t
 ctypedef np.int32_t INT_t
 ctypedef np.int64_t LONG_t
+cdef INT_t dst_id, next_r, next_c
 
 cdef extern from "math.h":
     double INFINITY
