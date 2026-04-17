@@ -79,6 +79,7 @@ def process_chemistry(
             fe2[i] += ferric_consumed * 1.07
             fe3[i] -= ferric_consumed
             h[i] += ferric_consumed * 1.14
+            so4[i] += ferric_consumed * (2.0 / 14.0)
 
         fe2[i] = fmax(fe2[i], 0.0)
         fe3[i] = fmax(fe3[i], 0.0)
@@ -102,7 +103,7 @@ def process_chemistry(
         h[i] = fmax(h[i], 0.0)
         fe_oh3[i] = fmax(fe_oh3[i], 0.0)
 
-        # ── Step 3: Fe²⁺ → Fe³⁺ oxidation (Singer & Stumm & PHREEQC) ──────────────
+        # ── Step 3: Fe²⁺ → Fe³⁺ oxidation (Singer & Stumm, & PHREEQC) ──────────────
         fe2_conc = fe2[i] / vol_safe
         h_conc_3 = h[i] / vol_safe
         fe2_safe = fe2_conc if (isfinite(fe2_conc) and fe2_conc > 0.0) else 0.0
@@ -130,11 +131,23 @@ def process_chemistry(
         oh_conc_2 = Kw / h_safe_4
         ph = -log10(h_safe_4)
 
-        if ph > 2.5:
-            adjustment = fe3[i]
+        # Fe(OH)3 precipitation based on pH (Ksp equilibrium approach)
+        # At low pH (<3): Fe3+ remains dissolved
+        # At high pH (>4): Fe3+ precipitates as Fe(OH)3
+        # Use gradual transition function instead of sharp cutoff at pH=2.5
         
-        else:
+        if ph < 2.0:
+            # Very acidic: no precipitation
             adjustment = 0.0
+        elif ph < 3.0:
+            # Moderately acidic: gradual precipitation (0-20%)
+            adjustment = fe3[i] * (ph - 2.0) * 0.2
+        elif ph < 4.0:
+            # Weakly acidic: significant precipitation (20-80%)
+            adjustment = fe3[i] * (0.2 + (ph - 3.0) * 0.6)
+        else:
+            # Nearly neutral or higher: nearly complete precipitation (80-99%)
+            adjustment = fe3[i] * 0.95
         
         fe3[i] = fmax(fe3[i] - adjustment, 0.0)
         fe_oh3[i] = fmax(fe_oh3[i] + adjustment, 0.0)
