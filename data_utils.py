@@ -146,7 +146,7 @@ def flo1k_prep(flo1k_path = "../data/FLO1K.ts.1960.2015.qav.nc",
                basins_path = "../data/hybas_eu_lev01-04/hybas_eu_lev04_v1c.shp",
                basins_iloc = (45, 53),
                date = np.datetime64("2015-01-01"),
-               output_path = f"../data/flo_IPB_"):
+               output_path = f"../data/flo_IPB_", aoi = None):
     """Function to clip the full flo1k dataset to a specified area of interest and dates, saves clipped flo1k to new netcdf file
 
     Parameters
@@ -162,13 +162,17 @@ def flo1k_prep(flo1k_path = "../data/FLO1K.ts.1960.2015.qav.nc",
         np.ndarray of np.datetime64 objects of what dates (1060-2015) the clipped flo1k dataset should save
     output_path : str, optional
         string of where the clipped flo1k dataset should be saved, date is used to append to this string to get full output path, by default f"../data/flo_IPB_"
+    aoi : geopandas.GeoDataFrame, optional
+        GeoDataFrame of area of interest to clip the flo1k dataset, if None the function uses basins_iloc, 
+        the aoi can specify a more specific area of interest if needed
     """
     
     
     flo_one_k = xr.open_dataset(flo1k_path)
     basins = gpd.read_file(basins_path)
 
-    aoi = basins.iloc[basins_iloc[0]:basins_iloc[1]]
+    if aoi is None:
+        aoi = basins.iloc[basins_iloc[0]:basins_iloc[1]]
     aoi_lat = [float(aoi.total_bounds[1]), float(aoi.total_bounds[3])]
     aoi_lon = [float(aoi.total_bounds[0]), float(aoi.total_bounds[2])]
 
