@@ -488,8 +488,8 @@ class AMDModel:
         nc : netCDF4.Dataset()
             the open netCDF dataset to write to, created in _create_output_file
         """
-        A_vals  = np.maximum(self.dataset["Q"].values[ti] / self.v, 1e-6)  # m²
-        V_cell  = A_vals * self.dx          # m³
+        A_vals = np.maximum(self.dataset["Q"].values[ti] / self.v, 1e-6)  # m²
+        V_cell = A_vals * self.dx          # m³
         step_vol = V_cell * 1000            # litres, storage volume
 
         molar_masses = {
@@ -503,7 +503,10 @@ class AMDModel:
         with np.errstate(under='ignore', divide='ignore', invalid='ignore'):
             # --------------------------------------new------------------------------
             for var in self._chem_vars:
-                # Get both buffer indices and compute concentration
+                # set sinks to 0 concentration, as the system is closed all chemistry piles here making it unreliable 
+                np.place(self._buffer[var][0], self.dataset["outID"].values < 0, 0)
+
+                # get both buffer indices and compute concentration
                 mol_amount = (self._buffer[var][0] + self._buffer[var][1])
                 concentration_molar = mol_amount / step_vol  # moles per litre
                 concentration_mg_per_L = concentration_molar * molar_masses[var]  # mg/L
