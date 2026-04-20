@@ -504,7 +504,8 @@ class AMDModel:
             # --------------------------------------new------------------------------
             for var in self._chem_vars:
                 # set sinks to 0 concentration, as the system is closed all chemistry piles here making it unreliable 
-                np.place(self._buffer[var][0], self.dataset["outID"].values < 0, 0)
+                mask = self.dataset["outID"].values < 0
+                self._buffer[var][0][mask] = 0
 
                 # get both buffer indices and compute concentration
                 mol_amount = (self._buffer[var][0] + self._buffer[var][1])
