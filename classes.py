@@ -218,7 +218,7 @@ class AMDModel:
 
         # xarray to numpy arrays for CPython
         volume = self._get_volume(time_idx)[rows, cols]
-        ore    = self.dataset["ore"].values[rows, cols]
+        ore    = self._ore_np[rows, cols]
 
         fe2    = self._buffer["ferrous_iron"][0, rows, cols]
         fe3    = self._buffer["ferric_iron"][0, rows, cols]
@@ -318,9 +318,9 @@ class AMDModel:
         src_cols = cols.astype(np.int64)
 
         # Extract 2D arrays at current time step
-        Q_2d = self.dataset["Q"].values[time_idx, :, :].astype(np.float32)
-        ID_grid = self.dataset["ID"].values.astype(np.int32)
-        outID_grid = self.dataset["outID"].values.astype(np.int32)
+        Q_2d = self._Q_np[time_idx]
+        ID_grid = self._ID_grid
+        outID_grid = self.outID_grid
 
         # Call Cython kernel
         _transport_cython(
@@ -400,6 +400,12 @@ class AMDModel:
         self._next_time_map[ts[-1]] = None
 
         self._time_index = {t: i for i, t in enumerate(self.dataset["time"].values)}
+
+        self._Q_np = self.dataset["Q"].values
+        self._ID_grid = self.dataset["ID"].values.astype(np.int32)
+        self.outID_grid = self.dataset["outID"].values.astype(np.int32)
+        self._ore_np = self.dataset["ore"].values
+        self._sink_mask = self.dataset["outID"].values < 0
                 
     def _next_time(self, t):
         """Get next timestep from _next_time_map cache
@@ -504,10 +510,9 @@ class AMDModel:
         }
 
         with np.errstate(under='ignore', divide='ignore', invalid='ignore'):
-            # --------------------------------------new------------------------------
             for var in self._chem_vars:
                 # set sinks to 0 concentration, as the system is closed all chemistry piles here making it unreliable 
-                mask = self.dataset["outID"].values < 0
+                mask = self._sink_mask
                 self._buffer[var][0][mask] = 0
 
                 # get both buffer indices and compute concentration
@@ -516,35 +521,11 @@ class AMDModel:
                 concentration_mg_per_L = concentration_molar * molar_masses[var]  # mg/L
                 concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
                 nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
-            # --------------------------------------new------------------------------
+
             h_mol = self._buffer["hydrogen_ion"][0] + self._buffer["hydrogen_ion"][1]
             h_conc = h_mol / step_vol  # mol/L
             ph = np.where(h_conc > 0, -np.log10(np.maximum(h_conc, 1e-14)), np.nan)
             nc.variables["pH"][ti, :, :] = ph.astype(np.float32)
 
-            # for var in self._chem_vars:
-            #     total_moles = self._buffer[var][0]
-            #     delta_moles = total_moles - self._prev_buffer[var]
-            #     delta_moles = np.maximum(delta_moles, 0)  # prevent negative deltas
-            #     mass = molar_masses[var]
-
-            #     if var == "hydrogen_ion":
-            #         if ti == len(self.time_steps) - 1:
-            #             conc_instant = np.full_like(step_vol, np.nan)
-            #         else:
-            #             conc_instant = np.where(step_vol > 0, delta_moles / step_vol, np.nan)
-            #         nc[var][ti, :, :] = conc_instant.astype(np.float32)
-
-            #         ph_instant = np.where(conc_instant > 0, -np.log10(conc_instant), np.nan)
-            #         nc["pH"][ti, :, :] = ph_instant.astype(np.float32)
-
-            #     else:
-            #         delta_grams = delta_moles * mass
-            #         if ti == len(self.time_steps) - 1:
-            #             conc_instant = np.full_like(step_vol, np.nan)
-            #         else:
-            #             conc_instant = np.where(step_vol > 0, delta_grams / step_vol, np.nan)
-            #         nc[var][ti, :, :] = conc_instant.astype(np.float32)
-
     def _get_volume(self, ti):
-        return (self._Q_dataset.isel(time = ti).values / self.v) * self.dx * 1000
+        return (self._Q_np[ti] / self.v) * self.dx * 1000
