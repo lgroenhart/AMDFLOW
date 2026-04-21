@@ -130,9 +130,11 @@ class AMDModel:
 
                 for result in results:
                     self._update_buffer(t, result)
+                
+                Q_2d = self._Q_np[ti].astype(np.float32)
                 if ti < len(self.time_steps) - 1:
                     for result in results:
-                        self._transport(t, result)
+                        self._transport(t, result, Q_2d)
 
                 
                 current_ids = upstream_ids
@@ -149,7 +151,7 @@ class AMDModel:
 
                     # only process cells not yet visited this timestep
                     out_ids = np.unique(out_ids)
-                    out_ids = out_ids[[i not in visited for i in out_ids]]
+                    out_ids = out_ids[~np.isin(out_ids, np.fromiter(visited, dtype=np.int64))]
 
                     if len(out_ids) == 0:
                         break
@@ -171,10 +173,9 @@ class AMDModel:
                     for result in results:
                         self._update_buffer(t, result)
 
-                    
                     if ti < len(self.time_steps) - 1:
                         for result in results:
-                            self._transport(t, result)
+                            self._transport(t, result, Q_2d)
 
                     # advance frontier to the newly processed IDs
                     current_ids = out_ids
@@ -269,7 +270,6 @@ class AMDModel:
         list of np.ndarray
             list of chunks, each containing an array of cell IDs
         """
-        cell_ids = list(cell_ids)
         if chunk_size is None:
             n_workers = os.cpu_count()
             chunk_size = max(1, len(cell_ids) // n_workers)
@@ -286,15 +286,12 @@ class AMDModel:
         result : tuple of np.ndarrays
             arrays containing the chemistry outputs for input cells at timestep t
         """
-        key_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion",
-                    "sulphate", "iron_III_hydroxide"]
 
         # quick return if slice is empty
         if result is None:
             return
         
         rows, cols, fe2, fe3, so4, h, fe_oh3 = result
-        time_idx = self._time_index[t]
         with np.errstate(under='ignore'):
             self._buffer["ferrous_iron"][0, rows, cols] = fe2
             self._buffer["ferric_iron"][0, rows, cols] = fe3
@@ -302,7 +299,7 @@ class AMDModel:
             self._buffer["hydrogen_ion"][0, rows, cols] = h
             self._buffer["iron_III_hydroxide"][0, rows, cols] = fe_oh3
         
-    def _transport(self, t, result):
+    def _transport(self, t, result, Q_2d):
         """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
             uses transport_cython from transport.pyx 
 
@@ -312,6 +309,8 @@ class AMDModel:
             timestep of model
         result : tuple of np.ndarrays
             arrays containing the row, column indices and chemistry outputs for cells at timestep t
+        Q_2d : np.ndarray
+            2d array of flow values at timestep t, used for transport calculations
         """
         next_time = self._next_time(t)
         if next_time is None:
@@ -326,7 +325,6 @@ class AMDModel:
         src_cols = cols.astype(np.int64)
 
         # Extract 2D arrays at current time step
-        Q_2d = self._Q_np[time_idx]
         ID_grid = self._ID_grid
         outID_grid = self.outID_grid
 
@@ -368,14 +366,6 @@ class AMDModel:
         flat_rows = rows.ravel()
         flat_cols = cols.ravel()
         flat_out = out_vals.ravel()
-
-        self._id_to_rc = dict(zip(
-            flat_ids.tolist(),
-            zip(
-                flat_rows.tolist(),
-                flat_cols.tolist()
-            )
-        ))
 
         max_id = int(np.nanmax(id_vals[id_vals >= 0]))
         valid_outs = out_vals[out_vals >= 0]
