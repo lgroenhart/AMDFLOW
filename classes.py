@@ -86,6 +86,14 @@ class AMDModel:
         
         self._build_cache()
 
+        self.molar_masses = {
+            "ferrous_iron":       55.845 * 1000,
+            "ferric_iron":        55.845 * 1000,
+            "sulphate":           96.056 * 1000,
+            "hydrogen_ion":       1.008 * 1000,
+            "iron_III_hydroxide": 106.866 * 1000,
+        }
+
     def run(self, chunk_size=1000, n_jobs = -1, backend = "threading"):
         """Runs model over all time steps and spatial extent, writes results to output_path netCDF file
 
@@ -501,14 +509,6 @@ class AMDModel:
         V_cell = A_vals * self.dx          # m³
         step_vol = V_cell * 1000            # litres, storage volume
 
-        molar_masses = {
-            "ferrous_iron":       55.845 * 1000,
-            "ferric_iron":        55.845 * 1000,
-            "sulphate":           96.056 * 1000,
-            "hydrogen_ion":       1.008 * 1000,
-            "iron_III_hydroxide": 106.866 * 1000,
-        }
-
         with np.errstate(under='ignore', divide='ignore', invalid='ignore'):
             for var in self._chem_vars:
                 # set sinks to 0 concentration, as the system is closed all chemistry piles here making it unreliable 
@@ -518,7 +518,7 @@ class AMDModel:
                 # get both buffer indices and compute concentration
                 mol_amount = (self._buffer[var][0] + self._buffer[var][1])
                 concentration_molar = mol_amount / step_vol  # moles per litre
-                concentration_mg_per_L = concentration_molar * molar_masses[var]  # mg/L
+                concentration_mg_per_L = concentration_molar * self.molar_masses[var]  # mg/L
                 concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
                 nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
 
