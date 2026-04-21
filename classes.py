@@ -359,6 +359,7 @@ class AMDModel:
         flat_ids = id_vals.ravel().astype(np.int64)
         flat_rows = rows.ravel()
         flat_cols = cols.ravel()
+        flat_out = out_vals.ravel()
 
         self._id_to_rc = dict(zip(
             flat_ids.tolist(),
@@ -368,12 +369,14 @@ class AMDModel:
             )
         ))
 
-        max_id = int(np.nanmax(self.dataset["ID"].values[self.dataset["ID"].values >= 0]))
-        self._id_to_row = np.full(max_id + 1, -1, dtype=np.int32)
-        self._id_to_col = np.full(max_id + 1, -1, dtype=np.int32)
-        self._id_to_outid = np.full(max_id + 1, -1, dtype=np.int64)
+        max_id = int(np.nanmax(id_vals[id_vals >= 0]))
+        valid_outs = out_vals[out_vals >= 0]
+        max_out_id = int(np.nanmax(valid_outs)) if valid_outs.size > 0 else 0
+        array_size = max(max_id, max_out_id) + 1
 
-        flat_out = out_vals.ravel()
+        self._id_to_row = np.full(array_size, -1, dtype=np.int32)
+        self._id_to_col = np.full(array_size, -1, dtype=np.int32)
+        self._id_to_outid = np.full(array_size, -1, dtype=np.int64)
 
         for id_val, r, c, out in zip(flat_ids, flat_rows, flat_cols, flat_out):
             if id_val >= 0:
