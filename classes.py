@@ -386,11 +386,12 @@ class AMDModel:
         self._id_to_col = np.full(array_size, -1, dtype=np.int32)
         self._id_to_outid = np.full(array_size, -1, dtype=np.int64)
 
-        for id_val, r, c, out in zip(flat_ids, flat_rows, flat_cols, flat_out):
-            if id_val >= 0:
-                self._id_to_row[id_val] = r
-                self._id_to_col[id_val] = c
-                self._id_to_outid[id_val] = int(out) if out >= 0 else -1
+        valid = flat_ids >= 0
+        self._id_to_row[flat_ids[valid]] = flat_rows[valid]
+        self._id_to_col[flat_ids[valid]] = flat_cols[valid]
+        out_valid = flat_out.astype(np.int64)
+        out_valid[out_valid < 0] = -1
+        self._id_to_outid[flat_ids[valid]] = out_valid[valid]
 
         self._arrays = {
             var: self._buffer[var]
