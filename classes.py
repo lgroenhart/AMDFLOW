@@ -91,7 +91,7 @@ class AMDModel:
             "ferric_iron":        55.845 * 1000,
             "sulphate":           96.056 * 1000,
             "hydrogen_ion":       1.008 * 1000,
-            "iron_III_hydroxide": 106.866 * 1000,
+            "iron_III_hydroxide": 55.845 * 1000,
         }
 
     def run(self, chunk_size=1000, n_jobs = -1, backend = "threading"):
@@ -461,7 +461,7 @@ class AMDModel:
                 "ferric_iron": ("µg/L", "Fe³⁺"),
                 "sulphate": ("µg/L", "SO₄²⁻"),
                 "hydrogen_ion": ("µg/L", "H⁺"),
-                "iron_III_hydroxide": ("µg/L", "Fe(OH)₃")
+                "iron_III_hydroxide": ("µg/L", "Fe in Fe(OH)₃")
                 }
 
             for var in self._chem_vars:
