@@ -5,8 +5,6 @@ import os
 import json
 import pandas as pd
 import re
-from osgeo import gdal
-from osgeo import ogr
 import xarray as xr
 import geopandas as gpd
 import numpy as np
@@ -14,6 +12,9 @@ import matplotlib.colors as mcolors
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 from IPython.display import HTML
+import rasterio as rio
+import rasterio.features
+import rioxarray
 
 def mindat_collector(region, material_id = 3314, mineral_strings = "(Fe|S)", material_name = "pyrite", path_str = "../data/", mindat_api_str = "mindat_API_key.txt"):
     """Mindat data collector, queries mindat API in specific region for a specific mineral and checks if those minerals are located at a mine/quarry, saves locations at lat/lon csv file
@@ -86,9 +87,11 @@ def mindat_collector(region, material_id = 3314, mineral_strings = "(Fe|S)", mat
     print(f"\nSuccesfully saved data to: {path_str}mindat_data/{region}_{material_name}.csv")
     return
 
-def vector_rasterisation(output_path = "../data/mines_raster.tif", flo1k_path = "../data/flo_IPB_2015.nc", vector_path = "../data/mine_polygons/74548_projected polygons.shp"):
+def vector_rasterisation(output_path="../data/mines_raster.tif",
+                         flo1k_path="../data/flo_IPB_2015.nc",
+                         vector_path="../data/mine_polygons/74548_projected polygons.shp"):
     """Rasterises vector file to a reference raster and saves rasterised file
-
+    
     Parameters
     ----------
     output_path : str, optional
@@ -98,49 +101,45 @@ def vector_rasterisation(output_path = "../data/mines_raster.tif", flo1k_path = 
     vector_path : str, optional
         string of where vector, to be rasterised, is located, by default "../data/mine_polygons/74548_projected polygons.shp"
     """
-    # rasterise mining polygons
-    # code sourced from: K. Haven 2019 https://medium.com/data-science/use-python-to-convert-polygons-to-raster-with-gdal-rasterizelayer-b0de1ec3267
-    nc_path = flo1k_path
+    ds = xr.open_dataset(flo1k_path)
+    ref = ds["qav"].isel(time=0)
 
-    raster = gdal.Open(f"NETCDF:{nc_path}:qav")
-    driver = ogr.GetDriverByName("ESRI Shapefile")
-    data_source = driver.Open(vector_path, 0)  # 0 = read-only
-    if data_source is None:
-        print("Could not open shapefile")
-    else:
-        print("Successfully opened shapefile")
-        layer = data_source.GetLayer()
-        print(f"Layer name: {layer.GetName()}")
+    lons = ds["lon"].values
+    lats = ds["lat"].values
+    res_x = float(lons[1] - lons[0])
+    res_y = float(lats[1] - lats[0])
 
-    geo_transform = raster.GetGeoTransform()
-    projection = raster.GetProjection()
-    x_size = raster.RasterXSize
-    y_size = raster.RasterYSize
-
-
-    drv_tiff = gdal.GetDriverByName("GTiff")
-    output_ds = drv_tiff.Create(
-        output_path,
-        x_size,
-        y_size,
-        1,  
-        gdal.GDT_Float32  
+    transform = rasterio.transform.from_bounds(
+        lons.min(), lats.min(), lons.max(), lats.max(),
+        len(lons), len(lats)
     )
 
-    output_ds.SetGeoTransform(geo_transform)
-    output_ds.SetProjection(projection)
+    gdf = gpd.read_file(vector_path)
+    if gdf.crs is None:
+        raise ValueError("Shapefile has no CRS defined")
 
+    shapes = [(geom, 1) for geom in gdf.geometry if geom is not None]
 
-    options = [f"ATTRIBUTE=Shape_Area"]
-    result = gdal.RasterizeLayer(
-        output_ds,        # output dataset
-        [1],              # band list
-        layer,            # layer to rasterize
-        options=options
+    raster_arr = rasterio.features.rasterize(
+        shapes,
+        out_shape=(len(lats), len(lons)),
+        transform=transform,
+        fill=0,
+        dtype="uint8"
     )
-    output_ds.GetRasterBand(1).SetNoDataValue(0.0) 
-    output_ds = None
-    return
+
+    crs = rasterio.crs.CRS.from_epsg(4326)  # adjust if your data uses a different CRS
+
+    with rasterio.open(
+        output_path, "w",
+        driver="GTiff",
+        height=len(lats), width=len(lons),
+        count=1, dtype="uint8",
+        crs=crs, transform=transform
+    ) as dst:
+        dst.write(raster_arr, 1)
+
+    print(f"Raster saved to {output_path}")
 
 def flo1k_prep(flo1k_path = "../data/FLO1K.ts.1960.2015.qav.nc", 
                basins_path = "../data/hybas_eu_lev01-04/hybas_eu_lev04_v1c.shp",
@@ -307,7 +306,7 @@ def hydir_IDs(ds, aoi):
     ds = ds.rio.clip(aoi.geometry, aoi.crs)
     return ds
 
-def filter_mines_with_buffer(raster, points, buffer_deg = 0.045):
+def filter_mines_with_buffer(raster, points, crs, buffer_dist = 5000.0):
     """Function to filter a full raster dataset with mindat mineral location, mindat mineral location gets buffer: 
         if mine cell of raster falls within buffer the cell passes filter, otherwise cells gets dropped
 
@@ -317,23 +316,29 @@ def filter_mines_with_buffer(raster, points, buffer_deg = 0.045):
         Dataset of mines cells
     points : geopandas.GeoDataFrame
         GeoDataFrame of mindat mineral locations to link with mines
-    buffer_deg : float, optional
-        !high uncertainty!, float of degree buffer in WG84 to buffer the points, by default 0.045
+    buffer_dist : float, optional
+        float of m buffer in crs to buffer the points, by default 5000.0 (m)
 
     Returns
     -------
     raster_filtered : xarray.Dataset
         Dataset of mines that fall within buffer of points, thus likely containing the mineral of interest
     """
-    points.set_geometry(col = 0)
+    points = points.set_geometry(col = 0)
 
-    # create buffer in degrees 
-    points.to_crs(raster.rio.crs, inplace = True)
-    buffered_points = points.buffer(buffer_deg)
+    # set crs to metre based crs
+    points.to_crs(crs, inplace = True)
+    raster = raster.rio.reproject(crs)
+
+    # create buffer in metres
+    buffered_points = points.buffer(buffer_dist)
 
     # clip
-    raster_filtered = raster.rio.clip(buffered_points.geometry, drop = True)
+    raster_filtered = raster.rio.clip(buffered_points, drop = True)
     raster_filtered = raster_filtered.rename_vars({"band_data": "mines"})
+
+    # return to wg84 crs
+    raster_filtered = raster_filtered.rio.reproject("EPSG:4326")
     return raster_filtered
 
 def bool_to_int(ds, dtype="int16"):
@@ -395,7 +400,7 @@ def add_time(ds, length, frequency):
     Returns
     -------
     ds_new : xarray.Dataset
-        Dataset with years divided into more discrete timesteps where Q (streamflow) is divided by length to represent mean annual streamflow divided by discrete timestep
+        Dataset with years divided into more discrete timesteps
     """
     start = ds.time.values[0]
     n_years = len(ds.time)
