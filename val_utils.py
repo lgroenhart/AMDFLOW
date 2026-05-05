@@ -154,17 +154,7 @@ def match_stations(candidates, tree, ilat_arr, ilon_arr, lat_arr, lon_arr,
     return c[c["matched"]].reset_index(drop=True)
 
 def extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq):
-    """Vectorized extraction — all stations in one Dask compute call.
-
-    Speed improvements over the loop version:
-      1. xarray vectorized isel: pass arrays of lat/lon indices so xarray
-         extracts all (time, station) combinations in a single operation.
-         One .compute() instead of N .compute() calls.
-      2. Caravan resampled once for all matched stations before any alignment.
-      3. Time alignment done with a pandas merge (hash join) instead of
-         per-station reindex calls.
-      4. Duplicate (ilat, ilon) cells are deduplicated before the AMD read
-         so identical model cells aren't fetched multiple times.
+    """Vectorized extraction 
     """
     # ── Overlapping period ────────────────────────────────────────────────────
     t_start = max(pd.Timestamp(amd.time.values[0]),
@@ -278,7 +268,7 @@ def extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq
         on="time",
         by="wqms_id",
         direction="nearest",
-        tolerance=pd.Timedelta("7D"),
+        tolerance=pd.Timedelta("14D"),
     )
     # result columns: time, wqms_id, modelled, dist_m, observed
 
@@ -326,6 +316,17 @@ def full_run(MIN_PAIRED_OBS = 3, resample_freq="W"):
         if len(dropped):
             print(f"  Dropped {len(dropped)} station(s) with < {MIN_PAIRED_OBS} "
                 f"paired observations: {dropped.to_dict()}")
+            
+        # drop stations where all modelled values are 0
+        all_zero = (
+            ts.groupby("wqms_id")["modelled"]
+            .apply(lambda x: (x == 0).all())
+        )
+        zero_stations = all_zero[all_zero].index
+        if len(zero_stations):
+            print(f"  Dropped {len(zero_stations)} station(s) with all-zero "
+                f"modelled values: {zero_stations.tolist()}")
+            keep = keep.difference(zero_stations)
         ts = ts[ts["wqms_id"].isin(keep)].reset_index(drop=True)
 
         n_stations = ts["wqms_id"].nunique()
@@ -380,10 +381,12 @@ def validation_metrics(ts: pd.DataFrame) -> pd.DataFrame:
     return df
 
 if __name__ == "__main__":
+    case_study_nr = "CSIII"
+    times = ("1960", "2015")
     caravan_path = "../data/validation data/Caravan-Qual_lite.zarr"   # adjust extension if .nc
-    amd_path = "../data/validation data/AMDFLOW_CSIII_1960-2015_W.nc"
-    output_path = "../data/validation data/CSIII/"
-    utm_crs = "EPSG:6312" # "EPSG:5641" (Brazil), "EPSG:32650" (China), "EPSG:25833" (N europe), "EPSG:6312" (Cyprus)
+    amd_path = f"../data/validation data/AMDFLOW_{case_study_nr}_{times[0]}-{times[1]}_W.nc"
+    output_path = f"../data/validation data/{case_study_nr}/"
+    utm_crs = "EPSG:6312"  # "EPSG:5641" (Brazil), "EPSG:32650" (China), "EPSG:25833" (N europe), "EPSG:6312" (Cyprus) # "EPSG: 3761" (Canada), "EPSG:24378" (India), "EPSG:26712" (USA)
     resample_freq = "W"
     VAR_MAP = {
         "pH":    "pH",
@@ -391,7 +394,7 @@ if __name__ == "__main__":
         "Fe-Tot": ["ferrous_iron", "ferric_iron",
                 "iron_III_hydroxide"],
         }
-    
+    print(f"Validating AMDFLOW Case Study {case_study_nr} ({times[0]}–{times[1]}), \nagainst Caravan-Qual Lite resampled to weekly frequency with bi-weekly time tolerance and 5km pairing distance.")
     amd, caravan = load_datasets(amd_path, caravan_path)
 
     candidates = wqms_stations_domain_filter(amd, caravan)
@@ -416,7 +419,18 @@ if __name__ == "__main__":
     for var, ts in all_results.items():
         print(f"\n── {var} ──────────────────────────────────────────")
         metrics = validation_metrics(ts)
+        
         coords = matches[["wqms_id", "lat", "lon", "cell_lat", "cell_lon"]].set_index("wqms_id")
+        results_df = metrics.join(coords)
+        coord_cols = ["lat", "lon", "cell_lat", "cell_lon"]
+        station_rows = results_df.index != "ALL"
+        missing_coords = results_df.loc[station_rows, coord_cols].isna().any(axis=1)
+        if missing_coords.any():
+            dropped = missing_coords[missing_coords].index.tolist()
+            print(f"  Warning: {len(dropped)} station(s) have missing coordinates "
+                  f"in the metrics output: {dropped}")
+            results_df = results_df.loc[~results_df.index.isin(dropped)]
+        
         os.makedirs(output_path, exist_ok=True)
-        metrics.join(coords).to_csv(f"{output_path}metrics_{var}.csv")
+        results_df.to_csv(f"{output_path}metrics_{var}.csv")
         print(f"  Saved → {output_path}metrics_{var}.csv")
