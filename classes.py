@@ -18,7 +18,8 @@ class AMDModel:
     This class takes in a dataset containing variables (Q, ore, ID, outID, source) and runs the AMD flow model over time (.run()),
     results are written to output_path as a netCDF file
     """
-    def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc", v = 0.5, D = 10):
+    def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc", v = 1,
+                 a = 2.71, b = 0.557, c = 0.349, f = 0.341, wf = 0.00142):
         """class initialisation
 
         Parameters
@@ -51,8 +52,12 @@ class AMDModel:
         self.dataset["Q"] = self.dataset["Q"].where(condition, 1e-12)
         self._Q = self.dataset["Q"].copy(deep=True)
         self.v = v
-        self.D = D
         self.dx = 1000 
+        self.a = a
+        self.b = b
+        self.c = c
+        self.f = f
+        self.wf = wf
         
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
@@ -62,7 +67,7 @@ class AMDModel:
         n_steps = len(self.dataset.time)
 
         self._chem_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion",
-                    "sulphate", "iron_III_hydroxide"]
+                    "sulphate", "iron_III_hydroxide", "bedload_storage"]
         
         self._buffer = {
             var: np.zeros((2, *spatial_shape), dtype = np.float32)
@@ -92,6 +97,7 @@ class AMDModel:
             "sulphate":           96.056 * 1000,
             "hydrogen_ion":       1.008 * 1000,
             "iron_III_hydroxide": 55.845 * 1000,
+            "bedload_storage": 106.87 * 1000
         }
 
     def run(self, chunk_size=1000, n_jobs = -1, backend = "threading"):
@@ -115,7 +121,12 @@ class AMDModel:
 
         upstream_mask = (ore_vals > 0) & (source_vals == 1)
         upstream_ids = id_vals[upstream_mask].astype(np.int64)
-        upstream_ids = upstream_ids[upstream_ids >= 0]
+        #upstream_ids = upstream_ids[upstream_ids >= 0]
+        upstream_ids = np.array(
+            [self._id_remap[i] for i in upstream_ids.tolist() if i in self._id_remap],
+            dtype=np.int64
+        )
+
         with netCDF4.Dataset(self.output_path, "r+") as nc:
             for ti, t in tqdm(enumerate(self.dataset.time.values)):
                 # upper loop of all source cells with water and ore
@@ -143,11 +154,10 @@ class AMDModel:
                     # lower loop to propagate through flow network from upper loop, until no more downstream cells to process
                     
                     # get downstream IDs from current frontier
-                    valid_mask = (current_ids <= len(self._id_to_outid) -1)
-                    out_ids = self._id_to_outid[current_ids[valid_mask]]
-                    out_ids = out_ids[
-                        np.isfinite(out_ids) & (out_ids >= 0)
-                    ]
+                    out_ids = np.full_like(current_ids, -1, dtype=np.int64)
+                    valid_idx = (current_ids >= 0) & (current_ids < len(self._id_to_outid))
+                    out_ids[valid_idx] = self._id_to_outid[current_ids[valid_idx]]
+                    out_ids = out_ids[out_ids >= 0]
 
                     # only process cells not yet visited this timestep
                     out_ids = np.unique(out_ids)
@@ -212,8 +222,11 @@ class AMDModel:
         # convert IDs to indices 
         cell_ids = np.asarray(cell_ids, dtype=np.int64)
 
-        rows = self._id_to_row[cell_ids]
-        cols = self._id_to_col[cell_ids]
+        valid_ids = (cell_ids >= 0) & (cell_ids < len(self._id_to_row))
+        rows = np.full_like(cell_ids, -1, dtype=np.int32)
+        cols = np.full_like(cell_ids, -1, dtype=np.int32)
+        rows[valid_ids] = self._id_to_row[cell_ids[valid_ids]]
+        cols[valid_ids] = self._id_to_col[cell_ids[valid_ids]]
 
         # filter invalid IDs
         valid = (rows >= 0) & (cols >= 0)
@@ -234,6 +247,7 @@ class AMDModel:
         so4    = self._buffer["sulphate"][0, rows, cols]
         h      = self._buffer["hydrogen_ion"][0, rows, cols]
         fe_oh3 = self._buffer["iron_III_hydroxide"][0, rows, cols]
+        bedload_storage = self._buffer["bedload_storage"][0, rows, cols]
 
 
         volume = np.ascontiguousarray(volume, dtype=np.float64)
@@ -244,15 +258,16 @@ class AMDModel:
         so4    = np.ascontiguousarray(so4, dtype=np.float64)
         h      = np.ascontiguousarray(h, dtype=np.float64)
         fe_oh3 = np.ascontiguousarray(fe_oh3, dtype=np.float64)
+        bedload_storage = np.ascontiguousarray(bedload_storage, dtype=np.float64)
 
         # CPython chemistry call
         process_chemistry(
-            fe2, fe3, so4, h, fe_oh3,
+            fe2, fe3, so4, h, fe_oh3, bedload_storage,
             ore, volume,
             self.do, self.time_step_seconds
         )
 
-        return rows, cols, fe2, fe3, so4, h, fe_oh3
+        return rows, cols, fe2, fe3, so4, h, fe_oh3, bedload_storage
     
     def _get_parallel_groups(self, cell_ids, chunk_size=None):
         """Groups cell IDs into chunks for parallel processing, if chunk_size is None, it will be automatically determined based on number of CPU cores and number of cell IDs
@@ -291,13 +306,14 @@ class AMDModel:
         if result is None:
             return
         
-        rows, cols, fe2, fe3, so4, h, fe_oh3 = result
+        rows, cols, fe2, fe3, so4, h, fe_oh3, bedload_storage = result
         with np.errstate(under='ignore'):
             self._buffer["ferrous_iron"][0, rows, cols] = fe2
             self._buffer["ferric_iron"][0, rows, cols] = fe3
             self._buffer["sulphate"][0, rows, cols] = so4
             self._buffer["hydrogen_ion"][0, rows, cols] = h
             self._buffer["iron_III_hydroxide"][0, rows, cols] = fe_oh3
+            self._buffer["bedload_storage"][0, rows, cols] = bedload_storage
         
     def _transport(self, t, result, Q_2d):
         """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
@@ -316,7 +332,7 @@ class AMDModel:
         if next_time is None:
             return
 
-        rows, cols, fe2, fe3, so4, h, fe_oh3 = result
+        rows, cols, fe2, fe3, so4, h, fe_oh3, bedload_storage = result
         time_idx = self._time_index[t]
 
         # Get source rows/cols (already filtered by _compute_slice)
@@ -334,6 +350,8 @@ class AMDModel:
             self._buffer["ferric_iron"],
             self._buffer["sulphate"],
             self._buffer["hydrogen_ion"],
+            self._buffer["iron_III_hydroxide"],
+            self._buffer["bedload_storage"],
             Q_2d,
             ID_grid,
             outID_grid,
@@ -343,10 +361,13 @@ class AMDModel:
             time_idx,
             self.time_step_seconds,
             self.v,
-            self.D,
             self.dx,
-            alpha=1e-4,           
-            max_substeps=50,
+            self.a,
+            self.b,
+            self.c,
+            self.f,
+            self.wf,          
+            max_substeps=1000,
             nlat=len(self.dataset.lat),
             nlon=len(self.dataset.lon),
             src_rows=src_rows,
@@ -365,23 +386,39 @@ class AMDModel:
         flat_ids = id_vals.ravel().astype(np.int64)
         flat_rows = rows.ravel()
         flat_cols = cols.ravel()
-        flat_out = out_vals.ravel()
-
-        max_id = int(np.nanmax(id_vals[id_vals >= 0]))
-        valid_outs = out_vals[out_vals >= 0]
-        max_out_id = int(np.nanmax(valid_outs)) if valid_outs.size > 0 else 0
-        array_size = max(max_id, max_out_id) + 1
-
-        self._id_to_row = np.full(array_size, -1, dtype=np.int32)
-        self._id_to_col = np.full(array_size, -1, dtype=np.int32)
-        self._id_to_outid = np.full(array_size, -1, dtype=np.int64)
+        flat_out = out_vals.ravel().astype(np.int64)
 
         valid = flat_ids >= 0
-        self._id_to_row[flat_ids[valid]] = flat_rows[valid]
-        self._id_to_col[flat_ids[valid]] = flat_cols[valid]
-        out_valid = flat_out.astype(np.int64)
-        out_valid[out_valid < 0] = -1
-        self._id_to_outid[flat_ids[valid]] = out_valid[valid]
+        valid_ids  = flat_ids[valid]
+        
+        unique_ids = np.unique(np.concatenate([
+            valid_ids,
+            flat_out[flat_out >= 0]
+        ]))
+        id_remap = {orig: new for new, orig in enumerate(unique_ids.tolist())}
+        array_size = len(unique_ids)  # ~36,300 instead of 67,586,153
+
+        self._id_to_row   = np.full(array_size, -1, dtype=np.int32)
+        self._id_to_col   = np.full(array_size, -1, dtype=np.int32)
+        self._id_to_outid = np.full(array_size, -1, dtype=np.int64)
+
+        remapped_ids = np.array([id_remap[i] for i in valid_ids.tolist()], dtype=np.int64)
+        self._id_to_row[remapped_ids] = flat_rows[valid]
+        self._id_to_col[remapped_ids] = flat_cols[valid]
+
+        remapped_out = np.array(
+            [id_remap.get(i, -1) for i in flat_out[valid].tolist()], dtype=np.int64
+        )
+        self._id_to_outid[remapped_ids] = remapped_out
+
+        
+        self._ID_grid = np.vectorize(lambda x: id_remap.get(x, -1))(
+            id_vals).astype(np.int32)
+        self.outID_grid = np.vectorize(lambda x: id_remap.get(x, -1))(
+            out_vals).astype(np.int32)
+
+        
+        self._id_remap = id_remap
 
         self._arrays = {
             var: self._buffer[var]
@@ -401,10 +438,8 @@ class AMDModel:
         self._time_index = {t: i for i, t in enumerate(self.dataset["time"].values)}
 
         self._Q_np = self.dataset["Q"].values
-        self._ID_grid = self.dataset["ID"].values.astype(np.int32)
-        self.outID_grid = self.dataset["outID"].values.astype(np.int32)
         self._ore_np = self.dataset["ore"].values
-        self._sink_mask = self.dataset["outID"].values < 0
+        self._sink_mask = self.outID_grid < 0
                 
     def _next_time(self, t):
         """Get next timestep from _next_time_map cache
@@ -461,7 +496,8 @@ class AMDModel:
                 "ferric_iron": ("µg/L", "Fe³⁺"),
                 "sulphate": ("µg/L", "SO₄²⁻"),
                 "hydrogen_ion": ("µg/L", "H⁺"),
-                "iron_III_hydroxide": ("µg/L", "Fe in Fe(OH)₃")
+                "iron_III_hydroxide": ("µg/L", "Fe in Fe(OH)₃ (suspended)"),
+                "bedload_storage": ("mol total", "Fe(OH)₃ deposited on riverbed")
                 }
 
             for var in self._chem_vars:
@@ -475,7 +511,10 @@ class AMDModel:
                 )
 
                 v.units = attrs[var][0]
-                v.description = f"{attrs[var][1]} - instant concentration at timestep"
+                if var == "bedload_storage": 
+                    v.description = attrs[var][1]
+                else:
+                    v.description = f"{attrs[var][1]} - instant concentration at timestep"
 
             ph_var = nc.createVariable(
                 "pH", "f4",
@@ -505,13 +544,17 @@ class AMDModel:
                 # set sinks to 0 concentration, as the system is closed all chemistry piles here making it unreliable 
                 mask = self._sink_mask
                 self._buffer[var][0][mask] = 0
-
-                # get both buffer indices and compute concentration
-                mol_amount = (self._buffer[var][0] + self._buffer[var][1])
-                concentration_molar = mol_amount / step_vol  # moles per litre
-                concentration_mg_per_L = concentration_molar * self.molar_masses[var]  # mg/L
-                concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
-                nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
+                
+                if var == "bedload_storage":
+                    nc.variables[var][ti, :, :] = (self._buffer[var][0] + self._buffer[var][1])
+                
+                else:
+                    # get both buffer indices and compute concentration
+                    mol_amount = (self._buffer[var][0] + self._buffer[var][1])
+                    concentration_molar = mol_amount / step_vol  # moles per litre
+                    concentration_mg_per_L = concentration_molar * self.molar_masses[var]  # mg/L
+                    concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
+                    nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
 
             h_mol = self._buffer["hydrogen_ion"][0] + self._buffer["hydrogen_ion"][1]
             h_conc = h_mol / step_vol  # mol/L

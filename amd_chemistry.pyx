@@ -2,6 +2,7 @@
 import numpy as np
 cimport numpy as np
 cimport cython
+from cython.parallel import prange
 from libc.math cimport log10, fmax, fmin, isfinite
 from libc.math cimport sqrt, pow as cpow
 
@@ -21,6 +22,7 @@ def process_chemistry(
     double[::1] so4,
     double[::1] h,
     double[::1] fe_oh3,
+    double[::1] bedload_storage,
     double[::1] ore,
     double[::1] volume,
     double do_val,            # dissolved oxygen (scalar)
@@ -46,11 +48,12 @@ def process_chemistry(
     cdef double fe3_conc, h_conc, fe3_safe, h_safe
     cdef double rate, ferric_consumed, max_ferric
     cdef double h_conc_2, h_safe_2, ferrous_amount
-    cdef double fe2_conc, h_conc_3, h_safe_3
+    cdef double fe2_conc, h_conc_3, h_safe_3, h_safe_4, 
     cdef double fe2_safe, oh_conc, ox_rate, fe2_oxidised
-    cdef double diff, adjustment
+    cdef double ph, so4_conc, I, gamma_h, gamma_fe3, act_fe3, act_h, eq_act, dissolve
+    cdef double precip, dissolved_needed, dissolved_sus, dissolve_bed, remaining
 
-    for i in range(n):
+    for i in prange(n, nogil = True, schedule = "static"):
         if not isfinite(volume[i]) or not isfinite(ore[i]) or not isfinite(fe2[i]):
             continue
         
@@ -65,7 +68,7 @@ def process_chemistry(
         vol_safe = volume[i]
         h2o = (0.99704702 * (volume[i] * 1000.0)) / 18.01528
 
-        # ── Step 1: pyrite oxidation by ferric iron ──────────────────────
+        # step 1: pyrite oxidation by ferric iron 
         if fe3[i] > 0.0 and ore[i] > 0.0:
             fe3_conc = fe3[i] / vol_safe
             h_conc = h[i]   / vol_safe
@@ -87,7 +90,7 @@ def process_chemistry(
         h[i] = fmax(h[i], 0.0)
         fe_oh3[i] = fmax(fe_oh3[i], 0.0)
 
-        # ── Step 2: pyrite oxidation by dissolved O₂ ─────────────────────
+        # step 2: pyrite oxidation by dissolved O2
         if ore[i] > 0.0:
             h_conc_2 = h[i] / vol_safe
             h_safe_2 = h_conc_2 if (h_conc_2 > 0.0 and isfinite(h_conc_2)) else 1e-7
@@ -103,7 +106,7 @@ def process_chemistry(
         h[i] = fmax(h[i], 0.0)
         fe_oh3[i] = fmax(fe_oh3[i], 0.0)
 
-        # ── Step 3: Fe²⁺ → Fe³⁺ oxidation (Singer & Stumm, & PHREEQC) ──────────────
+        # step 3: Fe3+ -> Fe3+ oxidation (Singer & Stumm, & PHREEQC)
         fe2_conc = fe2[i] / vol_safe
         h_conc_3 = h[i] / vol_safe
         fe2_safe = fe2_conc if (isfinite(fe2_conc) and fe2_conc > 0.0) else 0.0
@@ -126,33 +129,46 @@ def process_chemistry(
         h[i] = fmax(h[i], 0.0)
         fe_oh3[i] = fmax(fe_oh3[i], 0.0)
 
-        # ── Step 4: Fe³⁺ <-> Fe(OH)₃ hydrolysis and precipitation ──────────────────────────
+        # step 4: Fe3+ <-> Fe(OH)3 hydrolysis and precipitation
         h_safe_4 = fmax(h[i] / vol_safe, 1e-14)
-        oh_conc_2 = Kw / h_safe_4
         ph = -log10(h_safe_4)
+        fe3_conc = fe3[i] / vol_safe
+        fe2_conc = fe2[i] / vol_safe
+        so4_conc = so4[i] / vol_safe
 
-        # Fe(OH)3 precipitation based on pH (Ksp equilibrium approach)
-        # At low pH (<3): Fe3+ remains dissolved
-        # At high pH (>4): Fe3+ precipitates as Fe(OH)3
-        # Use gradual transition function instead of sharp cutoff at pH=2.5
-        
-        if ph < 2.0:
-            # Very acidic: no precipitation
-            adjustment = 0.0
-        elif ph < 3.0:
-            # Moderately acidic: gradual precipitation (0-20%)
-            adjustment = fe3[i] * (ph - 2.0) * 0.2
-        elif ph < 4.0:
-            # Weakly acidic: significant precipitation (20-80%)
-            adjustment = fe3[i] * (0.2 + (ph - 3.0) * 0.6)
+        # Fe(OH)3 <-> Fe3+ equilibrium based on activities
+        I = 0.5 * ((h_safe_4 * 1**2) + (fe3_conc * 3**2) + (fe2_conc * 2**2) + (so4_conc * 2**2))
+        gamma_h = 10**(-0.5 * 1**2 * (sqrt(I) / (1 + sqrt(I)) -0.3 * I))
+        gamma_fe3 = 10**(-0.5 * 3**2 * (sqrt(I) / (1 + sqrt(I)) -0.3 * I))
+        act_h = gamma_h * h_safe_4
+        act_fe3 = gamma_fe3 * fe3_conc
+        eq_act = 10**4.891 * act_h**3
+
+        if act_fe3 > eq_act:
+            # precipitation
+            precip = (fe3_conc - eq_act / gamma_fe3) * vol_safe
+            precip = fmin(fmax(precip, 0.0), fe3[i])
+            fe3[i] -= precip
+            fe_oh3[i] += precip
+            h[i] += precip * 3.0
+
         else:
-            # Nearly neutral or higher: nearly complete precipitation (80-99%)
-            adjustment = fe3[i] * 0.95
-        
-        fe3[i] = fmax(fe3[i] - adjustment, 0.0)
-        fe_oh3[i] = fmax(fe_oh3[i] + adjustment, 0.0)
-        h[i] = fmax(h[i] + adjustment * 3.0, 0.0)
+            # dissolving from suspended flow first
+            dissolve_needed = (eq_act / gamma_fe3 - fe3_conc) * vol_safe
+            dissolve_needed = fmax(dissolve_needed, 0.0)
 
+            dissolve_sus = fmin(dissolve_needed, fe_oh3[i])
+            fe_oh3[i] -= dissolve_sus
+            fe3[i] += dissolve_sus
+            h[i] = fmax(h[i] - dissolve_sus * 3.0, 0.0)
+
+            # dissolve any remainder needed from bedload if possible
+            remaining = dissolve_needed - dissolve_sus
+            if remaining > 0.0:
+                dissolve_bed = fmin(remaining, bedload_storage[i])
+                bedload_storage[i] -= dissolve_bed
+                fe3[i] += dissolve_bed
+                h[i] = fmax(h[i] - dissolve_bed * 3.0, 0.0)
 
         # ── Step 5: clip negatives ────────────────────────────────────────
         fe2[i] = fmax(fe2[i], 0.0)
@@ -160,3 +176,4 @@ def process_chemistry(
         h[i] = fmax(h[i], 0.0)
         so4[i] = fmax(so4[i], 0.0)
         fe_oh3[i] = fmax(fe_oh3[i],0.0)
+        bedload_storage[i] = fmax(bedload_storage[i], 0.0)

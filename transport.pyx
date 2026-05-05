@@ -19,6 +19,8 @@ def _transport_cython(
     FLOAT_t[:, :, ::1] fe3_buf,
     FLOAT_t[:, :, ::1] so4_buf,
     FLOAT_t[:, :, ::1] h_buf,
+    FLOAT_t[:, :, ::1] feoh3_buf,
+    FLOAT_t[:, :, ::1] bedload_storage, # precipitated feoh3 on riverbed
     FLOAT_t[:, ::1] Q,               # flow at current time step [nlat, nlon]
     INT_t[:, ::1] ID_grid,           # [nlat, nlon]
     INT_t[:, ::1] outID_grid,        # [nlat, nlon]
@@ -28,9 +30,12 @@ def _transport_cython(
     long time_idx,                   # current time index (unused but kept for interface)
     double time_step_seconds,
     double v,
-    double D,
     double dx,
-    double alpha,
+    double a,
+    double b,
+    double c,
+    double f,
+    double wf, # m/s
     int max_substeps,
     long nlat,
     long nlon,
@@ -38,15 +43,19 @@ def _transport_cython(
     LONG_t[:] src_cols,              # in/out: source cols, will be modified in-place
 ):
     """
-    Cython kernel for advective‑dispersive‑decay transport along the flow network.
-    Buffers are modified in‑place.
+    Cython kernel for advective-dispersive transport of dissolved species, and advection-deposition transport of precipitate species,
+    along the flow network.
+    Buffers are modified in-place.
     """
     cdef:
         LONG_t n_cells = src_rows.shape[0]
         LONG_t i, sub, var_idx
         LONG_t src_r, src_c, dst_r, dst_c
-        double Q_val, A, V_cell, C_courant, dt_sub, adv, disp, decay, trans_frac
-        double src_val, moved
+        double Q_val, A_cross, V_cell, C_courant, dt_sub, adv, disp, decay, trans_frac
+        double src_val, moved, src_vol
+        double mol_mass_feoh3, kg_per_mol, mass_precip, W, A_bed, ap, aq
+        double d_Sos, Qs_mass, DEP_mass, Qs_mol, DEP_mol, u_star, p, tau_zero
+        double friction_f, viscosity, hydraulic_dia, hydraulic_rad, H, Re, D
         LONG_t n_sub, sub_step
         LONG_t[:] dst_rows = np.empty(n_cells, dtype=np.int64)
         LONG_t[:] dst_cols = np.empty(n_cells, dtype=np.int64)
@@ -88,22 +97,38 @@ def _transport_cython(
 
     n_cells = valid_count
 
-    # 2. Compute number of substeps (Courant‑like condition)
+    # 2. Compute number of substeps (Courant‑like condition & von Neumann condition)
+    p = 997.1
+    viscosity = 0.894e-3
     cdef double max_C = 0.0
+    cdef double max_C_diff = 0.0
+    cdef double C_diff = 0.0
     for i in range(n_cells):
         src_r = src_rows[i]
         src_c = src_cols[i]
         Q_val = Q[src_r, src_c]
         if Q_val > 0:
-            A = Q_val / v
-            if A < 1e-6:
-                A = 1e-6
-            V_cell = A * dx
+            A_cross = Q_val / v
+            if A_cross < 1e-6:
+                A_cross = 1e-6
+            V_cell = A_cross * dx
             C_courant = Q_val * time_step_seconds / V_cell
             if C_courant > max_C:
                 max_C = C_courant
+            W = a * Q_val**b
+            H = c * Q_val**f
+            hydraulic_rad = (H * W) / (2 * H + W)
+            hydraulic_dia = hydraulic_rad * 4
+            Re = (p * v * hydraulic_dia) / viscosity
+            friction_f = 64 / Re
+            tau_zero = (friction_f / 8) * p * v**2
+            u_star = (tau_zero / p)**0.5
+            D = 5.4 * (W / H)**0.7 * (v / u_star)**0.13 * H * v
+            C_diff = 2.0 * D * time_step_seconds / (dx * dx)
+            if C_diff > max_C_diff:
+                max_C_diff = C_diff
 
-    n_sub = <LONG_t>ceil(max_C)
+    n_sub = <LONG_t>ceil(max(max_C, max_C_diff))
     if n_sub < 1:
         n_sub = 1
     elif n_sub > max_substeps:
@@ -116,10 +141,6 @@ def _transport_cython(
     cdef LONG_t[:] current_dst_rows = dst_rows
     cdef LONG_t[:] current_dst_cols = dst_cols
     cdef LONG_t current_n = n_cells
-
-    cdef double disp_coeff = D * dt_sub / (dx * dx)
-    if disp_coeff > 0.5:
-        disp_coeff = 0.5
 
     # Pre‑allocate working arrays of maximum possible size
     transport_frac = np.empty(max_cells, dtype=np.float64)
@@ -141,6 +162,8 @@ def _transport_cython(
                 so4_buf[1, src_r, src_c] = 0.0
                 h_buf[0, src_r, src_c] += h_buf[1, src_r, src_c]
                 h_buf[1, src_r, src_c] = 0.0
+                feoh3_buf[0, src_r, src_c] += feoh3_buf[1, src_r, src_c]
+                feoh3_buf[1, src_r, src_c] = 0.0
 
         # Compute transport fractions and volume validity for this substep
         for i in range(current_n):
@@ -150,23 +173,61 @@ def _transport_cython(
             if Q_val <= 0:
                 vol_valid[i] = False
                 continue
-            A = Q_val / v
-            if A < 1e-6:
-                A = 1e-6
-            V_cell = A * dx
+            # advection-diffusion calcs
+            A_cross = Q_val / v # m2
+            if A_cross < 1e-6:
+                A_cross = 1e-6
+            V_cell = A_cross * dx # m3
             adv = Q_val * dt_sub / V_cell
             if adv > 1.0:
                 adv = 1.0
-            disp = disp_coeff
-            decay = exp(-alpha * dt_sub)
-            trans_frac = (adv + disp) * decay
+
+            W = a * Q_val**b
+            H = c * Q_val**f
+            hydraulic_rad = (H * W) / (2 * H + W)
+            hydraulic_dia = hydraulic_rad * 4
+            Re = (p * v * hydraulic_dia) / viscosity
+            friction_f = 64 / Re
+            tau_zero = (friction_f / 8) * p * v**2
+            u_star = (tau_zero / p)**0.5
+            D = 5.4 * (W / H)**0.7 * (v / u_star)**0.13 * H * v
+            disp = D * dt_sub / (dx * dx)
+            if disp > 1.0:
+                disp = 1.0
+            
+            trans_frac = (adv + disp)
             if trans_frac > 1.0:
                 trans_frac = 1.0
             elif trans_frac < 0.0:
                 trans_frac = 0.0
             transport_frac[i] = trans_frac
 
-            # Optional volume check (consistent with original)
+            # advection-deposition calcs
+            mol_mass_feoh3 = 106.87 
+            kg_per_mol = mol_mass_feoh3 / 1000
+            mass_precip = feoh3_buf[0, src_r, src_c] * kg_per_mol
+
+            A_bed = W * dx
+            aq = Q_val / V_cell
+            ap = wf * A_bed / V_cell 
+            d_Sos = (1.0 - exp(-(aq + ap) * dt_sub)) * mass_precip
+
+            Qs_mass = (aq / (aq + ap)) * d_Sos # note that the paper states (aq / (aq + aq)) which is strange and resolves to 0.5 always
+            DEP_mass = (ap / (aq + ap)) * d_Sos
+
+            Qs_mol = Qs_mass / kg_per_mol
+            DEP_mol = DEP_mass / kg_per_mol
+
+
+            # Fe(OH)3 (iron (III) hydroxide)
+            feoh3_buf[0, src_r, src_c] = fmax(feoh3_buf[0, src_r, src_c] - Qs_mol - DEP_mol, 
+            0.0)
+            feoh3_buf[1, current_dst_rows[i], current_dst_cols[i]] += Qs_mol
+            bedload_storage[0, src_r, src_c] += DEP_mol
+
+
+
+            # Optional volume check 
             src_vol = Q_val * time_step_seconds * 1000.0
             if src_vol <= 0:
                 vol_valid[i] = False
@@ -259,3 +320,5 @@ def _transport_cython(
         so4_buf[1, src_r, src_c] = 0.0
         h_buf[0, src_r, src_c] += h_buf[1, src_r, src_c]
         h_buf[1, src_r, src_c] = 0.0
+        feoh3_buf[0, src_r, src_c] += feoh3_buf[1, src_r, src_c]
+        feoh3_buf[1, src_r, src_c] = 0.0 
