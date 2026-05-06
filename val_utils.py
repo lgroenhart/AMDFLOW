@@ -5,6 +5,8 @@ import numpy as np
 from pyproj import Transformer
 from scipy.spatial import cKDTree
 import os
+import scores as sc
+from sklearn.metrics import r2_score
 
 def load_datasets(amd_path, caravan_path, MGL_TO_UGL = 1e3):
     amd = xr.open_dataset(amd_path, chunks={})
@@ -278,7 +280,7 @@ def extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq
 
     return result[["wqms_id", "time", "observed", "modelled", "dist_m"]]
 
-def full_run(MIN_PAIRED_OBS = 3, resample_freq="W"):
+def full_run(VAR_MAP, MIN_PAIRED_OBS = 3, resample_freq="W"):
     all_results = {}
     IRON_VARS = {"Fe-Dis", "Fe-Tot"}
 
@@ -335,35 +337,38 @@ def full_run(MIN_PAIRED_OBS = 3, resample_freq="W"):
     return all_results, matches
 
 def compute_metrics(obs: np.ndarray, mod: np.ndarray) -> dict:
-    mask = np.isfinite(obs) & np.isfinite(mod)
-    n    = mask.sum()
+    o = obs.resample("W").mean()
+    o = xr.DataArray(o.values, coords = {"time": o.index}, dims = ["time"])
+    m = xr.DataArray(mod.values, coords = {"time": mod.index}, dims = ["time"])
+    o, m = xr.align(o, m, join = "inner")
+
+    valid = np.isfinite(o.values) & np.isfinite(m.values)
+    o = o.isel(time = valid)
+    m = m.isel(time = valid)
+    n = int(o.sizes["time"])
     if n < 3:
         return dict(n=n, RMSE=np.nan, bias=np.nan, NSE=np.nan, KGE=np.nan, R=np.nan)
-
-    o, m  = obs[mask], mod[mask]
-    rmse  = np.sqrt(np.mean((m - o) ** 2))
-    bias  = np.mean(m - o)
-    nse   = (1 - np.sum((o - m) ** 2) / np.sum((o - o.mean()) ** 2)
-             if o.std() > 0 else np.nan)
-    r     = (np.corrcoef(o, m)[0, 1]
-             if o.std() > 0 and m.std() > 0 else np.nan)
-    alpha = m.std() / o.std() if o.std() > 0 else np.nan
-    beta  = m.mean() / o.mean() if o.mean() != 0 else np.nan
-    kge   = (1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
-             if not any(np.isnan([r or np.nan, alpha or np.nan, beta or np.nan]))
-             else np.nan)
+    if o.values.std() == 0:
+        return dict(n=n, RMSE=np.nan, bias=np.nan,
+                    NSE=np.nan, KGE=np.nan, R=np.nan)
+    if m.values.std() == 0:
+        return dict(n=n, RMSE=np.nan, bias=np.nan,
+                    NSE=np.nan, KGE=np.nan, R=np.nan)
+    
+    rmse = sc.continuous.rmse(m, o).compute().values
+    bias = np.mean(m - o).values
+    nse = sc.continuous.nse(o, m).compute().values
+    r = r2_score(o.values, m.values)
+    kge = sc.continuous.kge(o, m).compute().values
     return dict(n=n, RMSE=rmse, bias=bias, NSE=nse, KGE=kge, R=r)
 
 def validation_metrics(ts: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for sid, grp in ts.groupby("wqms_id"):
-        m = compute_metrics(grp["observed"].values, grp["modelled"].values)
+        grp_t = grp.set_index("time")
+        m = compute_metrics(grp_t["observed"], grp_t["modelled"])
         m["wqms_id"] = sid
         rows.append(m)
-    # Pooled across all stations
-    overall = compute_metrics(ts["observed"].values, ts["modelled"].values)
-    overall["wqms_id"] = "ALL"
-    rows.append(overall)
 
     df = pd.DataFrame(rows).set_index("wqms_id")
 
@@ -414,7 +419,7 @@ if __name__ == "__main__":
     print(f"  pH mask:   {len(matches_ph)} stations matched")
     print(f"  Iron mask: {len(matches_iron)} stations matched")
 
-    all_results, matches = full_run(MIN_PAIRED_OBS=3, resample_freq=resample_freq)
+    all_results, matches = full_run(VAR_MAP, MIN_PAIRED_OBS=3, resample_freq=resample_freq)
 
     for var, ts in all_results.items():
         print(f"\n── {var} ──────────────────────────────────────────")
