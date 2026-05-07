@@ -483,7 +483,7 @@ if __name__ == "__main__":
     rivers_path = "../data/validation data/HydroRIVERS_v10_eu_shp/HydroRIVERS_v10_eu.shp"
     
     # choose UTM zone appropriate for your domain 
-    utm_crs = "EPSG:32633"   
+    utm_crs = "EPSG:6312"   
     resample_freq = "W"
     var_map = {
         "pH": "pH",

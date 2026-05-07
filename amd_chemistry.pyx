@@ -106,7 +106,7 @@ def process_chemistry(
         h[i] = fmax(h[i], 0.0)
         fe_oh3[i] = fmax(fe_oh3[i], 0.0)
 
-        # step 3: Fe3+ -> Fe3+ oxidation (Singer & Stumm, & PHREEQC)
+        # step 3: Fe2+ -> Fe3+ oxidation (Singer & Stumm, & PHREEQC)
         fe2_conc = fe2[i] / vol_safe
         h_conc_3 = h[i] / vol_safe
         fe2_safe = fe2_conc if (isfinite(fe2_conc) and fe2_conc > 0.0) else 0.0
