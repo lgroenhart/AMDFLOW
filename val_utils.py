@@ -203,8 +203,6 @@ def assign_uparea_from_acc(amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_tr
                 uparea_dict[(ilat, ilon)] = np.nan
         else:
             uparea_dict[(ilat, ilon)] = np.nan
-    # debug
-    print(f" Number of cells with valid uparea: {sum(~np.isnan(list(uparea_dict.values())))}")
     return uparea_dict
 
 def compute_network_distance(seg_id_a, point_a_proj, seg_id_b, point_b_proj, rivers_proj, graph):
@@ -280,28 +278,6 @@ def snap_stations_hydrosheds(candidates, amd_lat_2d, amd_lon_2d, valid_mask,
                 'point_deg': Point(transformer.transform(best_proj.x, best_proj.y, direction='INVERSE')),
                 'distance_to_river_km': best_dist / 1000.0
             }
-    # debug
-    print(f"  Stations snapped to river: {len(station_snaps)}")
-    if len(station_snaps) == 0:
-        print("  DEBUG: Checking first candidate station...")
-        row = candidates.iloc[0]
-        pt_proj = Point(transformer.transform(row['lon'], row['lat']))
-        possible = list(sindex.intersection(pt_proj.buffer(50000).bounds))
-        print(f"    Station {row['wqms_id']} at ({row['lon']}, {row['lat']})")
-        print(f"    Projected point: ({pt_proj.x:.1f}, {pt_proj.y:.1f})")
-        print(f"    Number of river segments within 50 km buffer: {len(possible)}")
-        if len(possible) > 0:
-            seg_geom = rivers_proj.iloc[possible[0]].geometry
-            print(f"    Sample segment: {seg_geom}")
-    # --- DEBUG: Print station areas and first candidate cell's uparea ---
-    print(f"  First 5 station areas: {[candidates.iloc[i]['area_sqkm'] for i in range(min(5, len(candidates)))]}")
-    # Check a sample cell's uparea
-    sample_cell = next(iter(cell_to_river.items())) if cell_to_river else None
-    if sample_cell:
-        (ilat, ilon), _ = sample_cell
-        sample_uparea = uparea_dict.get((ilat, ilon), np.nan)
-        print(f"  Sample cell uparea: {sample_uparea} km²")
-    # --- END DEBUG ---
     
     # match each station to the best cell
     matches = []
@@ -317,22 +293,12 @@ def snap_stations_hydrosheds(candidates, amd_lat_2d, amd_lon_2d, valid_mask,
         best_cell = None
         best_net_dist = np.inf
 
-        # debug 
-        candidate_count = 0
-        distance_pass = 0
-        area_pass = 0
-        # debug
-
         for (ilat, ilon), cell_info in cell_to_river.items():
             cell_seg = cell_info['HYRIV_ID']
             cell_pt_proj = cell_info['point_proj']
             uparea = uparea_dict.get((ilat, ilon), np.nan)
             if np.isnan(uparea):
                 continue
-            
-            # debug 
-            candidate_count += 1
-            # debug 
 
             # compute network distance
             net_dist_km = compute_network_distance(sta_seg, sta_pt_proj,
@@ -340,19 +306,11 @@ def snap_stations_hydrosheds(candidates, amd_lat_2d, amd_lon_2d, valid_mask,
                                                     rivers_proj, river_graph)
             if net_dist_km > max_network_km:
                 continue
-            
-            # debug 
-            distance_pass += 1
-            # debug 
 
             # area ratio check
             ratio = station_area / uparea
             if not (area_ratio_min <= ratio <= area_ratio_max):
                 continue
-            
-            #debug 
-            area_pass += 1
-            # debug 
 
             if net_dist_km < best_net_dist:
                 best_net_dist = net_dist_km
@@ -372,9 +330,6 @@ def snap_stations_hydrosheds(candidates, amd_lat_2d, amd_lon_2d, valid_mask,
                 'area_ratio': ratio
             })
         
-        # debug
-        print(f" Station {wqms_id}: cells with upurea={candidate_count}, passed distance={distance_pass}, \
-              passed area ratio={area_pass}")
     return pd.DataFrame(matches)
 
 def extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq):
