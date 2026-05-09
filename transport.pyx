@@ -1,74 +1,232 @@
-# cython: boundscheck=False, wraparound=False, initializedcheck=False, cdivision=True
+# cython: boundscheck=True, wraparound=True, initializedcheck=False, cdivision=True
 # distutils: language=c++
 
 import numpy as np
 cimport numpy as np
-from libc.math cimport exp, fmax, fmin, ceil
+from libc.math cimport exp, fmax, fmin, ceil, sqrt
 from libc.stdlib cimport malloc, free
 
-ctypedef np.float32_t FLOAT_t
-ctypedef np.int32_t INT_t
-ctypedef np.int64_t LONG_t
-cdef INT_t dst_id, next_r, next_c
+ctypedef np.float64_t F64
+ctypedef np.float32_t F32
+ctypedef np.int32_t   I32
+ctypedef np.int64_t   I64
 
 cdef extern from "math.h":
     double INFINITY
+def _transport_cn(
+    F32[:, ::1] conc,
+    F32[:, ::1] Q,
+    F32[:, ::1] Q_lat,
+    F32[:, ::1] C_lat,
+    list reaches,
+    I32[:] id_to_row,
+    I32[:] id_to_col,
+    double dx,
+    double v,
+    double a, 
+    double b,
+    double c,
+    double f,
+    double dt,
+    double psi,
+    double theta
+    ):
 
-def _transport_cython(
-    FLOAT_t[:, :, ::1] fe2_buf,      # buffer[2, nlat, nlon]
-    FLOAT_t[:, :, ::1] fe3_buf,
-    FLOAT_t[:, :, ::1] so4_buf,
-    FLOAT_t[:, :, ::1] h_buf,
-    FLOAT_t[:, :, ::1] feoh3_buf,
-    FLOAT_t[:, :, ::1] bedload_storage, # precipitated feoh3 on riverbed
-    FLOAT_t[:, ::1] Q,               # flow at current time step [nlat, nlon]
-    INT_t[:, ::1] ID_grid,           # [nlat, nlon]
-    INT_t[:, ::1] outID_grid,        # [nlat, nlon]
-    INT_t[:] id_to_row,              # mapping from ID to row index (-1 if invalid)
-    INT_t[:] id_to_col,              # mapping from ID to col index
-    LONG_t[:] id_to_outid,           # mapping from ID to outID
+    cdef:
+        I64 reach_len, i, j
+        I64 r0, c0,
+        double Q_i, A_i, V_i, W_i, H_i, D_i
+        double hr, Re, F_fric, tau, u_star
+        double r, s, p,
+        double C_im1, C_i, C_ip1, C_L_i, q_lin_i
+        double ai, bi, ci, di, denom
+        double bc_top
+        double eps = 1e-30
+        double rho = 997.1
+        double mu = 0.894e-3
+        int MAX_REACH = 50000
+
+
+    cdef F64[::1] a_arr 
+    cdef F64[::1] b_arr
+    cdef F64[::1] c_arr 
+    cdef F64[::1] d_arr 
+    cdef F64[::1] c_prime 
+    cdef F64[::1] d_prime 
+    cdef F64[::1] x_arr 
+    cdef I64[::1] rows 
+    cdef I64[::1] cols 
+
+    # loop over reaches
+    for reach_ids_py in reaches:
+
+        reach_ids = np.asarray(reach_ids_py, dtype = np.int64)
+        reach_len = len(reach_ids)
+        if reach_len < 2:
+            continue
+
+        a_arr = np.empty(reach_len, np.float64)
+        b_arr = np.empty(reach_len, np.float64)
+        c_arr = np.empty(reach_len, np.float64)
+        d_arr = np.empty(reach_len, np.float64)
+        c_prime = np.empty(reach_len, np.float64)
+        d_prime = np.empty(reach_len, np.float64)
+        x_arr = np.empty(reach_len, np.float64)
+        rows = np.empty(reach_len, np.int64)
+        cols = np.empty(reach_len, np.int64)
+
+        # cache row/col for reach
+        for i in range(reach_len):
+            rows[i] = id_to_row[reach_ids[i]]
+            cols[i] = id_to_col[reach_ids[i]]
+
+        
+        # concentration from upstream bound cell
+        r0 = rows[0]
+        c0 = cols[0]
+        Q_i = fmax(Q[r0, c0], eps)
+        V_i = fmax(Q_i / v, 1e-6) * dx
+        bc_top = conc[r0, c0] / V_i 
+
+        # tri-diagonal coeff
+        for i in range(reach_len):
+            r0 = rows[i]
+            c0 = cols[i]
+            Q_i = fmax(Q[r0, c0], eps)
+            A_i = fmax(Q_i / v, 1e-6)
+            V_i = A_i * dx
+        
+            # dispersion
+            W_i = a * (Q_i ** b)
+            H_i = c * (Q_i ** f)
+            hr = (H_i * W_i) / (2.0 * H_i + W_i + eps)
+            Re = (rho * v * 4.0 * hr) / mu
+            f_fric = 64.0 / (Re + eps)
+            tau = (f_fric / 8.0) * rho * v * v
+            u_star = sqrt(fmax(tau / rho, eps))
+            D_i = 5.4 * ((W_i / (H_i + eps)) ** 0.7) * \
+                ((v / (u_star + eps)) ** 0.13) * H_i * v
+
+            # dimensionless numbers
+            r = D_i * dt / (dx * dx)
+            s = v * dt / dx    
+            q_lin_i = fmax(Q_lat[r0, c0], 0.0)
+            p = q_lin_i * dt / (A_i * dx + eps)
+
+            # current conc
+            C_i = conc[r0, c0] / V_i
+            C_L_i = C_lat[r0, c0]
+
+            # upstream conc C_(i - 1)
+            if i == 0:
+                C_im1 = bc_top
+            else:
+                C_im1 = conc[rows[i - 1], cols[i - 1]] / \
+                    fmax(fmax(Q[rows[i - 1], cols[i - 1]], eps) / v * dx, eps)
+                
+            # downstream conc C_(i + 1)
+            if i < reach_len - 1:
+                C_ip1 = conc[rows[i + 1], cols[i + 1]] / \
+                    fmax(fmax(Q[rows[i + 1], cols[i + 1]], eps) / v * dx, eps)
+
+            else:
+                C_ip1 = C_i
+            
+            # tri-diagonal coeff
+            ai = -(theta * r - psi * s)
+            bi = 1.0 + theta * (2.0 * r + p) + psi * s
+            ci = -theta * r
+
+            # at last cell absorb c into b
+            if i == reach_len - 1:
+                bi -= ci
+                ci = 0.0
+
+            di = ( ((1.0 - theta) * r + (1.0-psi) * s ) * C_im1
+                + (1.0 - (1.0 - theta) * (2.0 * r + p)
+                - (1.0 - psi) * s) * C_i
+                + (1.0 - theta) * r * C_ip1
+                + p * C_L_i )
+
+
+            a_arr[i] = ai
+            b_arr[i] = bi
+            c_arr[i] = ci
+            d_arr[i] = di
+
+        # thomas algorithm
+        # forward sweep
+        c_prime[0] = c_arr[0] / b_arr[0]
+        d_prime[0] = d_arr[0] / b_arr[0]
+
+        for i in range(1, reach_len):
+            denom = b_arr[i] - a_arr[i] * c_prime[i - 1]
+            if abs(denom) < eps:
+                denom = eps
+            c_prime[i] = c_arr[i] / denom
+            d_prime[i] = (d_arr[i] - a_arr[i] * d_prime[i - 1]) / denom
+
+        # back substitution
+        x_arr[reach_len - 1] = d_prime[reach_len - 1]
+        for i in range(reach_len - 2, -1, -1):
+            x_arr[i] = d_prime[i] - c_prime[i] * x_arr[i + 1]
+        
+        # write back to buffer
+        for i in range(reach_len):
+            r0 = rows[i]
+            c0 = cols[i]
+            Q_i = fmax(Q[r0, c0], eps)
+            V_i = fmax(Q_i / v, 1e-6) * dx
+            conc[r0, c0] = <float>(fmax(x_arr[i], 0.0) * V_i)
+
+def _transport_ad_dep(
+    F32[:, :, ::1] feoh3_buf,
+    F32[:, :, ::1] bedload_storage, # precipitated feoh3 on riverbed
+    F32[:, ::1] Q,               # flow at current time step [nlat, nlon]
+    I64[:, ::1] ID_grid,           # [nlat, nlon]
+    I64[:, ::1] outID_grid,        # [nlat, nlon]
+    I32[:] id_to_row,              # mapping from ID to row index (-1 if invalid)
+    I32[:] id_to_col,              # mapping from ID to col index
+    I32[:] id_to_outid,           # mapping from ID to outID
     long time_idx,                   # current time index (unused but kept for interface)
     double time_step_seconds,
     double v,
     double dx,
     double a,
     double b,
-    double c,
-    double f,
     double wf, # m/s
     int max_substeps,
     long nlat,
     long nlon,
-    LONG_t[:] src_rows,              # in/out: source rows, will be modified in-place
-    LONG_t[:] src_cols,              # in/out: source cols, will be modified in-place
-):
+    I64[:] src_rows,              # in/out: source rows, will be modified in-place
+    I64[:] src_cols,              # in/out: source cols, will be modified in-place
+    ):
     """
-    Cython kernel for advective-dispersive transport of dissolved species, and advection-deposition transport of precipitate species,
+    Cython kernel for advection-deposition transport of precipitate species,
     along the flow network.
     Buffers are modified in-place.
     """
     cdef:
-        LONG_t n_cells = src_rows.shape[0]
-        LONG_t i, sub, var_idx
-        LONG_t src_r, src_c, dst_r, dst_c
-        double Q_val, A_cross, V_cell, C_courant, dt_sub, adv, disp, decay, trans_frac
+        I64 n_cells = src_rows.shape[0]
+        I64 i, sub, var_idx
+        I64 src_r, src_c, dst_r, dst_c
+        double Q_val, A_cross, V_cell, C_courant, dt_sub,
         double src_val, moved, src_vol
         double mol_mass_feoh3, kg_per_mol, mass_precip, W, A_bed, ap, aq
         double d_Sos, Qs_mass, DEP_mass, Qs_mol, DEP_mol, u_star, p, tau_zero
         double friction_f, viscosity, hydraulic_dia, hydraulic_rad, H, Re, D
-        LONG_t n_sub, sub_step
-        LONG_t[:] dst_rows = np.empty(n_cells, dtype=np.int64)
-        LONG_t[:] dst_cols = np.empty(n_cells, dtype=np.int64)
+        I64 n_sub, sub_step
+        I64[:] dst_rows = np.empty(n_cells, dtype=np.int64)
+        I64[:] dst_cols = np.empty(n_cells, dtype=np.int64)
         int[:] valid_cell = np.ones(n_cells, dtype=np.int32)
-        LONG_t valid_count
-        LONG_t current_id, next_id
+        I64 valid_count
+        I64 current_id, next_id
         double epsilon = 1e-12
 
         # For dynamic arrays inside loops
-        double[:] transport_frac
         int[:] vol_valid
         int[:] has_next
-        LONG_t max_cells = n_cells
+        I64 max_cells = n_cells
 
     # 1. Determine destination cells for each source
     for i in range(n_cells):
@@ -97,12 +255,9 @@ def _transport_cython(
 
     n_cells = valid_count
 
-    # 2. Compute number of substeps (Courant‑like condition & von Neumann condition)
-    p = 997.1
-    viscosity = 0.894e-3
+    # 2. Compute number of substeps (Courant‑like condition)
+
     cdef double max_C = 0.0
-    cdef double max_C_diff = 0.0
-    cdef double C_diff = 0.0
     for i in range(n_cells):
         src_r = src_rows[i]
         src_c = src_cols[i]
@@ -115,20 +270,8 @@ def _transport_cython(
             C_courant = Q_val * time_step_seconds / V_cell
             if C_courant > max_C:
                 max_C = C_courant
-            W = a * Q_val**b
-            H = c * Q_val**f
-            hydraulic_rad = (H * W) / (2 * H + W)
-            hydraulic_dia = hydraulic_rad * 4
-            Re = (p * v * hydraulic_dia) / viscosity
-            friction_f = 64 / Re
-            tau_zero = (friction_f / 8) * p * v**2
-            u_star = (tau_zero / p)**0.5
-            D = 5.4 * (W / H)**0.7 * (v / u_star)**0.13 * H * v
-            C_diff = 2.0 * D * time_step_seconds / (dx * dx)
-            if C_diff > max_C_diff:
-                max_C_diff = C_diff
 
-    n_sub = <LONG_t>ceil(max(max_C, max_C_diff))
+    n_sub = <I64>ceil(max_C)
     if n_sub < 1:
         n_sub = 1
     elif n_sub > max_substeps:
@@ -136,14 +279,13 @@ def _transport_cython(
     dt_sub = time_step_seconds / n_sub
 
     # 3. Prepare for substep loop
-    cdef LONG_t[:] current_src_rows = src_rows
-    cdef LONG_t[:] current_src_cols = src_cols
-    cdef LONG_t[:] current_dst_rows = dst_rows
-    cdef LONG_t[:] current_dst_cols = dst_cols
-    cdef LONG_t current_n = n_cells
+    cdef I64[:] current_src_rows = src_rows
+    cdef I64[:] current_src_cols = src_cols
+    cdef I64[:] current_dst_rows = dst_rows
+    cdef I64[:] current_dst_cols = dst_cols
+    cdef I64 current_n = n_cells
 
     # Pre‑allocate working arrays of maximum possible size
-    transport_frac = np.empty(max_cells, dtype=np.float64)
     vol_valid = np.empty(max_cells, dtype=np.int32)
     has_next = np.empty(max_cells, dtype=np.int32)
 
@@ -154,14 +296,6 @@ def _transport_cython(
             for i in range(current_n):
                 src_r = current_src_rows[i]
                 src_c = current_src_cols[i]
-                fe2_buf[0, src_r, src_c] += fe2_buf[1, src_r, src_c]
-                fe2_buf[1, src_r, src_c] = 0.0
-                fe3_buf[0, src_r, src_c] += fe3_buf[1, src_r, src_c]
-                fe3_buf[1, src_r, src_c] = 0.0
-                so4_buf[0, src_r, src_c] += so4_buf[1, src_r, src_c]
-                so4_buf[1, src_r, src_c] = 0.0
-                h_buf[0, src_r, src_c] += h_buf[1, src_r, src_c]
-                h_buf[1, src_r, src_c] = 0.0
                 feoh3_buf[0, src_r, src_c] += feoh3_buf[1, src_r, src_c]
                 feoh3_buf[1, src_r, src_c] = 0.0
 
@@ -173,34 +307,13 @@ def _transport_cython(
             if Q_val <= 0:
                 vol_valid[i] = False
                 continue
-            # advection-diffusion calcs
+            
             A_cross = Q_val / v # m2
             if A_cross < 1e-6:
                 A_cross = 1e-6
-            V_cell = A_cross * dx # m3
-            adv = Q_val * dt_sub / V_cell
-            if adv > 1.0:
-                adv = 1.0
 
+            V_cell = A_cross * dx # m3
             W = a * Q_val**b
-            H = c * Q_val**f
-            hydraulic_rad = (H * W) / (2 * H + W)
-            hydraulic_dia = hydraulic_rad * 4
-            Re = (p * v * hydraulic_dia) / viscosity
-            friction_f = 64 / Re
-            tau_zero = (friction_f / 8) * p * v**2
-            u_star = (tau_zero / p)**0.5
-            D = 5.4 * (W / H)**0.7 * (v / u_star)**0.13 * H * v
-            disp = D * dt_sub / (dx * dx)
-            if disp > 1.0:
-                disp = 1.0
-            
-            trans_frac = (adv + disp)
-            if trans_frac > 1.0:
-                trans_frac = 1.0
-            elif trans_frac < 0.0:
-                trans_frac = 0.0
-            transport_frac[i] = trans_frac
 
             # advection-deposition calcs
             mol_mass_feoh3 = 106.87 
@@ -242,38 +355,10 @@ def _transport_cython(
                 current_src_cols[valid_count] = current_src_cols[i]
                 current_dst_rows[valid_count] = current_dst_rows[i]
                 current_dst_cols[valid_count] = current_dst_cols[i]
-                transport_frac[valid_count] = transport_frac[i]
                 valid_count += 1
         if valid_count == 0:
             break
         current_n = valid_count
-
-        # Perform transport for all four chemical variables
-        for i in range(current_n):
-            src_r = current_src_rows[i]
-            src_c = current_src_cols[i]
-            dst_r = current_dst_rows[i]
-            dst_c = current_dst_cols[i]
-            # Fe2+ (ferrous iron)
-            src_val = fe2_buf[0, src_r, src_c]
-            moved = src_val * transport_frac[i]
-            fe2_buf[0, src_r, src_c] = fmax(src_val - moved, 0.0)
-            fe2_buf[1, dst_r, dst_c] += moved
-            # Fe3+ (ferric iron)
-            src_val = fe3_buf[0, src_r, src_c]
-            moved = src_val * transport_frac[i]
-            fe3_buf[0, src_r, src_c] = fmax(src_val - moved, 0.0)
-            fe3_buf[1, dst_r, dst_c] += moved
-            # SO4 (sulphate)
-            src_val = so4_buf[0, src_r, src_c]
-            moved = src_val * transport_frac[i]
-            so4_buf[0, src_r, src_c] = fmax(src_val - moved, 0.0)
-            so4_buf[1, dst_r, dst_c] += moved
-            # H+ (hydrogen ion)
-            src_val = h_buf[0, src_r, src_c]
-            moved = src_val * transport_frac[i]
-            h_buf[0, src_r, src_c] = fmax(src_val - moved, 0.0)
-            h_buf[1, dst_r, dst_c] += moved
 
         # Cascade to next downstream cells
         for i in range(current_n):
@@ -312,13 +397,5 @@ def _transport_cython(
     for i in range(current_n):
         src_r = current_src_rows[i]
         src_c = current_src_cols[i]
-        fe2_buf[0, src_r, src_c] += fe2_buf[1, src_r, src_c]
-        fe2_buf[1, src_r, src_c] = 0.0
-        fe3_buf[0, src_r, src_c] += fe3_buf[1, src_r, src_c]
-        fe3_buf[1, src_r, src_c] = 0.0
-        so4_buf[0, src_r, src_c] += so4_buf[1, src_r, src_c]
-        so4_buf[1, src_r, src_c] = 0.0
-        h_buf[0, src_r, src_c] += h_buf[1, src_r, src_c]
-        h_buf[1, src_r, src_c] = 0.0
         feoh3_buf[0, src_r, src_c] += feoh3_buf[1, src_r, src_c]
         feoh3_buf[1, src_r, src_c] = 0.0 

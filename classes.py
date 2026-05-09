@@ -2,7 +2,7 @@
 # contains main AMDModel class used for AMD modelling
 
 from amd_chemistry import process_chemistry
-from transport import _transport_cython
+from transport import _transport_cn, _transport_ad_dep
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -115,80 +115,21 @@ class AMDModel:
             parallel processing backend, by default "threading"
                 should be tuned based on dataset size, system memory, etc.
         """
-        ore_vals = self.dataset["ore"].values
-        source_vals = self.dataset["source"].values
-        id_vals = self.dataset["ID"].values
-
-        upstream_mask = (ore_vals > 0) & (source_vals == 1)
-        upstream_ids = id_vals[upstream_mask].astype(np.int64)
-        #upstream_ids = upstream_ids[upstream_ids >= 0]
-        upstream_ids = np.array(
-            [self._id_remap[i] for i in upstream_ids.tolist() if i in self._id_remap],
-            dtype=np.int64
-        )
-
         with netCDF4.Dataset(self.output_path, "r+") as nc:
             for ti, t in tqdm(enumerate(self.dataset.time.values)):
-                # upper loop of all source cells with water and ore
-                visited = set(upstream_ids.tolist())
-
-                groups  = self._get_parallel_groups(upstream_ids, chunk_size)
+                
+                groups  = self._get_parallel_groups(self._ID_grid, chunk_size)
                 
                 results = Parallel(n_jobs=n_jobs, backend = backend)(
-                    delayed(self._compute_slice)(group, t, ti) for group in groups
+                    delayed(self._chemistry)(group, t, ti) for group in groups
                 )
                 results = [r for r in results if r is not None]
 
                 for result in results:
                     self._update_buffer(t, result)
-                
-                Q_2d = self._Q_np[ti].astype(np.float32)
                 if ti < len(self.time_steps) - 1:
-                    for result in results:
-                        self._transport(t, result, Q_2d)
-
-                
-                current_ids = upstream_ids
-
-                while len(current_ids) > 0:
-                    # lower loop to propagate through flow network from upper loop, until no more downstream cells to process
-                    
-                    # get downstream IDs from current frontier
-                    out_ids = np.full_like(current_ids, -1, dtype=np.int64)
-                    valid_idx = (current_ids >= 0) & (current_ids < len(self._id_to_outid))
-                    out_ids[valid_idx] = self._id_to_outid[current_ids[valid_idx]]
-                    out_ids = out_ids[out_ids >= 0]
-
-                    # only process cells not yet visited this timestep
-                    out_ids = np.unique(out_ids)
-                    out_ids = out_ids[~np.isin(out_ids, np.fromiter(visited, dtype=np.int64))]
-
-                    if len(out_ids) == 0:
-                        break
-
-                    visited.update(out_ids.tolist())
-
-                    groups = self._get_parallel_groups(out_ids, chunk_size)
-                    
-                    # parallel only when there are multiple groups
-                    if len(groups) > 4:
-                        results = Parallel(n_jobs=n_jobs, backend = backend)(
-                            delayed(self._compute_slice)(group, t, ti) for group in groups
-                        )
-                    else:
-                        results = [self._compute_slice(group, t, ti) for group in groups]
-                    
-                    results = [r for r in results if r is not None]
-
-                    for result in results:
-                        self._update_buffer(t, result)
-
-                    if ti < len(self.time_steps) - 1:
-                        for result in results:
-                            self._transport(t, result, Q_2d)
-
-                    # advance frontier to the newly processed IDs
-                    current_ids = out_ids
+                    Q_2d = self._Q_np[ti].astype(np.float32)
+                    self._transport(t, Q_2d)
 
                 # write back to buffers
                 for var in self._chem_vars:
@@ -201,7 +142,7 @@ class AMDModel:
                 for var in self._chem_vars:
                     self._prev_buffer[var] = self._buffer[var][0].copy()
 
-    def _compute_slice(self, cell_ids, t, ti):
+    def _chemistry(self, cell_ids, t, ti):
         """Calculate chemistry for slice of cells at timestep t/ti, passes arrays to CPython file (see: amd_chemistry.pyx) for processing,
         returns arrays of row/col indices and chemistry outputs for input cells to be written back to main dataset
 
@@ -315,7 +256,7 @@ class AMDModel:
             self._buffer["iron_III_hydroxide"][0, rows, cols] = fe_oh3
             self._buffer["bedload_storage"][0, rows, cols] = bedload_storage
         
-    def _transport(self, t, result, Q_2d):
+    def _transport(self, t, Q_2d):
         """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
             uses transport_cython from transport.pyx 
 
@@ -323,55 +264,62 @@ class AMDModel:
         ----------
         t : np.datetime64
             timestep of model
-        result : tuple of np.ndarrays
-            arrays containing the row, column indices and chemistry outputs for cells at timestep t
         Q_2d : np.ndarray
             2d array of flow values at timestep t, used for transport calculations
         """
-        next_time = self._next_time(t)
-        if next_time is None:
-            return
-
-        rows, cols, fe2, fe3, so4, h, fe_oh3, bedload_storage = result
-        time_idx = self._time_index[t]
-
-        # Get source rows/cols (already filtered by _compute_slice)
-        # Convert to numpy arrays of int64 for Cython
-        src_rows = rows.astype(np.int64)
-        src_cols = cols.astype(np.int64)
-
-        # Extract 2D arrays at current time step
-        ID_grid = self._ID_grid
-        outID_grid = self.outID_grid
+        ti = self._time_index[t]
+        Q_lat = np.zeros_like(Q_2d, dtype= np.float32)
+        C_lat = np.zeros_like(Q_2d, dtype= np.float32)
 
         # Call Cython kernel
-        _transport_cython(
-            self._buffer["ferrous_iron"],
-            self._buffer["ferric_iron"],
-            self._buffer["sulphate"],
-            self._buffer["hydrogen_ion"],
+        for var in self._chem_vars: 
+            if var in ["iron_III_hydroxide", "bedload_storage"]:
+                pass
+            else:
+                _transport_cn(
+                    self._buffer[var][0],
+                    Q_2d,
+                    Q_lat,
+                    C_lat,
+                    self._reaches,
+                    self._id_to_row,      
+                    self._id_to_col,  
+                    self.dx,    
+                    self.v,
+                    self.a,
+                    self.b,
+                    self.c,
+                    self.f,
+                    self.time_step_seconds,
+                    psi =0.5,
+                    theta = 0.5
+                )
+        mask = self._buffer["iron_III_hydroxide"][0] > 0
+        src_rows, src_cols = np.where(mask)
+        src_rows = src_rows.astype(np.int64)
+        src_cols = src_cols.astype(np.int64)
+
+        _transport_ad_dep(
             self._buffer["iron_III_hydroxide"],
             self._buffer["bedload_storage"],
             Q_2d,
-            ID_grid,
-            outID_grid,
-            self._id_to_row,      
-            self._id_to_col,      
-            self._id_to_outid,    
-            time_idx,
+            self._ID_grid,
+            self.outID_grid,
+            self._id_to_row,
+            self._id_to_col,
+            self._id_to_outid,
+            ti,
             self.time_step_seconds,
             self.v,
             self.dx,
             self.a,
             self.b,
-            self.c,
-            self.f,
-            self.wf,          
-            max_substeps=1000,
+            self.wf,
+            1000,
             nlat=len(self.dataset.lat),
             nlon=len(self.dataset.lon),
             src_rows=src_rows,
-            src_cols=src_cols,
+            src_cols=src_cols
         )
 
     def _build_cache(self):
@@ -400,7 +348,7 @@ class AMDModel:
 
         self._id_to_row   = np.full(array_size, -1, dtype=np.int32)
         self._id_to_col   = np.full(array_size, -1, dtype=np.int32)
-        self._id_to_outid = np.full(array_size, -1, dtype=np.int64)
+        self._id_to_outid = np.full(array_size, -1, dtype=np.int32)
 
         remapped_ids = np.array([id_remap[i] for i in valid_ids.tolist()], dtype=np.int64)
         self._id_to_row[remapped_ids] = flat_rows[valid]
@@ -413,9 +361,9 @@ class AMDModel:
 
         
         self._ID_grid = np.vectorize(lambda x: id_remap.get(x, -1))(
-            id_vals).astype(np.int32)
+            id_vals).astype(np.int64)
         self.outID_grid = np.vectorize(lambda x: id_remap.get(x, -1))(
-            out_vals).astype(np.int32)
+            out_vals).astype(np.int64)
 
         
         self._id_remap = id_remap
@@ -440,7 +388,9 @@ class AMDModel:
         self._Q_np = self.dataset["Q"].values
         self._ore_np = self.dataset["ore"].values
         self._sink_mask = self.outID_grid < 0
-                
+        
+        self._build_reaches()
+
     def _next_time(self, t):
         """Get next timestep from _next_time_map cache
 
@@ -563,3 +513,67 @@ class AMDModel:
 
     def _get_volume(self, ti):
         return (self._Q_np[ti] / self.v) * self.dx * 1000
+    
+    def _build_reaches(self):
+        up_count = np.zeros(len(self._id_to_row), dtype = np.int32)
+        for remap_id, out_id in enumerate(self._id_to_outid):
+            if out_id >= 0:
+                up_count[out_id] += 1
+
+        headwaters = np.where(
+            (up_count == 0) & (self._id_to_row >= 0)
+        )[0]
+
+        reaches = []
+        visited = set()
+
+        for hw in headwaters:
+            reach = []
+            current = hw
+
+            while current >= 0 and current not in visited:
+                visited.add(current)
+                reach.append(int(current))
+                out = int(self._id_to_outid[current])
+
+                # stop reach at downstream cell has > 1 upstream
+                if out < 0 or up_count[out] > 1:
+                    # reach.append(out) if out >= 0 else None
+                    break
+                current = out
+            if len(reach) >= 2:
+                reaches.append(reach)
+
+        self._reaches = reaches
+
+    def diagnose_reach_coverage(self):
+        """Check what fraction of valid cells are covered by transport reaches."""
+        # all remapped IDs that correspond to real cells
+        valid_ids = set(int(i) for i in np.where(self._id_to_row >= 0)[0])
+
+        covered_ids = set()
+        for reach in self._reaches:
+            covered_ids.update(reach)
+
+        uncovered = valid_ids - covered_ids
+        pct = 100 * len(uncovered) / len(valid_ids) if valid_ids else 0
+        print(f"Valid cells:          {len(valid_ids):>8,}")
+        print(f"Covered by reaches:   {len(covered_ids):>8,}")
+        print(f"Uncovered:            {len(uncovered):>8,}  ({pct:.1f}%)")
+
+        # compute up_count to characterise uncovered cells
+        up_count = np.zeros(len(self._id_to_row), dtype=np.int32)
+        for cell_id, out_id in enumerate(self._id_to_outid):
+            if out_id >= 0:
+                up_count[out_id] += 1
+
+        confluence_ids   = set(int(i) for i in np.where(up_count > 1)[0])
+        uncov_confl      = uncovered & confluence_ids
+        uncov_downstream = uncovered - confluence_ids   # downstream of confluences but not confluences themselves
+
+        print(f"\nOf uncovered cells:")
+        print(f"  Are confluences (up_count > 1): {len(uncov_confl):>6,}")
+        print(f"  Are downstream of confluences:  {len(uncov_downstream):>6,}")
+        print(f"\nReach count: {len(self._reaches)}")
+        print(f"Mean reach length: {np.mean([len(r) for r in self._reaches]):.1f} cells")
+        print(f"Max  reach length: {max(len(r) for r in self._reaches)} cells")
