@@ -181,30 +181,31 @@ class AMDModel:
 
         # xarray to numpy arrays for CPython
         volume = self._get_volume(time_idx)[rows, cols]
-        ore    = self._ore_np[rows, cols]
+        ore = self._ore_np[rows, cols]
+        median_vol = self._median_vol[rows, cols]
 
-        fe2    = self._buffer["ferrous_iron"][0, rows, cols]
-        fe3    = self._buffer["ferric_iron"][0, rows, cols]
-        so4    = self._buffer["sulphate"][0, rows, cols]
-        h      = self._buffer["hydrogen_ion"][0, rows, cols]
+        fe2 = self._buffer["ferrous_iron"][0, rows, cols]
+        fe3 = self._buffer["ferric_iron"][0, rows, cols]
+        so4 = self._buffer["sulphate"][0, rows, cols]
+        h = self._buffer["hydrogen_ion"][0, rows, cols]
         fe_oh3 = self._buffer["iron_III_hydroxide"][0, rows, cols]
         bedload_storage = self._buffer["bedload_storage"][0, rows, cols]
 
 
         volume = np.ascontiguousarray(volume, dtype=np.float64)
-        ore    = np.ascontiguousarray(ore, dtype=np.float64)
-
-        fe2    = np.ascontiguousarray(fe2, dtype=np.float64)
-        fe3    = np.ascontiguousarray(fe3, dtype=np.float64)
-        so4    = np.ascontiguousarray(so4, dtype=np.float64)
-        h      = np.ascontiguousarray(h, dtype=np.float64)
+        ore = np.ascontiguousarray(ore, dtype=np.float64)
+        median_vol = np.ascontiguousarray(median_vol, dtype=np.float64)
+        fe2 = np.ascontiguousarray(fe2, dtype=np.float64)
+        fe3 = np.ascontiguousarray(fe3, dtype=np.float64)
+        so4 = np.ascontiguousarray(so4, dtype=np.float64)
+        h = np.ascontiguousarray(h, dtype=np.float64)
         fe_oh3 = np.ascontiguousarray(fe_oh3, dtype=np.float64)
         bedload_storage = np.ascontiguousarray(bedload_storage, dtype=np.float64)
 
         # CPython chemistry call
         process_chemistry(
             fe2, fe3, so4, h, fe_oh3, bedload_storage,
-            ore, volume,
+            ore, volume, median_vol,
             self.do, self.time_step_seconds
         )
 
@@ -390,6 +391,12 @@ class AMDModel:
         self._time_index = {t: i for i, t in enumerate(self.dataset["time"].values)}
 
         self._Q_np = self.dataset["Q"].values
+
+        # median long term volume array for protection against concentration explosions
+        median_Q = np.median(self._Q_np, axis = 0)
+        median_vol = (median_Q / self.v) * self.dx * 1000
+        self._median_vol = np.maximum(median_vol, 1.0).astype(np.float32)
+
         self._ore_np = self.dataset["ore"].values
         self._sink_mask = self.outID_grid < 0
         
@@ -600,7 +607,7 @@ class AMDModel:
             self._reach_junctions.append(None)
 
     def diagnose_reach_lengths(self):
-        """Count how many seeded reaches are discarded by the length-2 filter."""
+        """Count and show how the reaches of the network are distributed, diagnosing tool"""
         up_count = np.zeros(len(self._id_to_row), dtype=np.int32)
         for remap_id, out_id in enumerate(self._id_to_outid):
             if out_id >= 0:
@@ -627,8 +634,7 @@ class AMDModel:
             length_counts[n] = length_counts.get(n, 0) + 1
 
         for length, count in sorted(length_counts.items()):
-            discarded = " ← discarded" if length < 2 else ""
-            print(f"  length {length:>3}: {count:>6} reaches{discarded}")
+            print(f"  length {length:>3}: {count:>6} reaches")
 
     def _junction_transfer(self, var, reach_idx, Q_2d):
         """Transfer dissolved moles from reach tail to the downstream reach head.

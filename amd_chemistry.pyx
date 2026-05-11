@@ -25,6 +25,7 @@ def process_chemistry(
     double[::1] bedload_storage,
     double[::1] ore,
     double[::1] volume,
+    double[::1] median_vol,
     double do_val,            # dissolved oxygen (scalar)
     double time_step_seconds  # scalar
 ):
@@ -65,7 +66,7 @@ def process_chemistry(
             not isfinite(fe_oh3[i])):
             continue
         
-        vol_safe = volume[i]
+        vol_safe = fmax(volume[i], median_vol[i])
         h2o = (0.99704702 * (volume[i] * 1000.0)) / 18.01528
 
         # step 1: pyrite oxidation by ferric iron 
