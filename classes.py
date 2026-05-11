@@ -519,6 +519,11 @@ class AMDModel:
         return (self._Q_np[ti] / self.v) * self.dx * 1000
     
     def _build_reaches(self):
+        """Builds reaches and junction network for transport,
+        reach = headwater --> confluence, or confluence --> confluence, or headwater/confluence --> sink,
+        junction = tail of reach --> head of downstream reach, or tail of reach --> sink
+        confluence = cell with inflow cells > 1, headwater = cell with inflow cells = 0, sink = cell with outflow ID < 0
+        """
         up_count = np.zeros(len(self._id_to_row), dtype=np.int32)
         for remap_id, out_id in enumerate(self._id_to_outid):
             if out_id >= 0:
@@ -628,7 +633,16 @@ class AMDModel:
     def _junction_transfer(self, var, reach_idx, Q_2d):
         """Transfer dissolved moles from reach tail to the downstream reach head.
         Uses an explicit first-order upwind step; transfer fraction is
-        min(Courant, 1.0), which equals 1.0 for monthly timesteps at v=1 m/s.
+        min(Courant, 1.0)
+
+        Parameters
+        ----------
+        var : str
+            string name of chemistry variable to transfer
+        reach_idx : int
+            index of the reach for which to transfer mass
+        Q_2d : np.ndarray
+            2D array of flow rates
         """
         junction = self._reach_junctions[reach_idx]
         if junction is None:
