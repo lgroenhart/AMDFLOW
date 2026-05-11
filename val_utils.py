@@ -457,6 +457,8 @@ def compute_metrics(obs, mod):
 
 def validation_metrics(ts):
     """Compute per-station metrics and return DataFrame."""
+    if ts.empty:
+        return pd.DataFrame(columns=["n", "RMSE", "bias", "NSE", "KGE", "R"])
     rows = []
     for sid, grp in ts.groupby("wqms_id"):
         grp = grp.set_index("time").sort_index()
