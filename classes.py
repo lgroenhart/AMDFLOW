@@ -127,9 +127,9 @@ class AMDModel:
 
                 for result in results:
                     self._update_buffer(t, result)
-                if ti < len(self.time_steps) - 1:
-                    Q_2d = self._Q_np[ti].astype(np.float32)
-                    self._transport(t, Q_2d)
+
+                Q_2d = self._Q_np[ti].astype(np.float32)
+                self._transport(t, Q_2d)
 
                 # write back to buffers
                 for var in self._chem_vars:
@@ -276,24 +276,28 @@ class AMDModel:
             if var in ["iron_III_hydroxide", "bedload_storage"]:
                 pass
             else:
-                _transport_cn(
-                    self._buffer[var][0],
-                    Q_2d,
-                    Q_lat,
-                    C_lat,
-                    self._reaches,
-                    self._id_to_row,      
-                    self._id_to_col,  
-                    self.dx,    
-                    self.v,
-                    self.a,
-                    self.b,
-                    self.c,
-                    self.f,
-                    self.time_step_seconds,
-                    psi =0.5,
-                    theta = 0.5
-                )
+                for reach_idx, reach in enumerate(self._reaches):
+                    if len(reach) >= 2:
+                        _transport_cn(
+                            self._buffer[var][0],
+                            Q_2d,
+                            Q_lat,
+                            C_lat,
+                            [reach],
+                            self._id_to_row,      
+                            self._id_to_col,  
+                            self.dx,    
+                            self.v,
+                            self.a,
+                            self.b,
+                            self.c,
+                            self.f,
+                            self.time_step_seconds,
+                            psi =0.5,
+                            theta = 0.5
+                        )
+                    self._junction_transfer(var, reach_idx, Q_2d)
+
         mask = self._buffer["iron_III_hydroxide"][0] > 0
         src_rows, src_cols = np.where(mask)
         src_rows = src_rows.astype(np.int64)
@@ -515,65 +519,131 @@ class AMDModel:
         return (self._Q_np[ti] / self.v) * self.dx * 1000
     
     def _build_reaches(self):
-        up_count = np.zeros(len(self._id_to_row), dtype = np.int32)
+        up_count = np.zeros(len(self._id_to_row), dtype=np.int32)
         for remap_id, out_id in enumerate(self._id_to_outid):
             if out_id >= 0:
                 up_count[out_id] += 1
 
-        headwaters = np.where(
-            (up_count == 0) & (self._id_to_row >= 0)
-        )[0]
+        headwaters  = np.where((up_count == 0) & (self._id_to_row >= 0))[0]
+        confluences = np.where((up_count > 1)  & (self._id_to_row >= 0))[0]
+        start_cells = np.concatenate([headwaters, confluences])
 
         reaches = []
         visited = set()
-
-        for hw in headwaters:
+        for hw in start_cells:
             reach = []
-            current = hw
-
+            current = int(hw)
             while current >= 0 and current not in visited:
                 visited.add(current)
-                reach.append(int(current))
+                reach.append(current)
                 out = int(self._id_to_outid[current])
-
-                # stop reach at downstream cell has > 1 upstream
                 if out < 0 or up_count[out] > 1:
-                    # reach.append(out) if out >= 0 else None
                     break
                 current = out
-            if len(reach) >= 2:
+            if len(reach) >= 1:
                 reaches.append(reach)
 
-        self._reaches = reaches
+        # --- topological sort (Kahn's algorithm) ---
+        # map each reach's head cell → reach index
+        head_to_reach = {r[0]: i for i, r in enumerate(reaches)}
 
-    def diagnose_reach_coverage(self):
-        """Check what fraction of valid cells are covered by transport reaches."""
-        # all remapped IDs that correspond to real cells
-        valid_ids = set(int(i) for i in np.where(self._id_to_row >= 0)[0])
+        # for each reach, which reach index is immediately downstream (-1 = none)
+        downstream_of = []
+        for reach in reaches:
+            out_id = int(self._id_to_outid[reach[-1]])
+            downstream_of.append(head_to_reach.get(out_id, -1))
 
-        covered_ids = set()
+        n = len(reaches)
+        in_degree = [0] * n
+        for d in downstream_of:
+            if d >= 0:
+                in_degree[d] += 1
+
+        from collections import deque
+        queue = deque(i for i in range(n) if in_degree[i] == 0)
+        sorted_order = []
+        while queue:
+            i = queue.popleft()
+            sorted_order.append(i)
+            d = downstream_of[i]
+            if d >= 0:
+                in_degree[d] -= 1
+                if in_degree[d] == 0:
+                    queue.append(d)
+
+        # guard against cycles (shouldn't occur in a valid river network)
+        if len(sorted_order) < n:
+            visited_set = set(sorted_order)
+            sorted_order.extend(i for i in range(n) if i not in visited_set)
+
+        self._reaches = [reaches[i] for i in sorted_order]
+
+        # --- junction cache: one entry per reach ---
+        # each entry is (tail_r, tail_c, dst_r, dst_c) or None for sinks
+        self._reach_junctions = []
         for reach in self._reaches:
-            covered_ids.update(reach)
+            tail_id = reach[-1]
+            tail_r  = int(self._id_to_row[tail_id])
+            tail_c  = int(self._id_to_col[tail_id])
+            out_id  = int(self._id_to_outid[tail_id])
+            if out_id >= 0 and out_id < len(self._id_to_row):
+                dst_r = int(self._id_to_row[out_id])
+                dst_c = int(self._id_to_col[out_id])
+                if dst_r >= 0 and dst_c >= 0:
+                    self._reach_junctions.append((tail_r, tail_c, dst_r, dst_c))
+                    continue
+            self._reach_junctions.append(None)
 
-        uncovered = valid_ids - covered_ids
-        pct = 100 * len(uncovered) / len(valid_ids) if valid_ids else 0
-        print(f"Valid cells:          {len(valid_ids):>8,}")
-        print(f"Covered by reaches:   {len(covered_ids):>8,}")
-        print(f"Uncovered:            {len(uncovered):>8,}  ({pct:.1f}%)")
-
-        # compute up_count to characterise uncovered cells
+    def diagnose_reach_lengths(self):
+        """Count how many seeded reaches are discarded by the length-2 filter."""
         up_count = np.zeros(len(self._id_to_row), dtype=np.int32)
-        for cell_id, out_id in enumerate(self._id_to_outid):
+        for remap_id, out_id in enumerate(self._id_to_outid):
             if out_id >= 0:
                 up_count[out_id] += 1
 
-        confluence_ids   = set(int(i) for i in np.where(up_count > 1)[0])
-        uncov_confl      = uncovered & confluence_ids
-        uncov_downstream = uncovered - confluence_ids   # downstream of confluences but not confluences themselves
+        headwaters  = np.where((up_count == 0) & (self._id_to_row >= 0))[0]
+        confluences = np.where((up_count > 1)  & (self._id_to_row >= 0))[0]
+        start_cells = np.concatenate([headwaters, confluences])
 
-        print(f"\nOf uncovered cells:")
-        print(f"  Are confluences (up_count > 1): {len(uncov_confl):>6,}")
-        print(f"  Are downstream of confluences:  {len(uncov_downstream):>6,}")
-        print(f"\nReach count: {len(self._reaches)}")
-        print(f"Mean reach length: {np.mean([len(r) for r in self._reaches]):.1f} cells")
-        print(f"Max  reach length: {max(len(r) for r in self._reaches)} cells")
+        visited = set()
+        length_counts = {}
+
+        for hw in start_cells:
+            reach = []
+            current = int(hw)
+            while current >= 0 and current not in visited:
+                visited.add(current)
+                reach.append(current)
+                out = int(self._id_to_outid[current])
+                if out < 0 or up_count[out] > 1:
+                    break
+                current = out
+            n = len(reach)
+            length_counts[n] = length_counts.get(n, 0) + 1
+
+        for length, count in sorted(length_counts.items()):
+            discarded = " ← discarded" if length < 2 else ""
+            print(f"  length {length:>3}: {count:>6} reaches{discarded}")
+
+    def _junction_transfer(self, var, reach_idx, Q_2d):
+        """Transfer dissolved moles from reach tail to the downstream reach head.
+        Uses an explicit first-order upwind step; transfer fraction is
+        min(Courant, 1.0), which equals 1.0 for monthly timesteps at v=1 m/s.
+        """
+        junction = self._reach_junctions[reach_idx]
+        if junction is None:
+            return
+
+        tail_r, tail_c, dst_r, dst_c = junction
+        Q_val = float(Q_2d[tail_r, tail_c])
+        if Q_val <= 0.0:
+            return
+
+        V_cell = (Q_val / self.v) * self.dx          # m³
+        courant = Q_val * self.time_step_seconds / V_cell
+        fraction = min(courant, 1.0)
+
+        buf = self._buffer[var][0]
+        transfer = fraction * float(buf[tail_r, tail_c])
+        buf[tail_r, tail_c] -= transfer
+        buf[dst_r, dst_c]   += transfer
