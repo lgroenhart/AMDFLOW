@@ -134,17 +134,8 @@ class AMDModel:
         with netCDF4.Dataset(self.output_path, "r+") as nc:
             for ti, t in tqdm(enumerate(self.dataset.time.values)):
                 
-                groups  = self._get_parallel_groups(self._ID_grid, chunk_size)
-                
-                results = Parallel(n_jobs=n_jobs, backend = backend)(
-                    delayed(self._chemistry)(group, t, ti) for group in groups
-                )
-                results = [r for r in results if r is not None]
-
-                for result in results:
-                    self._update_buffer(t, result)
-
                 Q_2d = self._Q_np[ti].astype(np.float32)
+                self._chemistry(Q_2d)
                 self._transport(t, Q_2d)
 
                 # write back to buffers
@@ -154,75 +145,35 @@ class AMDModel:
                 
                 self._write_timestep(ti, nc)
                 
-    def _chemistry(self, cell_ids, t, ti):
-        """Calculate chemistry for slice of cells at timestep t/ti, passes arrays to CPython file (see: amd_chemistry.pyx) for processing,
-        returns arrays of row/col indices and chemistry outputs for input cells to be written back to main dataset
+    def _chemistry(self, Q_2d):
 
-        Parameters
-        ----------
-        cell_ids : np.ndarray
-            array of cell IDs to process in slice
-        t : np.datetime64
-            timestep to process
-        ti : int
-            index of timestep to process
+        volume_2d = (Q_2d / self.v) * self.dx * 1000  # litres
+        mask = (np.isfinite(volume_2d)) & (volume_2d > 0)
+        rows, cols = np.where(mask)
+        valid_rows = rows.astype(np.int64)
+        valid_cols = cols.astype(np.int64)
+        num_valid = len(valid_rows)
 
-        Returns
-        -------
-        rows, cols, fe2, fe3, so4, h, fe_oh3: tuple of np.ndarrays
-            arrays containing the row, column indices, and chemistry outputs for input cells at timestep t/ti
-        """
-        # convert IDs to indices 
-        cell_ids = np.asarray(cell_ids, dtype=np.int64)
-
-        valid_ids = (cell_ids >= 0) & (cell_ids < len(self._id_to_row))
-        rows = np.full_like(cell_ids, -1, dtype=np.int32)
-        cols = np.full_like(cell_ids, -1, dtype=np.int32)
-        rows[valid_ids] = self._id_to_row[cell_ids[valid_ids]]
-        cols[valid_ids] = self._id_to_col[cell_ids[valid_ids]]
-
-        # filter invalid IDs
-        valid = (rows >= 0) & (cols >= 0)
-        if not np.any(valid):
+        if num_valid == 0:
             return None
+        else:
+            process_chemistry(
+                self._buffer["ferrous_iron"][0],
+                self._buffer["ferric_iron"][0],
+                self._buffer["sulphate"][0],
+                self._buffer["hydrogen_ion"][0],
+                self._buffer["iron_III_hydroxide"][0],
+                self._buffer["bedload_storage"][0],
+                self._ore_np,
+                volume_2d,
+                self._median_vol,
+                self.do,
+                self.time_step_seconds,
+                valid_rows,
+                valid_cols,
+                num_valid
+            )
 
-        rows = rows[valid]
-        cols = cols[valid]
-
-        time_idx = self._time_index[t]
-
-        # xarray to numpy arrays for CPython
-        volume = self._get_volume(time_idx)[rows, cols]
-        ore = self._ore_np[rows, cols]
-        median_vol = self._median_vol[rows, cols]
-
-        fe2 = self._buffer["ferrous_iron"][0, rows, cols]
-        fe3 = self._buffer["ferric_iron"][0, rows, cols]
-        so4 = self._buffer["sulphate"][0, rows, cols]
-        h = self._buffer["hydrogen_ion"][0, rows, cols]
-        fe_oh3 = self._buffer["iron_III_hydroxide"][0, rows, cols]
-        bedload_storage = self._buffer["bedload_storage"][0, rows, cols]
-
-
-        volume = np.ascontiguousarray(volume, dtype=np.float64)
-        ore = np.ascontiguousarray(ore, dtype=np.float64)
-        median_vol = np.ascontiguousarray(median_vol, dtype=np.float64)
-        fe2 = np.ascontiguousarray(fe2, dtype=np.float64)
-        fe3 = np.ascontiguousarray(fe3, dtype=np.float64)
-        so4 = np.ascontiguousarray(so4, dtype=np.float64)
-        h = np.ascontiguousarray(h, dtype=np.float64)
-        fe_oh3 = np.ascontiguousarray(fe_oh3, dtype=np.float64)
-        bedload_storage = np.ascontiguousarray(bedload_storage, dtype=np.float64)
-
-        # CPython chemistry call
-        process_chemistry(
-            fe2, fe3, so4, h, fe_oh3, bedload_storage,
-            ore, volume, median_vol,
-            self.do, self.time_step_seconds
-        )
-
-        return rows, cols, fe2, fe3, so4, h, fe_oh3, bedload_storage
-    
     def _get_parallel_groups(self, cell_ids, chunk_size=None):
         """Groups cell IDs into chunks for parallel processing, if chunk_size is None, it will be automatically determined based on number of CPU cores and number of cell IDs
 
