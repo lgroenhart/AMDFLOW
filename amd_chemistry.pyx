@@ -16,21 +16,21 @@ ctypedef np.float64_t DTYPE_t
 @cython.cdivision(True)
 @cython.nonecheck(False)
 def process_chemistry(
-    double[:, ::1] fe2,
-    double[:, ::1] fe3,
-    double[:, ::1] so4,
-    double[:, ::1] h,
-    double[:, ::1] fe_oh3,
-    double[:, ::1] bedload_storage,
+    float[:, ::1] fe2,
+    float[:, ::1] fe3,
+    float[:, ::1] so4,
+    float[:, ::1] h,
+    float[:, ::1] fe_oh3,
+    float[:, ::1] bedload_storage,
     double[:, ::1] ore,
-    double[:, ::1] volume,
-    double[:, ::1] median_vol,
-    long[:] valid_rows,
-    long[:] valid_cols,
-    long num_valid,
+    float[:, ::1] volume,
+    float[:, ::1] median_vol,
     double do_val,            # dissolved oxygen (scalar)
-    double time_step_seconds  # scalar
-):
+    double time_step_seconds,  # scalar
+    Py_ssize_t[::1] valid_rows,
+    Py_ssize_t[::1] valid_cols,
+    Py_ssize_t num_valid
+    ):
     """
     chemistry steps in a single C-speed loop over n cells.
     """
@@ -60,15 +60,15 @@ def process_chemistry(
     for k in prange(num_valid, nogil = True, schedule = "static"):
         r = valid_rows[k]
         c = valid_cols[k]
-        fe2_val = fe2[r, c]
-        fe3_val = fe3[r, c]
-        so4_val = so4[r, c]
-        h_val = h[r, c]
-        fe_oh3_val = fe_oh3[r, c]
-        bedload_val = bedload_storage[r, c]
-        ore_val = ore[r, c]
-        vol_val = volume[r, c]
-        median_vol_val = median_vol[r, c]
+        fe2_val = <double>fe2[r, c]
+        fe3_val = <double>fe3[r, c]
+        so4_val = <double>so4[r, c]
+        h_val = <double>h[r, c]
+        fe_oh3_val = <double>fe_oh3[r, c]
+        bedload_val = <double>bedload_storage[r, c]
+        ore_val = <double>ore[r, c]
+        vol_val = <double>volume[r, c]
+        median_vol_val = <double>median_vol[r, c]
         
         if not isfinite(vol_val) or not isfinite(ore_val) or not isfinite(fe2_val):
             continue
@@ -135,9 +135,9 @@ def process_chemistry(
         fe2_oxidised = fmin(ox_rate * vol_safe * time_step_seconds, fe2_val)
         if not isfinite(fe2_oxidised):
             fe2_oxidised = 0.0
-        fe3_val += fe2_oxidised
-        h_val -= fe2_oxidised
-        fe2_val -= fe2_oxidised
+        fe3_val = fe3_val + fe2_oxidised
+        h_val = h_val - fe2_oxidised
+        fe2_val = fe2_val - fe2_oxidised
 
         fe2_val = fmax(fe2_val, 0.0)
         fe3_val = fmax(fe3_val, 0.0)
@@ -164,9 +164,9 @@ def process_chemistry(
             # precipitation
             precip = (fe3_conc - eq_act / gamma_fe3) * vol_safe
             precip = fmin(fmax(precip, 0.0), fe3_val)
-            fe3_val -= precip
-            fe_oh3_val += precip
-            h_val += precip * 3.0
+            fe3_val = fe3_val - precip
+            fe_oh3_val = fe_oh3_val + precip
+            h_val = h_val + precip * 3.0
 
         else:
             # dissolving from suspended flow first
@@ -174,16 +174,16 @@ def process_chemistry(
             dissolve_needed = fmax(dissolve_needed, 0.0)
 
             dissolve_sus = fmin(dissolve_needed, fe_oh3_val)
-            fe_oh3_val -= dissolve_sus
-            fe3_val += dissolve_sus
+            fe_oh3_val = fe_oh3_val - dissolve_sus
+            fe3_val = fe3_val + dissolve_sus
             h_val = fmax(h_val - dissolve_sus * 3.0, 0.0)
 
             # dissolve any remainder needed from bedload if possible
             remaining = dissolve_needed - dissolve_sus
             if remaining > 0.0:
                 dissolve_bed = fmin(remaining, bedload_storage_val)
-                bedload_storage_val -= dissolve_bed
-                fe3_val += dissolve_bed
+                bedload_storage_val = bedload_storage_val - dissolve_bed
+                fe3_val = fe3_val + dissolve_bed
                 h_val = fmax(h_val - dissolve_bed * 3.0, 0.0)
 
         # ── Step 5: clip negatives ────────────────────────────────────────
@@ -195,9 +195,9 @@ def process_chemistry(
         bedload_storage_val = fmax(bedload_storage_val, 0.0)
 
         # write back to arrays
-        fe2[r, c] = fe2_val
-        fe3[r, c] = fe3_val
-        h[r, c] = h_val
-        so4[r, c] = so4_val
-        fe_oh3[r, c] = fe_oh3_val
-        bedload_storage[r, c] = bedload_storage_val
+        fe2[r, c] = <float>fe2_val
+        fe3[r, c] = <float>fe3_val
+        h[r, c] = <float>h_val
+        so4[r, c] = <float>so4_val
+        fe_oh3[r, c] = <float>fe_oh3_val
+        bedload_storage[r, c] = <float>bedload_storage_val

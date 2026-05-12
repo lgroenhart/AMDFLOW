@@ -150,8 +150,8 @@ class AMDModel:
         volume_2d = (Q_2d / self.v) * self.dx * 1000  # litres
         mask = (np.isfinite(volume_2d)) & (volume_2d > 0)
         rows, cols = np.where(mask)
-        valid_rows = rows.astype(np.int64)
-        valid_cols = cols.astype(np.int64)
+        valid_rows = rows.astype(np.intp)
+        valid_cols = cols.astype(np.intp)
         num_valid = len(valid_rows)
 
         if num_valid == 0:
