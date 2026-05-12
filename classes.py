@@ -293,6 +293,7 @@ class AMDModel:
                     if len(reach) >= 2:
                         _transport_cn(
                             self._buffer[var][0],
+                            self._sbuffer[var][0],
                             Q_2d,
                             Q_lat,
                             C_lat,
@@ -306,8 +307,10 @@ class AMDModel:
                             self.c,
                             self.f,
                             self.time_step_seconds,
-                            psi =0.5,
-                            theta = 0.5
+                            0.5,
+                            0.5,
+                            self.alpha_s,
+                            self.A_s_ratio
                         )
                     self._junction_transfer(var, reach_idx, Q_2d)
 
