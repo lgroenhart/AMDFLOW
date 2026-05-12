@@ -235,34 +235,47 @@ class AMDModel:
         Q_lat = np.zeros_like(Q_2d, dtype= np.float32)
         C_lat = np.zeros_like(Q_2d, dtype= np.float32)
 
-        # Call Cython kernel
+        # call Cython kernel
         for var in self._chem_vars: 
             if var in ["iron_III_hydroxide", "bedload_storage"]:
                 pass
             else:
                 for reach_idx, reach in enumerate(self._reaches):
                     if len(reach) >= 2:
-                        _transport_cn(
-                            self._buffer[var][0],
-                            self._sbuffer[var][0],
-                            Q_2d,
-                            Q_lat,
-                            C_lat,
-                            [reach],
-                            self._id_to_row,      
-                            self._id_to_col,  
-                            self.dx,    
-                            self.v,
-                            self.a,
-                            self.b,
-                            self.c,
-                            self.f,
-                            self.time_step_seconds,
-                            0.5,
-                            0.5,
-                            self.alpha_s,
-                            self.A_s_ratio
-                        )
+                        if self._cn_working_arrays is not None:
+                            _transport_cn(
+                                self._buffer[var][0],
+                                self._sbuffer[var][0],
+                                Q_2d,
+                                Q_lat,
+                                C_lat,
+                                [reach],
+                                self._id_to_row,      
+                                self._id_to_col,  
+                                self.dx,    
+                                self.v,
+                                self.a,
+                                self.b,
+                                self.c,
+                                self.f,
+                                self.time_step_seconds,
+                                0.5,
+                                0.5,
+                                self.alpha_s,
+                                self.A_s_ratio,
+                                self._cn_working_arrays["a"],
+                                self._cn_working_arrays["b"],
+                                self._cn_working_arrays["c"],
+                                self._cn_working_arrays["d"],
+                                self._cn_working_arrays["c_prime"],
+                                self._cn_working_arrays["d_prime"],
+                                self._cn_working_arrays["x"],
+                                self._cn_working_arrays["rows"],
+                                self._cn_working_arrays["cols"],
+                                self._cn_working_arrays["V"],
+                                self._max_reach_length
+                                )
+                            
                     self._junction_transfer(var, reach_idx, Q_2d)
 
         mask = self._buffer["iron_III_hydroxide"][0] > 0
@@ -287,10 +300,15 @@ class AMDModel:
             self.b,
             self.wf,
             1000,
-            nlat=len(self.dataset.lat),
-            nlon=len(self.dataset.lon),
-            src_rows=src_rows,
-            src_cols=src_cols
+            len(self.dataset.lat),
+            len(self.dataset.lon),
+            src_rows,
+            src_cols,
+            self._addep_working_arrays["dst_rows"],
+            self._addep_working_arrays["dst_cols"],
+            self._addep_working_arrays["valid_cell"],
+            self._addep_working_arrays["vol_valid"],
+            self._addep_working_arrays["has_next"]
         )
 
     def _build_cache(self):
@@ -367,6 +385,31 @@ class AMDModel:
         self._sink_mask = self.outID_grid < 0
         
         self._build_reaches()
+
+        if self._max_reach_length >= 2:
+            self._cn_working_arrays = {
+                "a": np.empty((self._max_reach_length,), dtype=np.float64),
+                "b": np.empty((self._max_reach_length,), dtype=np.float64),
+                "c": np.empty((self._max_reach_length,), dtype=np.float64),
+                "d": np.empty((self._max_reach_length,), dtype=np.float64),
+                "c_prime": np.empty((self._max_reach_length,), dtype=np.float64),
+                "d_prime": np.empty((self._max_reach_length,), dtype=np.float64),
+                "x": np.empty((self._max_reach_length,), dtype=np.float64),
+                "rows": np.empty((self._max_reach_length,), dtype=np.int64),
+                "cols": np.empty((self._max_reach_length,), dtype=np.int64),
+                "V": np.empty((self._max_reach_length,), dtype=np.float64)
+            }
+        else:
+            self._cn_working_arrays = None
+        
+        nlat, nlon = self.dataset.lat.size, self.dataset.lon.size
+        self._addep_working_arrays = {
+            "dst_rows": np.empty(nlat * nlon, dtype = np.int64),
+            "dst_cols": np.empty(nlat * nlon, dtype = np.int64),
+            "valid_cell": np.empty(nlat * nlon, dtype = np.int32),
+            "vol_valid": np.empty(nlat * nlon, dtype = np.int32),
+            "has_next": np.empty(nlat * nlon, dtype = np.int32)
+        }
 
     def _next_time(self, t):
         """Get next timestep from _next_time_map cache
@@ -581,6 +624,8 @@ class AMDModel:
                     self._reach_junctions.append((tail_r, tail_c, dst_r, dst_c))
                     continue
             self._reach_junctions.append(None)
+
+        self._max_reach_length = max(len(r) for r in self._reaches)
 
     def diagnose_reach_lengths(self):
         """Count and show how the reaches of the network are distributed, diagnosing tool"""

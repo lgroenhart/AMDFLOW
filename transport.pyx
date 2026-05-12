@@ -32,14 +32,24 @@ def _transport_cn(
     double psi,
     double theta,
     double alpha_s,
-    double A_s_ratio
+    double A_s_ratio,
+    F64[::1] a_arr,        
+    F64[::1] b_arr,
+    F64[::1] c_arr,
+    F64[::1] d_arr,
+    F64[::1] c_prime,
+    F64[::1] d_prime,
+    F64[::1] x_arr,
+    I64[::1] rows,
+    I64[::1] cols,
+    F64[::1] V_i_arr,
+    long max_reach_length   
     ):
-
     cdef:
-        I64 reach_len, i, j
-        I64 r0, c0,
+        I64 reach_len, i
+        I64 r0, c0
         double Q_i, A_i, V_i, W_i, H_i, D_i
-        double hr, Re, F_fric, tau, u_star
+        double hr, Re, f_fric, tau, u_star
         double r, s, p, beta, gamma, kappa
         double C_im1, C_i, C_ip1, C_L_i, q_lin_i
         double ai, bi, ci, di, denom
@@ -47,53 +57,29 @@ def _transport_cn(
         double eps = 1e-30
         double rho = 997.1
         double mu = 0.894e-3
-        int MAX_REACH = 50000
 
-
-    cdef F64[::1] a_arr 
-    cdef F64[::1] b_arr
-    cdef F64[::1] c_arr 
-    cdef F64[::1] d_arr 
-    cdef F64[::1] c_prime 
-    cdef F64[::1] d_prime 
-    cdef F64[::1] x_arr 
-    cdef I64[::1] rows 
-    cdef I64[::1] cols 
-    cdef F64[::1] V_i_arr
-
-    # loop over reaches
     for reach_ids_py in reaches:
-
-        reach_ids = np.asarray(reach_ids_py, dtype = np.int64)
+        reach_ids = np.asarray(reach_ids_py, dtype=np.int64)
         reach_len = len(reach_ids)
         if reach_len < 2:
             continue
 
-        a_arr = np.empty(reach_len, np.float64)
-        b_arr = np.empty(reach_len, np.float64)
-        c_arr = np.empty(reach_len, np.float64)
-        d_arr = np.empty(reach_len, np.float64)
-        c_prime = np.empty(reach_len, np.float64)
-        d_prime = np.empty(reach_len, np.float64)
-        x_arr = np.empty(reach_len, np.float64)
-        rows = np.empty(reach_len, np.int64)
-        cols = np.empty(reach_len, np.int64)
-        V_i_arr = np.empty(reach_len, np.float64)
+        if reach_len > max_reach_length:
+            raise ValueError("Reach length exceeds pre‑allocated workspace size")
 
         # cache row/col for reach
         for i in range(reach_len):
             rows[i] = id_to_row[reach_ids[i]]
             cols[i] = id_to_col[reach_ids[i]]
 
-        
-        # concentration from upstream bound cell
+        # concentration from upstream boundary cell
         r0 = rows[0]
         c0 = cols[0]
         Q_i = fmax(Q[r0, c0], eps)
         V_i = fmax(Q_i / v, 1e-6) * dx
-        bc_top = conc[r0, c0] / V_i 
+        bc_top = conc[r0, c0] / V_i
 
-        # tri-diagonal coeff
+        # build tridiagonal coefficients 
         for i in range(reach_len):
             r0 = rows[i]
             c0 = cols[i]
@@ -101,8 +87,8 @@ def _transport_cn(
             A_i = fmax(Q_i / v, 1e-6)
             V_i = A_i * dx
             V_i_arr[i] = V_i
-        
-            # dispersion
+
+            # dispersion 
             W_i = a * (Q_i ** b)
             H_i = c * (Q_i ** f)
             hr = (H_i * W_i) / (2.0 * H_i + W_i + eps)
@@ -113,48 +99,43 @@ def _transport_cn(
             D_i = 5.4 * ((W_i / (H_i + eps)) ** 0.7) * \
                 ((v / (u_star + eps)) ** 0.13) * H_i * v
 
-            # dimensionless numbers
             r = D_i * dt / (dx * dx)
-            s = v * dt / dx    
+            s_adv = v * dt / dx          
             q_lin_i = fmax(Q_lat[r0, c0], 0.0)
             p = q_lin_i * dt / (A_i * dx + eps)
 
-            # current conc
             C_i = conc[r0, c0] / V_i
             C_L_i = C_lat[r0, c0]
 
-            # upstream conc C_(i - 1)
+            # upstream concentration
             if i == 0:
                 C_im1 = bc_top
             else:
                 C_im1 = conc[rows[i - 1], cols[i - 1]] / \
                     fmax(fmax(Q[rows[i - 1], cols[i - 1]], eps) / v * dx, eps)
-                
-            # downstream conc C_(i + 1)
+
+            # downstream concentration
             if i < reach_len - 1:
                 C_ip1 = conc[rows[i + 1], cols[i + 1]] / \
                     fmax(fmax(Q[rows[i + 1], cols[i + 1]], eps) / v * dx, eps)
-
             else:
                 C_ip1 = C_i
-            
-            # tri-diagonal coeff
-            ai = -(theta * r - psi * s)
-            bi = 1.0 + theta * (2.0 * r + p) + psi * s
+
+            # coefficients
+            ai = -(theta * r - psi * s_adv)
+            bi = 1.0 + theta * (2.0 * r + p) + psi * s_adv
             ci = -theta * r
 
-            # at last cell absorb c into b
             if i == reach_len - 1:
                 bi -= ci
                 ci = 0.0
 
-            di = ( ((1.0 - theta) * r + (1.0-psi) * s ) * C_im1
+            di = ( ((1.0 - theta) * r + (1.0 - psi) * s_adv) * C_im1
                 + (1.0 - (1.0 - theta) * (2.0 * r + p)
-                - (1.0 - psi) * s) * C_i
+                - (1.0 - psi) * s_adv) * C_i
                 + (1.0 - theta) * r * C_ip1
                 + p * C_L_i )
 
-            # storage exchange
             if alpha_s > 0.0:
                 beta = alpha_s / A_s_ratio
                 kappa = beta * dt / 2.0
@@ -166,13 +147,13 @@ def _transport_cn(
                 bi += gamma / 2.0
                 di += gamma * C_s_i - (gamma / 2.0) * C_i
 
+
             a_arr[i] = ai
             b_arr[i] = bi
             c_arr[i] = ci
             d_arr[i] = di
 
-        # thomas algorithm
-        # forward sweep
+        # Thomas algorithm 
         c_prime[0] = c_arr[0] / b_arr[0]
         d_prime[0] = d_arr[0] / b_arr[0]
 
@@ -183,12 +164,11 @@ def _transport_cn(
             c_prime[i] = c_arr[i] / denom
             d_prime[i] = (d_arr[i] - a_arr[i] * d_prime[i - 1]) / denom
 
-        # back substitution
         x_arr[reach_len - 1] = d_prime[reach_len - 1]
         for i in range(reach_len - 2, -1, -1):
             x_arr[i] = d_prime[i] - c_prime[i] * x_arr[i + 1]
-        
-        # write back to buffer
+
+        # write back to buffers 
         for i in range(reach_len):
             r0 = rows[i]
             c0 = cols[i]
@@ -201,10 +181,8 @@ def _transport_cn(
 
             beta = alpha_s / A_s_ratio
             kappa = beta * dt / 2.0
-            C_s_new = (C_s_old * (1.0 - kappa) + kappa *(C_old + C_new)) / (1.0 + kappa)
-            
-            Q_i = fmax(Q[r0, c0], eps)
-            V_i = fmax(Q_i / v, 1e-6) * dx
+            C_s_new = (C_s_old * (1.0 - kappa) + kappa * (C_old + C_new)) / (1.0 + kappa)
+
             conc[r0, c0] = <float>(fmax(C_new, 0.0)) * V_i_arr[i]
             conc_s[r0, c0] = <float>(fmax(C_s_new, 0.0)) * V_s_i
 
@@ -223,12 +201,17 @@ def _transport_ad_dep(
     double dx,
     double a,
     double b,
-    double wf, # m/s
+    double wf, 
     int max_substeps,
     long nlat,
     long nlon,
     I64[:] src_rows,              
-    I64[:] src_cols,              
+    I64[:] src_cols,     
+    I64[:] dst_rows,
+    I64[:] dst_cols,
+    int[:] valid_cell,
+    int[:] vol_valid,
+    int[:] has_next         
     ):
     """
     Cython kernel for advection-deposition transport of precipitate species,
@@ -245,14 +228,9 @@ def _transport_ad_dep(
         double d_Sos, Qs_mass, DEP_mass, Qs_mol, DEP_mol, u_star, p, tau_zero
         double friction_f, viscosity, hydraulic_dia, hydraulic_rad, H, Re, D
         I64 n_sub, sub_step
-        I64[:] dst_rows = np.empty(n_cells, dtype=np.int64)
-        I64[:] dst_cols = np.empty(n_cells, dtype=np.int64)
-        int[:] valid_cell = np.ones(n_cells, dtype=np.int32)
         I64 valid_count
         I64 current_id, next_id
         double epsilon = 1e-12
-        int[:] vol_valid
-        int[:] has_next
         I64 max_cells = n_cells
 
     # determine destination cells for each source
@@ -264,9 +242,9 @@ def _transport_ad_dep(
             dst_rows[i] = id_to_row[dst_id]
             dst_cols[i] = id_to_col[dst_id]
             if dst_rows[i] < 0 or dst_cols[i] < 0:
-                valid_cell[i] = False
+                valid_cell[i] = 0
         else:
-            valid_cell[i] = False
+            valid_cell[i] = 0
 
     # filter to valid source‑destination pairs
     valid_count = 0
@@ -311,9 +289,6 @@ def _transport_ad_dep(
     cdef I64[:] current_dst_cols = dst_cols
     cdef I64 current_n = n_cells
 
-    vol_valid = np.empty(max_cells, dtype=np.int32)
-    has_next = np.empty(max_cells, dtype=np.int32)
-
     for sub_step in range(n_sub):
         # merge incoming buffer into resident before each substep except first
         # merge buffers at start of substep (chemicals from previous substep become available)
@@ -330,7 +305,7 @@ def _transport_ad_dep(
             src_c = current_src_cols[i]
             Q_val = Q[src_r, src_c]
             if Q_val <= 0:
-                vol_valid[i] = False
+                vol_valid[i] = 0
                 continue
             
             A_cross = Q_val / v # m2
@@ -365,18 +340,18 @@ def _transport_ad_dep(
 
             src_vol = Q_val * time_step_seconds * 1000.0
             if src_vol <= 0:
-                vol_valid[i] = False
+                vol_valid[i] = 0
             else:
-                vol_valid[i] = True
+                vol_valid[i] = 1
 
         # filter out invalid cells (zero volume, zero flow, etc.)
         valid_count = 0
         for i in range(current_n):
             if vol_valid[i]:
-                current_src_rows[valid_count] = current_src_rows[i]
-                current_src_cols[valid_count] = current_src_cols[i]
-                current_dst_rows[valid_count] = current_dst_rows[i]
-                current_dst_cols[valid_count] = current_dst_cols[i]
+                src_rows[valid_count] = src_rows[i]
+                src_cols[valid_count] = src_cols[i]
+                dst_rows[valid_count] = dst_rows[i]
+                dst_cols[valid_count] = dst_cols[i]
                 valid_count += 1
         if valid_count == 0:
             break
@@ -384,7 +359,7 @@ def _transport_ad_dep(
 
         # cascade to next downstream cells
         for i in range(current_n):
-            has_next[i] = False
+            has_next[i] = 0
         for i in range(current_n):
             dst_r = current_dst_rows[i]
             dst_c = current_dst_cols[i]
@@ -400,7 +375,7 @@ def _transport_ad_dep(
                         current_src_cols[i] = dst_c
                         current_dst_rows[i] = next_r
                         current_dst_cols[i] = next_c
-                        has_next[i] = True
+                        has_next[i] = 1
 
         # compress to only cells that have a valid downstream neighbour
         valid_count = 0
