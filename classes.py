@@ -19,7 +19,7 @@ class AMDModel:
     results are written to output_path as a netCDF file
     """
     def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc", v = 1,
-                 a = 2.71, b = 0.557, c = 0.349, f = 0.341, wf = 0.00142):
+                 a = 2.71, b = 0.557, c = 0.349, f = 0.341, wf = 0.00142, alpha_s = 1e-5, A_s_ratio = 0.5):
         """class initialisation
 
         Parameters
@@ -33,10 +33,21 @@ class AMDModel:
         output_path : str, optional
             path to the output netCDF file, by default "amdflow_output.nc"
         v : float, optional
-            average velocity used for area calculation in transport, by default 0.5 m/s
-        D : float, optional
-            dispersion coefficient used in transport, by default 10 m**2/s
-
+            average velocity used for area calculation in transport, by default 1 m/s
+        a : float, optional
+            geometry relation parameter for equation: width (W) = a * Q**b, by default 2.71
+        b : float, optional
+            geometry relation parameter for equation: width (W) = a * Q**b, by default 0.557
+        c : float, optional
+            geometry relation parameter for equation: depth (H) = c * Q**f, by default 0.349
+        f : float, optional
+            geometry relation parameter for equation: depth (H) = c * Q**f, by default 0.341
+        wf : float, optional
+            settling velocity of iron hydroxides, by default 0.00142 m/s
+        alpha_s : float, optional
+            storage exchange coefficient, by default 1e-5
+        A_s_ratio : float, optional
+            storage zone cross sectional area ratio relative to main channel cross sectional area, by default 0.5
         """
         self.dataset = dataset.copy(deep=True)
         self.dataset["Q"] = self.dataset["Q"].fillna(0.0)
@@ -58,7 +69,8 @@ class AMDModel:
         self.c = c
         self.f = f
         self.wf = wf
-        
+        self.alpha_s = alpha_s
+        self.A_s_ratio = A_s_ratio 
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
         self.do = do
@@ -69,9 +81,17 @@ class AMDModel:
         self._chem_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion",
                     "sulphate", "iron_III_hydroxide", "bedload_storage"]
         
+        self._transport_vars = [v for v in self._chem_vars
+                                if v not in ["iron_III_hydroxide", "bedload_storage"]]
+        
         self._buffer = {
             var: np.zeros((2, *spatial_shape), dtype = np.float32)
             for var in self._chem_vars
+        }
+
+        self._sbuffer = {
+            var: np.zeros((2, *spatial_shape), dtype = np.float32)
+            for var in self._transport_vars
         }
 
         self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400, "hour": 3600, "minute": 60}[self.t_unit]
@@ -79,13 +99,9 @@ class AMDModel:
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
         volume_0 = (self.dataset["Q"].isel(time=0).values / self.v) * self.dx * 1000 # V = (Q / v) * dx = m**3, *1000 = L
         self._buffer["hydrogen_ion"][0] = (1e-7 * volume_0).astype(np.float32)
+        self._sbuffer["hydrogen_ion"][0] = self._buffer["hydrogen_ion"][0].copy()
 
         self._Q_dataset = self.dataset["Q"]
-
-        self._prev_buffer = {
-            var: np.zeros(spatial_shape, dtype = np.float32)
-            for var in self._chem_vars
-        }
 
         self._create_output_file(n_steps, spatial_shape)
         
@@ -138,10 +154,6 @@ class AMDModel:
                 
                 self._write_timestep(ti, nc)
                 
-                # needs to be outside of previous loop to prevent weird behaviour at first timestep
-                for var in self._chem_vars:
-                    self._prev_buffer[var] = self._buffer[var][0].copy()
-
     def _chemistry(self, cell_ids, t, ti):
         """Calculate chemistry for slice of cells at timestep t/ti, passes arrays to CPython file (see: amd_chemistry.pyx) for processing,
         returns arrays of row/col indices and chemistry outputs for input cells to be written back to main dataset
@@ -461,21 +473,24 @@ class AMDModel:
                 "bedload_storage": ("mol total", "Fe(OH)₃ deposited on riverbed")
                 }
 
+
             for var in self._chem_vars:
                 v = nc.createVariable(
-                    var, "f4",
-                    ("time", "lat", "lon"),
-                    chunksizes = (1, spatial_shape[0], spatial_shape[1]),
-                    zlib = True,
-                    complevel = 4,
-                    fill_value = np.nan
-                )
+                        var, "f4",
+                        ("time", "lat", "lon"),
+                        chunksizes = (1, spatial_shape[0], spatial_shape[1]),
+                        zlib = True,
+                        complevel = 4,
+                        fill_value = np.nan
+                    )
 
                 v.units = attrs[var][0]
                 if var == "bedload_storage": 
                     v.description = attrs[var][1]
+                elif var == "iron_III_hydroxide":
+                    v.description = f"{attrs[var][1]} - suspended concentration at timestep in main channel"
                 else:
-                    v.description = f"{attrs[var][1]} - instant concentration at timestep"
+                    v.description = f"{attrs[var][1]} - instant concentration at timestep in both storage zone and main channel (sum)" 
 
             ph_var = nc.createVariable(
                 "pH", "f4",
@@ -507,17 +522,24 @@ class AMDModel:
                 self._buffer[var][0][mask] = 0
                 
                 if var == "bedload_storage":
+                    # output total moles in storage, not concentration, as bedload is not concentration of mixed chem in water
                     nc.variables[var][ti, :, :] = (self._buffer[var][0] + self._buffer[var][1])
-                
-                else:
-                    # get both buffer indices and compute concentration
+                elif var == "iron_III_hydroxide":
+                    # output concentration in main channel, as precip is split into bedload storage and suspended
                     mol_amount = (self._buffer[var][0] + self._buffer[var][1])
                     concentration_molar = mol_amount / step_vol  # moles per litre
                     concentration_mg_per_L = concentration_molar * self.molar_masses[var]  # mg/L
                     concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
                     nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
+                else:
+                    # output concentration of total chem (storage + main channel) of dissolved chems
+                    mol_amount = (self._buffer[var][0] + self._buffer[var][1] + self._sbuffer[var][0] + self._sbuffer[var][1])
+                    concentration_molar = mol_amount / step_vol  # moles per litre
+                    concentration_mg_per_L = concentration_molar * self.molar_masses[var]  # mg/L
+                    concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
+                    nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
 
-            h_mol = self._buffer["hydrogen_ion"][0] + self._buffer["hydrogen_ion"][1]
+            h_mol = self._buffer["hydrogen_ion"][0] + self._buffer["hydrogen_ion"][1] + self._sbuffer["hydrogen_ion"][0] + self._sbuffer["hydrogen_ion"][1]
             h_conc = h_mol / step_vol  # mol/L
             ph = np.where(h_conc > 0, -np.log10(np.maximum(h_conc, 1e-14)), np.nan)
             nc.variables["pH"][ti, :, :] = ph.astype(np.float32)

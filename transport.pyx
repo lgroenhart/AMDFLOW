@@ -15,6 +15,7 @@ cdef extern from "math.h":
     double INFINITY
 def _transport_cn(
     F32[:, ::1] conc,
+    F32[:, ::1] conc_s,
     F32[:, ::1] Q,
     F32[:, ::1] Q_lat,
     F32[:, ::1] C_lat,
@@ -29,7 +30,9 @@ def _transport_cn(
     double f,
     double dt,
     double psi,
-    double theta
+    double theta,
+    double alpha_s,
+    double A_s_ratio
     ):
 
     cdef:
@@ -37,7 +40,7 @@ def _transport_cn(
         I64 r0, c0,
         double Q_i, A_i, V_i, W_i, H_i, D_i
         double hr, Re, F_fric, tau, u_star
-        double r, s, p,
+        double r, s, p, beta, gamma, kappa
         double C_im1, C_i, C_ip1, C_L_i, q_lin_i
         double ai, bi, ci, di, denom
         double bc_top
@@ -56,6 +59,7 @@ def _transport_cn(
     cdef F64[::1] x_arr 
     cdef I64[::1] rows 
     cdef I64[::1] cols 
+    cdef F64[::1] V_i_arr
 
     # loop over reaches
     for reach_ids_py in reaches:
@@ -74,6 +78,7 @@ def _transport_cn(
         x_arr = np.empty(reach_len, np.float64)
         rows = np.empty(reach_len, np.int64)
         cols = np.empty(reach_len, np.int64)
+        V_i_arr = np.empty(reach_len, np.float64)
 
         # cache row/col for reach
         for i in range(reach_len):
@@ -95,6 +100,7 @@ def _transport_cn(
             Q_i = fmax(Q[r0, c0], eps)
             A_i = fmax(Q_i / v, 1e-6)
             V_i = A_i * dx
+            V_i_arr[i] = V_i
         
             # dispersion
             W_i = a * (Q_i ** b)
@@ -148,6 +154,17 @@ def _transport_cn(
                 + (1.0 - theta) * r * C_ip1
                 + p * C_L_i )
 
+            # storage exchange
+            if alpha_s > 0.0:
+                beta = alpha_s / A_s_ratio
+                kappa = beta * dt / 2.0
+                gamma = alpha_s * dt / (1.0 + kappa)
+
+                V_s_i = A_s_ratio * V_i
+                C_s_i = conc_s[rows[i], cols[i]] / fmax(V_s_i, eps)
+
+                bi += gamma / 2.0
+                di += gamma * C_s_i - (gamma / 2.0) * C_i
 
             a_arr[i] = ai
             b_arr[i] = bi
@@ -175,9 +192,21 @@ def _transport_cn(
         for i in range(reach_len):
             r0 = rows[i]
             c0 = cols[i]
+
+            C_old = conc[r0, c0] / fmax(V_i_arr[i], eps)
+            C_new = x_arr[i]
+
+            V_s_i = A_s_ratio * V_i_arr[i]
+            C_s_old = conc_s[r0, c0] / fmax(V_s_i, eps)
+
+            beta = alpha_s / A_s_ratio
+            kappa = beta * dt / 2.0
+            C_s_new = (C_s_old * (1.0 - kappa) + kappa *(C_old + C_new)) / (1.0 + kappa)
+            
             Q_i = fmax(Q[r0, c0], eps)
             V_i = fmax(Q_i / v, 1e-6) * dx
-            conc[r0, c0] = <float>(fmax(x_arr[i], 0.0) * V_i)
+            conc[r0, c0] = <float>(fmax(C_new, 0.0)) * V_i_arr[i]
+            conc_s[r0, c0] = <float>(fmax(C_s_new, 0.0)) * V_s_i
 
 def _transport_ad_dep(
     F32[:, :, ::1] feoh3_buf,
@@ -188,7 +217,7 @@ def _transport_ad_dep(
     I32[:] id_to_row,              # mapping from ID to row index (-1 if invalid)
     I32[:] id_to_col,              # mapping from ID to col index
     I32[:] id_to_outid,           # mapping from ID to outID
-    long time_idx,                   # current time index (unused but kept for interface)
+    long time_idx,                   
     double time_step_seconds,
     double v,
     double dx,
@@ -198,8 +227,8 @@ def _transport_ad_dep(
     int max_substeps,
     long nlat,
     long nlon,
-    I64[:] src_rows,              # in/out: source rows, will be modified in-place
-    I64[:] src_cols,              # in/out: source cols, will be modified in-place
+    I64[:] src_rows,              
+    I64[:] src_cols,              
     ):
     """
     Cython kernel for advection-deposition transport of precipitate species,
@@ -222,13 +251,11 @@ def _transport_ad_dep(
         I64 valid_count
         I64 current_id, next_id
         double epsilon = 1e-12
-
-        # For dynamic arrays inside loops
         int[:] vol_valid
         int[:] has_next
         I64 max_cells = n_cells
 
-    # 1. Determine destination cells for each source
+    # determine destination cells for each source
     for i in range(n_cells):
         src_r = src_rows[i]
         src_c = src_cols[i]
@@ -241,7 +268,7 @@ def _transport_ad_dep(
         else:
             valid_cell[i] = False
 
-    # Filter to valid source‑destination pairs
+    # filter to valid source‑destination pairs
     valid_count = 0
     for i in range(n_cells):
         if valid_cell[i]:
@@ -255,7 +282,7 @@ def _transport_ad_dep(
 
     n_cells = valid_count
 
-    # 2. Compute number of substeps (Courant‑like condition)
+    # compute number of substeps (Courant‑like condition)
 
     cdef double max_C = 0.0
     for i in range(n_cells):
@@ -278,20 +305,18 @@ def _transport_ad_dep(
         n_sub = max_substeps
     dt_sub = time_step_seconds / n_sub
 
-    # 3. Prepare for substep loop
     cdef I64[:] current_src_rows = src_rows
     cdef I64[:] current_src_cols = src_cols
     cdef I64[:] current_dst_rows = dst_rows
     cdef I64[:] current_dst_cols = dst_cols
     cdef I64 current_n = n_cells
 
-    # Pre‑allocate working arrays of maximum possible size
     vol_valid = np.empty(max_cells, dtype=np.int32)
     has_next = np.empty(max_cells, dtype=np.int32)
 
     for sub_step in range(n_sub):
-        # Merge incoming buffer into resident before each substep except first
-        # Merge buffers at start of substep (chemicals from previous substep become available)
+        # merge incoming buffer into resident before each substep except first
+        # merge buffers at start of substep (chemicals from previous substep become available)
         if sub_step > 0:
             for i in range(current_n):
                 src_r = current_src_rows[i]
@@ -299,7 +324,7 @@ def _transport_ad_dep(
                 feoh3_buf[0, src_r, src_c] += feoh3_buf[1, src_r, src_c]
                 feoh3_buf[1, src_r, src_c] = 0.0
 
-        # Compute transport fractions and volume validity for this substep
+        # compute transport fractions and volume validity for this substep
         for i in range(current_n):
             src_r = current_src_rows[i]
             src_c = current_src_cols[i]
@@ -338,16 +363,13 @@ def _transport_ad_dep(
             feoh3_buf[1, current_dst_rows[i], current_dst_cols[i]] += Qs_mol
             bedload_storage[0, src_r, src_c] += DEP_mol
 
-
-
-            # Optional volume check 
             src_vol = Q_val * time_step_seconds * 1000.0
             if src_vol <= 0:
                 vol_valid[i] = False
             else:
                 vol_valid[i] = True
 
-        # Filter out invalid cells (zero volume, zero flow, etc.)
+        # filter out invalid cells (zero volume, zero flow, etc.)
         valid_count = 0
         for i in range(current_n):
             if vol_valid[i]:
@@ -360,7 +382,7 @@ def _transport_ad_dep(
             break
         current_n = valid_count
 
-        # Cascade to next downstream cells
+        # cascade to next downstream cells
         for i in range(current_n):
             has_next[i] = False
         for i in range(current_n):
@@ -373,14 +395,14 @@ def _transport_ad_dep(
                     next_r = id_to_row[next_id]
                     next_c = id_to_col[next_id]
                     if next_r >= 0 and next_c >= 0:
-                        # Overwrite the source arrays in‑place for next iteration
+                        # overwrite the source arrays in‑place for next iteration
                         current_src_rows[i] = dst_r
                         current_src_cols[i] = dst_c
                         current_dst_rows[i] = next_r
                         current_dst_cols[i] = next_c
                         has_next[i] = True
 
-        # Compress to only cells that have a valid downstream neighbour
+        # compress to only cells that have a valid downstream neighbour
         valid_count = 0
         for i in range(current_n):
             if has_next[i]:
@@ -393,7 +415,7 @@ def _transport_ad_dep(
             break
         current_n = valid_count
 
-    # Final merge of any remaining incoming material into resident buffer
+    # final merge of any remaining incoming material into resident buffer
     for i in range(current_n):
         src_r = current_src_rows[i]
         src_c = current_src_cols[i]
