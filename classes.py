@@ -232,14 +232,13 @@ class AMDModel:
             2d array of flow values at timestep t, used for transport calculations
         """
         ti = self._time_index[t]
-        Q_lat = np.zeros_like(Q_2d, dtype= np.float32)
-        C_lat = np.zeros_like(Q_2d, dtype= np.float32)
 
         # call Cython kernel
         for var in self._chem_vars: 
             if var in ["iron_III_hydroxide", "bedload_storage"]:
                 pass
             else:
+                Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
                 for reach_idx, reach in enumerate(self._reaches):
                     if len(reach) >= 2:
                         if self._cn_working_arrays is not None:
@@ -275,8 +274,14 @@ class AMDModel:
                                 self._cn_working_arrays["V"],
                                 self._max_reach_length
                                 )
-                            
-                    self._junction_transfer(var, reach_idx, Q_2d)
+                        else:
+                            hr = int(self._id_to_row[reach[0]])
+                            hc = int(self._id_to_col[reach[0]])
+                            Q_l = float(Q_lat[hr, hc])
+                            if Q_l > 0.0:
+                                m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
+                                self._buffer[var][0, hr, hc] += m_in
+
 
         mask = self._buffer["iron_III_hydroxide"][0] > 0
         src_rows, src_cols = np.where(mask)
@@ -657,34 +662,39 @@ class AMDModel:
         for length, count in sorted(length_counts.items()):
             print(f"  length {length:>3}: {count:>6} reaches")
 
-    def _junction_transfer(self, var, reach_idx, Q_2d):
-        """Transfer dissolved moles from reach tail to the downstream reach head.
-        Uses an explicit first-order upwind step; transfer fraction is
-        min(Courant, 1.0)
-
-        Parameters
-        ----------
-        var : str
-            string name of chemistry variable to transfer
-        reach_idx : int
-            index of the reach for which to transfer mass
-        Q_2d : np.ndarray
-            2D array of flow rates
+    def _build_junction_inflows(self, Q_2d, var):
+        """Compute Q_lat and C_lat at each confluence head from upstream reach tails.
+        Removes moles from tail cells (mass conservation).
+        Returns Q_lat [m³/s] and C_lat [mol/m³] as float32 arrays.
         """
-        junction = self._reach_junctions[reach_idx]
-        if junction is None:
-            return
-
-        tail_r, tail_c, dst_r, dst_c = junction
-        Q_val = float(Q_2d[tail_r, tail_c])
-        if Q_val <= 0.0:
-            return
-
-        V_cell = (Q_val / self.v) * self.dx          # m³
-        courant = Q_val * self.time_step_seconds / V_cell
-        fraction = min(courant, 1.0)
-
+        Q_lat     = np.zeros_like(Q_2d, dtype=np.float64)
+        C_lat_num = np.zeros_like(Q_2d, dtype=np.float64)  # flow-weighted numerator [mol/s]
         buf = self._buffer[var][0]
-        transfer = fraction * float(buf[tail_r, tail_c])
-        buf[tail_r, tail_c] -= transfer
-        buf[dst_r, dst_c]   += transfer
+
+        for junction in self._reach_junctions:
+            if junction is None:
+                continue
+            tail_r, tail_c, dst_r, dst_c = junction
+
+            Q_t = float(Q_2d[tail_r, tail_c])
+            if Q_t <= 0.0:
+                continue
+
+            moles = float(buf[tail_r, tail_c])
+            if moles <= 0.0:
+                continue
+
+            V_t     = max((Q_t / self.v) * self.dx, 1e-10)          # m³
+            courant = Q_t * self.time_step_seconds / V_t
+            moles_out = min(courant, 1.0) * moles
+
+            # effective concentration so CN injects exactly moles_out [mol/m³]
+            C_eff = moles_out / (Q_t * self.time_step_seconds)
+
+            buf[tail_r, tail_c] -= moles_out
+            Q_lat[dst_r, dst_c]     += Q_t
+            C_lat_num[dst_r, dst_c] += Q_t * C_eff
+
+        mask = Q_lat > 0.0
+        C_lat = np.where(mask, C_lat_num / Q_lat, 0.0)
+        return Q_lat.astype(np.float32), C_lat.astype(np.float32)
