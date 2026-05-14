@@ -478,14 +478,14 @@ def validation_metrics(ts):
 if __name__ == "__main__":
     case_study_nr = "CSIII"
     times = ("1960", "2015")
+    hydrobasins_region_code = "eu"
     caravan_path = "../data/validation data/Caravan-Qual_lite.zarr"
     amd_path = f"../data/validation data/AMDFLOW_{case_study_nr}_{times[0]}-{times[1]}_W.nc"
     output_path = f"../data/validation data/{case_study_nr}/"
-    acc_path = "../data/validation data/hyd_eu_acc_30s.tif"
-    rivers_path = "../data/validation data/HydroRIVERS_v10_eu_shp/HydroRIVERS_v10_eu.shp"
+    acc_path = f"../data/validation data/hyd_{hydrobasins_region_code}_acc_30s.tif"
+    rivers_path = f"../data/validation data/HydroRIVERS_v10_{hydrobasins_region_code}_shp/HydroRIVERS_v10_{hydrobasins_region_code}.shp"
     
-    # choose UTM zone appropriate for your domain 
-    utm_crs = "EPSG:6312"   
+    utm_crs = "EPSG:6312" #"EPSG:6312" (Cyprus),  "EPSG:24378" (India) "EPSG: 3761" #(Canada)
     resample_freq = "W"
     var_map = {
         "pH": "pH",
