@@ -16,17 +16,19 @@ ctypedef np.float64_t DTYPE_t
 @cython.cdivision(True)
 @cython.nonecheck(False)
 def process_chemistry(
-    float[:, ::1] fe2,
-    float[:, ::1] fe3,
-    float[:, ::1] so4,
-    float[:, ::1] h,
-    float[:, ::1] fe_oh3,
-    float[:, ::1] bedload_storage,
-    double[:, ::1] ore,
+    double[:, ::1] fe2,
+    double[:, ::1] fe3,
+    double[:, ::1] so4,
+    double[:, ::1] h,
+    double[:, ::1] fe_oh3,
+    double[:, ::1] bedload_storage,
+    float[:, ::1] ore,
     float[:, ::1] volume,
     float[:, ::1] median_vol,
-    double do_val,            # dissolved oxygen (scalar)
-    double time_step_seconds,  # scalar
+    double do_val,
+    double ssa,
+    double buffer_capacity,            
+    double time_step_seconds,  
     Py_ssize_t[::1] valid_rows,
     Py_ssize_t[::1] valid_cols,
     Py_ssize_t num_valid
@@ -45,9 +47,10 @@ def process_chemistry(
     cdef double p02 = 0.21
     cdef double Kw = 1.0e-14
     cdef double do_sqrt = do_val ** 0.5
+    cdef double h_val_conc_cap = 1e4
 
     # per-iteration temporaries
-    cdef double fe2_val, fe3_val, so4_val, h_val, fe_oh3_val, bedload_val, ore_val, vol_val, median_vol_val
+    cdef double fe2_val, fe3_val, so4_val, h_val, fe_oh3_val, bedload_storage_val, ore_val, vol_val, median_vol_val
     cdef double vol_safe, h2o
     cdef double fe3_conc, h_conc, fe3_safe, h_safe
     cdef double rate, ferric_consumed, max_ferric
@@ -56,6 +59,7 @@ def process_chemistry(
     cdef double fe2_safe, oh_conc, ox_rate, fe2_oxidised
     cdef double ph, so4_conc, I, gamma_h, gamma_fe3, act_fe3, act_h, eq_act, dissolve
     cdef double precip, dissolved_needed, dissolved_sus, dissolve_bed, remaining
+    cdef double h_val_cap, pyrite_consumed1, ore_loss1, ore_loss2
 
     for k in prange(num_valid, nogil = True, schedule = "static"):
         r = valid_rows[k]
@@ -65,7 +69,7 @@ def process_chemistry(
         so4_val = <double>so4[r, c]
         h_val = <double>h[r, c]
         fe_oh3_val = <double>fe_oh3[r, c]
-        bedload_val = <double>bedload_storage[r, c]
+        bedload_storage_val = <double>bedload_storage[r, c]
         ore_val = <double>ore[r, c]
         vol_val = <double>volume[r, c]
         median_vol_val = <double>median_vol[r, c]
@@ -99,11 +103,15 @@ def process_chemistry(
             fe3_val -= ferric_consumed
             h_val += ferric_consumed * 1.14
             so4_val += ferric_consumed * (2.0 / 14.0)
+            pyrite_consumed1 = ferric_consumed / 14.0
+            ore_loss1 = pyrite_consumed1 * 119.98 * ssa
+            ore_val = fmax(ore_val - ore_loss1, 0.0)
 
         fe2_val = fmax(fe2_val, 0.0)
         fe3_val = fmax(fe3_val, 0.0)
         so4_val = fmax(so4_val, 0.0)
         h_val = fmax(h_val, 0.0)
+        h_val = fmin(h_val, h_val_conc_cap * vol_val)
         fe_oh3_val = fmax(fe_oh3_val, 0.0)
 
         # step 2: pyrite oxidation by dissolved O2
@@ -115,11 +123,14 @@ def process_chemistry(
             fe2_val += ferrous_amount
             so4_val += 2.0 * ferrous_amount
             h_val += 2.0 * ferrous_amount
+            ore_loss2 = ferrous_amount * 119.98 * ssa
+            ore_val = fmax(ore_val - ore_loss2, 0.0)
 
         fe2_val = fmax(fe2_val, 0.0)
         fe3_val = fmax(fe3_val, 0.0)
         so4_val = fmax(so4_val, 0.0)
         h_val = fmax(h_val, 0.0)
+        h_val = fmin(h_val, h_val_conc_cap * vol_val)
         fe_oh3_val = fmax(fe_oh3_val, 0.0)
 
         # step 3: Fe2+ -> Fe3+ oxidation (Singer & Stumm, & PHREEQC)
@@ -133,8 +144,20 @@ def process_chemistry(
         ox_rate = (k2_ox * p02 + k1_ox * (oh_conc * oh_conc) * p02) * fe2_safe
         
         fe2_oxidised = fmin(ox_rate * vol_safe * time_step_seconds, fe2_val)
+
         if not isfinite(fe2_oxidised):
             fe2_oxidised = 0.0
+        if buffer_capacity > 0.0 and fe2_oxidised > 0.0:
+            h_conc_pre = h_val / vol_safe
+            ph_before = -log10(fmax(h_conc_pre, 1e-14))
+            h_consumed = fe2_oxidised
+
+            max_h_consumed = buffer_capacity * vol_safe * 1.0
+
+            if h_consumed > max_h_consumed:
+                scale = max_h_consumed / fe2_oxidised
+                fe2_oxidised = fe2_oxidised * scale
+
         fe3_val = fe3_val + fe2_oxidised
         h_val = h_val - fe2_oxidised
         fe2_val = fe2_val - fe2_oxidised
@@ -143,6 +166,7 @@ def process_chemistry(
         fe3_val = fmax(fe3_val, 0.0)
         so4_val = fmax(so4_val, 0.0)
         h_val = fmax(h_val, 0.0)
+        h_val = fmin(h_val, h_val_conc_cap * vol_val)
         fe_oh3_val = fmax(fe_oh3_val, 0.0)
 
         # step 4: Fe3+ <-> Fe(OH)3 hydrolysis and precipitation
@@ -154,6 +178,7 @@ def process_chemistry(
 
         # Fe(OH)3 <-> Fe3+ equilibrium based on activities
         I = 0.5 * ((h_safe_4 * 1**2) + (fe3_conc * 3**2) + (fe2_conc * 2**2) + (so4_conc * 2**2))
+        I = fmin(I, 1.0) # cap ionic strength
         gamma_h = 10**(-0.5 * 1**2 * (sqrt(I) / (1 + sqrt(I)) -0.3 * I))
         gamma_fe3 = 10**(-0.5 * 3**2 * (sqrt(I) / (1 + sqrt(I)) -0.3 * I))
         act_h = gamma_h * h_safe_4
@@ -190,14 +215,16 @@ def process_chemistry(
         fe2_val = fmax(fe2_val, 0.0)
         fe3_val = fmax(fe3_val, 0.0)
         h_val = fmax(h_val, 0.0)
+        h_val = fmin(h_val, h_val_conc_cap * vol_val)
         so4_val = fmax(so4_val, 0.0)
         fe_oh3_val = fmax(fe_oh3_val, 0.0)
         bedload_storage_val = fmax(bedload_storage_val, 0.0)
 
         # write back to arrays
-        fe2[r, c] = <float>fe2_val
-        fe3[r, c] = <float>fe3_val
-        h[r, c] = <float>h_val
-        so4[r, c] = <float>so4_val
-        fe_oh3[r, c] = <float>fe_oh3_val
-        bedload_storage[r, c] = <float>bedload_storage_val
+        fe2[r, c] = fe2_val
+        fe3[r, c] = fe3_val
+        h[r, c] = h_val
+        so4[r, c] = so4_val
+        fe_oh3[r, c] = fe_oh3_val
+        bedload_storage[r, c] = bedload_storage_val
+        ore[r, c] = <float>ore_val
