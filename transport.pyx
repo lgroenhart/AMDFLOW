@@ -14,16 +14,17 @@ ctypedef np.int64_t   I64
 cdef extern from "math.h":
     double INFINITY
 def _transport_cn(
-    F32[:, ::1] conc,
-    F32[:, ::1] conc_s,
+    double[:, ::1] conc,
+    double[:, ::1] conc_s,
     F32[:, ::1] Q,
     F32[:, ::1] Q_lat,
-    F32[:, ::1] C_lat,
+    double[:, ::1] C_lat,
+    F32[:, ::1] median_vol,
     list reaches,
     I32[:] id_to_row,
     I32[:] id_to_col,
     double dx,
-    double v,
+    F32[:, ::1] S,
     double a, 
     double b,
     double c,
@@ -33,6 +34,8 @@ def _transport_cn(
     double theta,
     double alpha_s,
     double A_s_ratio,
+    double mannings,
+    int max_substeps,
     F64[::1] a_arr,        
     F64[::1] b_arr,
     F64[::1] c_arr,
@@ -48,16 +51,18 @@ def _transport_cn(
     cdef:
         I64 reach_len, i
         I64 r0, c0
-        double Q_i, A_i, V_i, W_i, H_i, D_i
-        double hr, Re, f_fric, tau, u_star
-        double r, s, p, beta, gamma, kappa
+        double Q_i, A_i, V_i, W_i, H_i, D_i, S_i
+        double RH, Re, f_fric, tau, u_star
+        double r, s, p, beta, gamma, kappa, v_i
         double C_im1, C_i, C_ip1, C_L_i, q_lin_i
         double ai, bi, ci, di, denom
         double bc_top
         double eps = 1e-30
         double rho = 997.1
         double mu = 0.894e-3
-
+        double dt_sub , max_C, n_sub_souble, C_cour
+        I64 n_sub
+        
     for reach_ids_py in reaches:
         reach_ids = np.asarray(reach_ids_py, dtype=np.int64)
         reach_len = len(reach_ids)
@@ -65,130 +70,161 @@ def _transport_cn(
             continue
 
         if reach_len > max_reach_length:
-            raise ValueError("Reach length exceeds pre‑allocated workspace size")
+            raise ValueError("Reach length exceeds pre-allocated workspace size")
 
         # cache row/col for reach
         for i in range(reach_len):
             rows[i] = id_to_row[reach_ids[i]]
             cols[i] = id_to_col[reach_ids[i]]
+        
+        # dynamic substeps based on courant number
+        max_C = 0.0
+        for i in range(reach_len):
+            r0 = rows[i]
+            c0 = cols[i]
+            Q_i = fmax(Q[r0, c0], eps)
+            S_i = fmax(S[r0, c0], 0.0)
+            W_i = a * (Q_i ** b)
+            H_i = c * (Q_i ** f)
+            hr = (H_i * W_i) / (2.0 * H_i + W_i + eps)
+            v_i = mannings**-1 * hr**(2.0/3.0) * sqrt(S_i)
+            C_cour = v_i * dt / dx
+            if C_cour > max_C:
+                max_C = C_cour
+        
+        n_sub = <I64>ceil(max_C)
+        if n_sub < 1:
+            n_sub = 1
+        elif n_sub > max_substeps:
+            n_sub = max_substeps
+        dt_sub = dt / n_sub
 
         # concentration from upstream boundary cell
         r0 = rows[0]
         c0 = cols[0]
         Q_i = fmax(Q[r0, c0], eps)
-        V_i = fmax(Q_i / v, 1e-6) * dx
+        S_i = fmax(S[r0, c0], 0.0)
+        W_i = a * (Q_i ** b)
+        H_i = c * (Q_i ** f)
+        RH = (H_i * W_i) / (2 * H_i + W_i + eps)
+        v_i = mannings**-1 * RH**(2.0/3.0) * sqrt(S_i)
+        V_i = fmax(fmax(Q_i / v_i, 1e-6), median_vol[r0, c0] / 1000) * dx
         bc_top = conc[r0, c0] / V_i
 
-        # build tridiagonal coefficients 
-        for i in range(reach_len):
-            r0 = rows[i]
-            c0 = cols[i]
-            Q_i = fmax(Q[r0, c0], eps)
-            A_i = fmax(Q_i / v, 1e-6)
-            V_i = A_i * dx
-            V_i_arr[i] = V_i
+        # substep loops
+        for sub in range(n_sub):
 
-            # dispersion 
-            W_i = a * (Q_i ** b)
-            H_i = c * (Q_i ** f)
-            hr = (H_i * W_i) / (2.0 * H_i + W_i + eps)
-            Re = (rho * v * 4.0 * hr) / mu
-            f_fric = 64.0 / (Re + eps)
-            tau = (f_fric / 8.0) * rho * v * v
-            u_star = sqrt(fmax(tau / rho, eps))
-            D_i = 5.4 * ((W_i / (H_i + eps)) ** 0.7) * \
-                ((v / (u_star + eps)) ** 0.13) * H_i * v
+            # build tridiagonal coefficients 
+            for i in range(reach_len):
+                r0 = rows[i]
+                c0 = cols[i]
+                Q_i = fmax(Q[r0, c0], eps)
+                S_i = fmax(S[r0, c0], 0.0)
+                W_i = a * (Q_i ** b)
+                H_i = c * (Q_i ** f)
+                RH = (H_i * W_i) / (2.0 * H_i + W_i + eps)
+                v_i = mannings**-1 * RH**(2.0/3.0) * sqrt(S_i)
+                A_i = fmax(Q_i / v_i, 1e-6)
+                V_i = A_i * dx
+                V_i_arr[i] = V_i
+                # dispersion 
+                Re = (rho * v_i * 4.0 * RH) / mu
+                f_fric = 64.0 / (Re + eps)
+                tau = (f_fric / 8.0) * rho * v_i * v_i
+                u_star = sqrt(fmax(tau / rho, eps))
+                D_i = 5.4 * ((W_i / (H_i + eps)) ** 0.7) * \
+                    ((v_i / (u_star + eps)) ** 0.13) * H_i * v_i
 
-            r = D_i * dt / (dx * dx)
-            s_adv = v * dt / dx          
-            q_lin_i = fmax(Q_lat[r0, c0], 0.0)
-            p = q_lin_i * dt / (A_i * dx + eps)
+                r = D_i * dt_sub / (dx * dx)
+                s_adv = v_i * dt_sub / dx          
+                q_lin_i = fmax(Q_lat[r0, c0], 0.0)
+                p = q_lin_i * dt_sub / (A_i * dx + eps)
 
-            C_i = conc[r0, c0] / V_i
-            C_L_i = C_lat[r0, c0]
+                C_i = conc[r0, c0] / V_i
+                C_L_i = C_lat[r0, c0]
 
-            # upstream concentration
-            if i == 0:
-                C_im1 = bc_top
-            else:
-                C_im1 = conc[rows[i - 1], cols[i - 1]] / \
-                    fmax(fmax(Q[rows[i - 1], cols[i - 1]], eps) / v * dx, eps)
+                # upstream concentration
+                if i == 0:
+                    C_im1 = bc_top
+                else:
+                    C_im1 = conc[rows[i - 1], cols[i - 1]] / \
+                        fmax(fmax(Q[rows[i - 1], cols[i - 1]], eps) / v_i * dx, eps)
 
-            # downstream concentration
-            if i < reach_len - 1:
-                C_ip1 = conc[rows[i + 1], cols[i + 1]] / \
-                    fmax(fmax(Q[rows[i + 1], cols[i + 1]], eps) / v * dx, eps)
-            else:
-                C_ip1 = C_i
+                # downstream concentration
+                if i < reach_len - 1:
+                    C_ip1 = conc[rows[i + 1], cols[i + 1]] / \
+                        fmax(fmax(Q[rows[i + 1], cols[i + 1]], eps) / v_i * dx, eps)
+                else:
+                    C_ip1 = C_i
 
-            # coefficients
-            ai = -(theta * r - psi * s_adv)
-            bi = 1.0 + theta * (2.0 * r + p) + psi * s_adv
-            ci = -theta * r
+                # coefficients
+                ai = -(theta * r - psi * s_adv)
+                bi = 1.0 + theta * (2.0 * r + p) + psi * s_adv
+                ci = -theta * r
 
-            if i == reach_len - 1:
-                bi -= ci
-                ci = 0.0
+                if i == reach_len - 1:
+                    bi -= ci
+                    ci = 0.0
 
-            di = ( ((1.0 - theta) * r + (1.0 - psi) * s_adv) * C_im1
-                + (1.0 - (1.0 - theta) * (2.0 * r + p)
-                - (1.0 - psi) * s_adv) * C_i
-                + (1.0 - theta) * r * C_ip1
-                + p * C_L_i )
+                di = ( ((1.0 - theta) * r + (1.0 - psi) * s_adv) * C_im1
+                    + (1.0 - (1.0 - theta) * (2.0 * r + p)
+                    - (1.0 - psi) * s_adv) * C_i
+                    + (1.0 - theta) * r * C_ip1
+                    + p * C_L_i )
 
-            if alpha_s > 0.0:
+                if alpha_s > 0.0:
+                    beta = alpha_s / A_s_ratio
+                    kappa = beta * dt_sub / 2.0
+                    gamma = alpha_s * dt_sub / (1.0 + kappa)
+
+                    V_s_i = A_s_ratio * V_i
+                    C_s_i = conc_s[rows[i], cols[i]] / fmax(V_s_i, eps)
+
+                    bi += gamma / 2.0
+                    di += gamma * C_s_i - (gamma / 2.0) * C_i
+
+
+                a_arr[i] = ai
+                b_arr[i] = bi
+                c_arr[i] = ci
+                d_arr[i] = di
+
+            # Thomas algorithm 
+            c_prime[0] = c_arr[0] / b_arr[0]
+            d_prime[0] = d_arr[0] / b_arr[0]
+
+            for i in range(1, reach_len):
+                denom = b_arr[i] - a_arr[i] * c_prime[i - 1]
+                if abs(denom) < eps:
+                    denom = eps
+                c_prime[i] = c_arr[i] / denom
+                d_prime[i] = (d_arr[i] - a_arr[i] * d_prime[i - 1]) / denom
+
+            x_arr[reach_len - 1] = d_prime[reach_len - 1]
+            for i in range(reach_len - 2, -1, -1):
+                x_arr[i] = d_prime[i] - c_prime[i] * x_arr[i + 1]
+
+            # write back to buffers 
+            for i in range(reach_len):
+                r0 = rows[i]
+                c0 = cols[i]
+
+                C_old = conc[r0, c0] / fmax(V_i_arr[i], eps)
+                C_new = x_arr[i]
+
+                V_s_i = A_s_ratio * V_i_arr[i]
+                C_s_old = conc_s[r0, c0] / fmax(V_s_i, eps)
+
                 beta = alpha_s / A_s_ratio
-                kappa = beta * dt / 2.0
-                gamma = alpha_s * dt / (1.0 + kappa)
+                kappa = beta * dt_sub / 2.0
+                C_s_new = (C_s_old * (1.0 - kappa) + kappa * (C_old + C_new)) / (1.0 + kappa)
 
-                V_s_i = A_s_ratio * V_i
-                C_s_i = conc_s[rows[i], cols[i]] / fmax(V_s_i, eps)
-
-                bi += gamma / 2.0
-                di += gamma * C_s_i - (gamma / 2.0) * C_i
-
-
-            a_arr[i] = ai
-            b_arr[i] = bi
-            c_arr[i] = ci
-            d_arr[i] = di
-
-        # Thomas algorithm 
-        c_prime[0] = c_arr[0] / b_arr[0]
-        d_prime[0] = d_arr[0] / b_arr[0]
-
-        for i in range(1, reach_len):
-            denom = b_arr[i] - a_arr[i] * c_prime[i - 1]
-            if abs(denom) < eps:
-                denom = eps
-            c_prime[i] = c_arr[i] / denom
-            d_prime[i] = (d_arr[i] - a_arr[i] * d_prime[i - 1]) / denom
-
-        x_arr[reach_len - 1] = d_prime[reach_len - 1]
-        for i in range(reach_len - 2, -1, -1):
-            x_arr[i] = d_prime[i] - c_prime[i] * x_arr[i + 1]
-
-        # write back to buffers 
-        for i in range(reach_len):
-            r0 = rows[i]
-            c0 = cols[i]
-
-            C_old = conc[r0, c0] / fmax(V_i_arr[i], eps)
-            C_new = x_arr[i]
-
-            V_s_i = A_s_ratio * V_i_arr[i]
-            C_s_old = conc_s[r0, c0] / fmax(V_s_i, eps)
-
-            beta = alpha_s / A_s_ratio
-            kappa = beta * dt / 2.0
-            C_s_new = (C_s_old * (1.0 - kappa) + kappa * (C_old + C_new)) / (1.0 + kappa)
-
-            conc[r0, c0] = <float>(fmax(C_new, 0.0)) * V_i_arr[i]
-            conc_s[r0, c0] = <float>(fmax(C_s_new, 0.0)) * V_s_i
+                conc[r0, c0] = (fmax(C_new, 0.0)) * V_i_arr[i]
+                conc_s[r0, c0] = (fmax(C_s_new, 0.0)) * V_s_i
 
 def _transport_ad_dep(
-    F32[:, :, ::1] feoh3_buf,
-    F32[:, :, ::1] bedload_storage, # precipitated feoh3 on riverbed
+    double[:, :, ::1] feoh3_buf,
+    double[:, :, ::1] bedload_storage, # precipitated feoh3 on riverbed
     F32[:, ::1] Q,               # flow at current time step [nlat, nlon]
     I64[:, ::1] ID_grid,           # [nlat, nlon]
     I64[:, ::1] outID_grid,        # [nlat, nlon]
@@ -197,11 +233,14 @@ def _transport_ad_dep(
     I32[:] id_to_outid,           # mapping from ID to outID
     long time_idx,                   
     double time_step_seconds,
-    double v,
+    F32[:, ::1] S,
     double dx,
     double a,
     double b,
+    double c,
+    double f,
     double wf, 
+    double mannings,
     int max_substeps,
     long nlat,
     long nlon,
@@ -267,6 +306,11 @@ def _transport_ad_dep(
         src_r = src_rows[i]
         src_c = src_cols[i]
         Q_val = Q[src_r, src_c]
+        S_val = S[src_r, src_c]
+        W = a * Q_val**b
+        H = c * Q_val**f
+        RH = (H * W) / (2 * H + W)
+        v = mannings ** -1 * RH ** (2.0/3.0) * sqrt(S_val)
         if Q_val > 0:
             A_cross = Q_val / v
             if A_cross < 1e-6:
@@ -304,6 +348,11 @@ def _transport_ad_dep(
             src_r = current_src_rows[i]
             src_c = current_src_cols[i]
             Q_val = Q[src_r, src_c]
+            S_val = S[src_r, src_c]
+            W = a * Q_val ** b
+            H = c * Q_val ** f
+            RH = (H * W) / (2 * H + W)
+            v = mannings**-1 * RH**(2.0/3.0) * sqrt(S_val)
             if Q_val <= 0:
                 vol_valid[i] = 0
                 continue
@@ -313,7 +362,6 @@ def _transport_ad_dep(
                 A_cross = 1e-6
 
             V_cell = A_cross * dx # m3
-            W = a * Q_val**b
 
             # advection-deposition calcs
             mol_mass_feoh3 = 106.87 
