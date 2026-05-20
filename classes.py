@@ -220,51 +220,54 @@ class AMDModel:
                 pass
             else:
                 Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
-                for reach_idx, reach in enumerate(self._reaches):
-                    if len(reach) >= 2:
-                        if self._cn_working_arrays is not None:
-                            _transport_cn(
-                                self._buffer[var][0],
-                                self._sbuffer[var][0],
-                                Q_2d,
-                                Q_lat,
-                                C_lat,
-                                self._median_vol,
-                                [reach],
-                                self._id_to_row,      
-                                self._id_to_col,  
-                                self.dx,    
-                                self._S_np,
-                                self.a,
-                                self.b,
-                                self.c,
-                                self.f,
-                                self.time_step_seconds,
-                                0.5,
-                                0.5,
-                                self.alpha_s,
-                                self.A_s_ratio,
-                                self.mannings,
-                                1000,
-                                self._cn_working_arrays["a"],
-                                self._cn_working_arrays["b"],
-                                self._cn_working_arrays["c"],
-                                self._cn_working_arrays["d"],
-                                self._cn_working_arrays["c_prime"],
-                                self._cn_working_arrays["d_prime"],
-                                self._cn_working_arrays["x"],
-                                self._cn_working_arrays["rows"],
-                                self._cn_working_arrays["cols"],
-                                self._cn_working_arrays["V"],
-                                self._max_reach_length
-                                )
-                        else:
-                            hr = int(self._id_to_row[reach[0]])
-                            hc = int(self._id_to_col[reach[0]])
-                            Q_l = float(Q_lat[hr, hc])
-                            if Q_l > 0.0:
-                                m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
-                                self._buffer[var][0, hr, hc] += m_in
+                
+                if self._cn_working_arrays is not None:
+                    _transport_cn(
+                        self._buffer[var][0],
+                        self._sbuffer[var][0],
+                        Q_2d,
+                        Q_lat,
+                        C_lat,
+                        self._median_vol,
+                        self._reaches,
+                        self._id_to_row,      
+                        self._id_to_col,  
+                        self.dx,    
+                        self._S_np,
+                        self.a,
+                        self.b,
+                        self.c,
+                        self.f,
+                        self.time_step_seconds,
+                        0.5,
+                        0.5,
+                        self.alpha_s,
+                        self.A_s_ratio,
+                        self.mannings,
+                        1000,
+                        self._cn_working_arrays["a"],
+                        self._cn_working_arrays["b"],
+                        self._cn_working_arrays["c"],
+                        self._cn_working_arrays["d"],
+                        self._cn_working_arrays["c_prime"],
+                        self._cn_working_arrays["d_prime"],
+                        self._cn_working_arrays["x"],
+                        self._cn_working_arrays["rows"],
+                        self._cn_working_arrays["cols"],
+                        self._cn_working_arrays["V"],
+                        self._cn_working_arrays["v"],
+                        self._cn_working_arrays["A"],
+                        self._cn_working_arrays["D"],
+                        self._max_reach_length
+                        )
+                else:
+                    for reach in self._reaches: 
+                        hr = int(self._id_to_row[reach[0]])
+                        hc = int(self._id_to_col[reach[0]])
+                        Q_l = float(Q_lat[hr, hc])
+                        if Q_l > 0.0:
+                            m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
+                            self._buffer[var][0, hr, hc] += m_in
 
 
         mask = self._buffer["iron_III_hydroxide"][0] > 0
@@ -399,7 +402,10 @@ class AMDModel:
                 "x": np.empty((self._max_reach_length,), dtype=np.float64),
                 "rows": np.empty((self._max_reach_length,), dtype=np.int64),
                 "cols": np.empty((self._max_reach_length,), dtype=np.int64),
-                "V": np.empty((self._max_reach_length,), dtype=np.float64)
+                "V": np.empty((self._max_reach_length,), dtype=np.float64),
+                "v": np.empty((self._max_reach_length,), dtype=np.float32),
+                "A": np.empty((self._max_reach_length,), dtype=np.float32),
+                "D": np.empty((self._max_reach_length,), dtype=np.float32)
             }
         else:
             self._cn_working_arrays = None

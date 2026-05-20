@@ -46,13 +46,16 @@ def _transport_cn(
     I64[::1] rows,
     I64[::1] cols,
     F64[::1] V_i_arr,
+    F32[::1] v_arr,
+    F32[::1] A_arr,
+    F32[::1] D_arr,
     long max_reach_length   
     ):
     cdef:
         I64 reach_len, i
         I64 r0, c0
-        double Q_i, A_i, V_i, W_i, H_i, D_i, S_i
-        double RH, Re, f_fric, tau, u_star
+        double Q_i, A_i, V_i, W_i, H_i, D_i, S_i,
+        double RH, Re, f_fric, tau, u_star, V_head
         double r, s, p, beta, gamma, kappa, v_i
         double C_im1, C_i, C_ip1, C_L_i, q_lin_i
         double ai, bi, ci, di, denom
@@ -78,6 +81,7 @@ def _transport_cn(
             cols[i] = id_to_col[reach_ids[i]]
         
         # dynamic substeps based on courant number
+        # pre-compute most parameters
         max_C = 0.0
         for i in range(reach_len):
             r0 = rows[i]
@@ -86,12 +90,24 @@ def _transport_cn(
             S_i = fmax(S[r0, c0], 0.0)
             W_i = a * (Q_i ** b)
             H_i = c * (Q_i ** f)
-            hr = (H_i * W_i) / (2.0 * H_i + W_i + eps)
-            v_i = mannings**-1 * hr**(2.0/3.0) * sqrt(S_i)
+            RH = (H_i * W_i) / (2.0 * H_i + W_i + eps)
+            v_i = mannings**-1 * RH**(2.0/3.0) * sqrt(S_i)
+            v_arr[i] = v_i
+            A_i = fmax(Q_i / v_i, 1e-6)
+            A_arr[i] = A_i
+            V_i = A_i * dx
+            V_i_arr[i] = V_i
             C_cour = v_i * dt / dx
             if C_cour > max_C:
                 max_C = C_cour
-        
+            Re = (rho * v_i * 4.0 * RH) / mu
+            f_fric = 64.0 / (Re + eps)
+            tau = (f_fric / 8.0) * rho * v_i * v_i
+            u_star = sqrt(fmax(tau / rho, eps))
+            D_i = 5.4 * ((W_i / (H_i + eps)) ** 0.7) * \
+                ((v_i / (u_star + eps)) ** 0.13) * H_i * v_i
+            D_arr[i] = D_i
+
         n_sub = <I64>ceil(max_C)
         if n_sub < 1:
             n_sub = 1
@@ -102,14 +118,8 @@ def _transport_cn(
         # concentration from upstream boundary cell
         r0 = rows[0]
         c0 = cols[0]
-        Q_i = fmax(Q[r0, c0], eps)
-        S_i = fmax(S[r0, c0], 0.0)
-        W_i = a * (Q_i ** b)
-        H_i = c * (Q_i ** f)
-        RH = (H_i * W_i) / (2 * H_i + W_i + eps)
-        v_i = mannings**-1 * RH**(2.0/3.0) * sqrt(S_i)
-        V_i = fmax(fmax(Q_i / v_i, 1e-6), median_vol[r0, c0] / 1000) * dx
-        bc_top = conc[r0, c0] / V_i
+        V_head = V_i_arr[0]
+        bc_top = conc[r0, c0] / V_head
 
         # substep loops
         for sub in range(n_sub):
@@ -118,23 +128,13 @@ def _transport_cn(
             for i in range(reach_len):
                 r0 = rows[i]
                 c0 = cols[i]
-                Q_i = fmax(Q[r0, c0], eps)
-                S_i = fmax(S[r0, c0], 0.0)
-                W_i = a * (Q_i ** b)
-                H_i = c * (Q_i ** f)
-                RH = (H_i * W_i) / (2.0 * H_i + W_i + eps)
-                v_i = mannings**-1 * RH**(2.0/3.0) * sqrt(S_i)
-                A_i = fmax(Q_i / v_i, 1e-6)
-                V_i = A_i * dx
-                V_i_arr[i] = V_i
-                # dispersion 
-                Re = (rho * v_i * 4.0 * RH) / mu
-                f_fric = 64.0 / (Re + eps)
-                tau = (f_fric / 8.0) * rho * v_i * v_i
-                u_star = sqrt(fmax(tau / rho, eps))
-                D_i = 5.4 * ((W_i / (H_i + eps)) ** 0.7) * \
-                    ((v_i / (u_star + eps)) ** 0.13) * H_i * v_i
+                
+                A_i = A_arr[i]
+                V_i = V_i_arr[i]
+                v_i = v_arr[i]
+                D_i = D_arr[i]
 
+                
                 r = D_i * dt_sub / (dx * dx)
                 s_adv = v_i * dt_sub / dx          
                 q_lin_i = fmax(Q_lat[r0, c0], 0.0)
