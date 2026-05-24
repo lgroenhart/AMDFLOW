@@ -15,6 +15,7 @@ from IPython.display import HTML
 import rasterio as rio
 import rasterio.features
 import rioxarray
+import pyflwdir
 
 def mindat_collector(region, material_id = 3314, mineral_strings = "(Fe|S)", material_name = "pyrite", path_str = "../data/", mindat_api_str = "mindat_API_key.txt"):
     """Mindat data collector, queries mindat API in specific region for a specific mineral and checks if those minerals are located at a mine/quarry, saves locations at lat/lon csv file
@@ -110,14 +111,15 @@ def vector_rasterisation(output_path="../data/mines_raster.tif",
     res_y = float(lats[1] - lats[0])
 
     transform = rasterio.transform.from_bounds(
-        lons.min(), lats.min(), lons.max(), lats.max(),
+        lons.min() - res_x/2, lats.min() - res_y/2,
+        lons.max() + res_x/2, lats.max() + res_y/2,
         len(lons), len(lats)
     )
 
     gdf = gpd.read_file(vector_path)
     if gdf.crs is None:
         raise ValueError("Shapefile has no CRS defined")
-
+    gdf = gdf.to_crs("EPSG:4326")
     shapes = [(geom, 1) for geom in gdf.geometry if geom is not None]
 
     raster_arr = rasterio.features.rasterize(
@@ -335,6 +337,7 @@ def filter_mines_with_buffer(raster, points, crs, buffer_dist = 5000.0):
 
     # clip
     raster_filtered = raster.rio.clip(buffered_points, drop = True)
+    raster_filtered = raster.where(raster_filtered["band_data"] == 1)
     raster_filtered = raster_filtered.rename_vars({"band_data": "mines"})
 
     # return to wg84 crs
@@ -385,7 +388,7 @@ def cleanup_and_metadata(ds):
     return ds
 
 def add_time(ds, length, frequency):
-    """Function to add more discrete timestep to dataset with flo1k annual streamflow (Q) data, Q gets divided by by length to represent mean annual streamflow divided by discrete timestep,
+    """Function to add more discrete timestep to dataset with flo1k annual streamflow (Q) data,
         returns new dataset
 
     Parameters
@@ -418,7 +421,7 @@ def add_time(ds, length, frequency):
         },
         attrs={
             "units": "m3/s",
-            "description": f"Annual streamflow divided into {length} timesteps per year",
+            "description": f"annual average streamflow"
         }
     )
 
@@ -463,7 +466,7 @@ def estimate_ore(ds, F, ox_range = 27):
     """
 
     constant = ox_range * 1000 * F
-    ds["ore"] = xr.where(ds["mines"].notnull(), constant, np.nan)
+    ds["ore"] = xr.where(ds["mines"] == 1, constant, np.nan)
     ds["ore"].attrs = {"description": "Estimation of reactive ore per cell", "unit": "m2",}
     ds = ds.drop_vars(["mines"])
     return ds
@@ -571,3 +574,40 @@ def sel_nearest_where(da, lat, lon, condition, max_distance_km=5, dist_km=None):
     actual_distance = dist_km[best_lat_idx, best_lon_idx]
 
     return da.sel(lat=best_lat, lon=best_lon), actual_distance
+
+def fill_flow_values(ds, hydir_filename, aoi):
+
+    # Open with rioxarray
+    flw_da = rioxarray.open_rasterio(hydir_filename)
+    # Clip to AOI
+    #flw_clip = flw_da.rio.clip(aoi.geometry, aoi.crs, drop=True)
+    flw_clip = flw_da
+    # Extract the numpy array, transform, and crs
+    flw_data = flw_clip.values[0]  # assuming single band
+    transform = flw_clip.rio.transform()
+    crs = flw_clip.rio.crs
+
+    ds = ds.rio.set_spatial_dims(x_dim='lon', y_dim='lat')
+    for var in ds.data_vars:
+        if 'grid_mapping' in ds[var].attrs:
+            del ds[var].attrs['grid_mapping']
+    Q = ds["qav"]
+    flw = pyflwdir.from_array(
+        data=flw_data,
+        transform=transform,
+        ftype= "d8",
+        latlon=True
+    )
+
+    for t in range(len(ds.time)):
+        q_2d = Q.isel(time=t).values
+        q_2d[q_2d == 0] = np.nan
+        q_filled = flw.fillnodata(
+            data = q_2d, 
+            nodata = np.nan,
+            direction="down",
+            how = "sum")
+        
+        ds["qav"][t, :, :] = q_filled
+    
+    return ds
