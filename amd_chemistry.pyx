@@ -26,7 +26,6 @@ def process_chemistry(
     float[:, ::1] volume,
     float[:, ::1] median_vol,
     double do_val,
-    double ssa,
     double buffer_capacity,            
     double time_step_seconds,  
     Py_ssize_t[::1] valid_rows,
@@ -59,7 +58,7 @@ def process_chemistry(
     cdef double fe2_safe, oh_conc, ox_rate, fe2_oxidised
     cdef double ph, so4_conc, I, gamma_h, gamma_fe3, act_fe3, act_h, eq_act, dissolve
     cdef double precip, dissolved_needed, dissolved_sus, dissolve_bed, remaining
-    cdef double h_val_cap, pyrite_consumed1, ore_loss1, ore_loss2
+    cdef double h_val_cap,
 
     for k in prange(num_valid, nogil = True, schedule = "static"):
         r = valid_rows[k]
@@ -103,9 +102,7 @@ def process_chemistry(
             fe3_val -= ferric_consumed
             h_val += ferric_consumed * 1.14
             so4_val += ferric_consumed * (2.0 / 14.0)
-            pyrite_consumed1 = ferric_consumed / 14.0
-            ore_loss1 = pyrite_consumed1 * 119.98 * ssa
-            ore_val = fmax(ore_val - ore_loss1, 0.0)
+           
 
         fe2_val = fmax(fe2_val, 0.0)
         fe3_val = fmax(fe3_val, 0.0)
@@ -123,8 +120,7 @@ def process_chemistry(
             fe2_val += ferrous_amount
             so4_val += 2.0 * ferrous_amount
             h_val += 2.0 * ferrous_amount
-            ore_loss2 = ferrous_amount * 119.98 * ssa
-            ore_val = fmax(ore_val - ore_loss2, 0.0)
+            
 
         fe2_val = fmax(fe2_val, 0.0)
         fe3_val = fmax(fe3_val, 0.0)
@@ -227,4 +223,3 @@ def process_chemistry(
         so4[r, c] = so4_val
         fe_oh3[r, c] = fe_oh3_val
         bedload_storage[r, c] = bedload_storage_val
-        ore[r, c] = <float>ore_val

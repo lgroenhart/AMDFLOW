@@ -21,7 +21,7 @@ class AMDModel:
     """
     def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc",
                  a = 2.71, b = 0.557, c = 0.349, f = 0.341, wf = 0.00142, alpha_s = 1e-5, A_s_ratio = 0.5,
-                 ssa = 1.0, buffer_capacity = 0.1, v = 1.0):
+                    buffer_capacity = 0.1, v = 1.0):
         """class initialisation
 
         Parameters
@@ -80,7 +80,6 @@ class AMDModel:
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
         self.do = do
-        self.ssa = ssa
         self.buffer_capacity = buffer_capacity
         self.output_path = output_path
         spatial_shape = (len(self.dataset.lat), len(self.dataset.lon))
@@ -179,7 +178,6 @@ class AMDModel:
                     volume_2d,
                     self._median_vol,
                     self.do,
-                    self.ssa,
                     self.buffer_capacity,
                     self.time_step_seconds / 7,
                     valid_rows,
