@@ -21,13 +21,13 @@ class AMDModel:
     """
     def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc",
                  a = 2.71, b = 0.557, c = 0.349, f = 0.341, wf = 0.00142, alpha_s = 1e-5, A_s_ratio = 0.5,
-                 ssa = 1.0, buffer_capacity = 0.1, mannings = 0.044):
+                 ssa = 1.0, buffer_capacity = 0.1, v = 1.0):
         """class initialisation
 
         Parameters
         ----------
         dataset : xr.Dataset
-            dataset containing variables: Q (time, lat, lon), ore (lat, lon), ID (lat, lon), outID (lat, lon), source (lat, lon), slope (lat, lon)
+            dataset containing variables: Q (time, lat, lon), ore (lat, lon), ID (lat, lon), outID (lat, lon), source (lat, lon)
         t_unit : str
             time unit for the model: "month", "week", "day", "hour", or "minute", should align with timesteps of the dataset
         do : float, optional
@@ -52,8 +52,8 @@ class AMDModel:
             specific surface area of pyrite, by default 1
         buffer_capacity : float, optional
             buffer capacity for pH, non-physical instrument to buffer pH, by default 0.1
-        mannings : float, optional
-            mannings roughness coefficient for velocity from slope calculation, by default 0.044 (set for global)
+        v : float, optional
+            global set velocity
         """
         self.dataset = dataset.copy(deep=True)
         self.dataset["Q"] = self.dataset["Q"].fillna(0.0)
@@ -61,7 +61,6 @@ class AMDModel:
         self.dataset["ID"] = self.dataset["ID"].where(self.dataset["ID"] >= 0, -1)
         self.dataset["outID"] = self.dataset["outID"].where(self.dataset["outID"] >= 0, -1)
         self.dataset["source"] = self.dataset["source"].where(self.dataset["source"] == 1, 0)
-        self.dataset["slope"] = self.dataset["slope"].where(self.dataset["slope"] > 0, 0.0)
 
         mask_source = (self.dataset["source"] == 1)
         cond1 = ~mask_source.values
@@ -77,7 +76,7 @@ class AMDModel:
         self.wf = wf
         self.alpha_s = alpha_s
         self.A_s_ratio = A_s_ratio
-        self.mannings = mannings
+        self.v = v
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
         self.do = do
@@ -106,14 +105,7 @@ class AMDModel:
         self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400, "hour": 3600, "minute": 60}[self.t_unit]
         
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
-        W = self.a * self.dataset["Q"].isel(time=0).values**self.b
-        H = self.c * self.dataset["Q"].isel(time=0).values**self.f
-        _denom = 2 * H + W
-        RH = np.where(_denom > 0, (H * W) / np.where(_denom >0, _denom, 1.0), 0.0)
-        v = self.mannings**-1 * RH**(2/3) * self.dataset["slope"].values**0.5
-        volume_0 = np.where(v > 0,
-                            (self.dataset["Q"].isel(time=0).values /
-                              np.where(v > 0, v, 1.0)) * self.dx * 1000, 0.0) # V = (Q / v) * dx = m**3, *1000 = L
+        volume_0 = (self.dataset["Q"].isel(time=0).values / self.v) * self.dx * 1000 # V = (Q / v) * dx = m**3, *1000 = L
         self._buffer["hydrogen_ion"][0] = (1e-7 * volume_0).astype(np.float64)
         self._sbuffer["hydrogen_ion"][0] = self._buffer["hydrogen_ion"][0].copy()
 
@@ -154,13 +146,8 @@ class AMDModel:
                 self._write_timestep(ti, nc, Q_2d)
                 
     def _chemistry(self, Q_2d):
-        W = self.a * Q_2d**self.b
-        H = self.c * Q_2d**self.f
-        _denom = 2 * H + W
-        RH = np.where(_denom > 0, (H * W) / np.where(_denom > 0, _denom, 1.0), 0.0)
-        v = self.mannings**-1 * RH**(2/3) * self._S_np**0.5
-        v = np.where(v > 0, v, 1.0)
-        volume_2d = np.where(v > 0, (Q_2d / v) * self.dx * 1000, 0.0)  # litres
+        
+        volume_2d = (Q_2d / self.v) * self.dx * 1000  # litres
         mask = (np.isfinite(volume_2d)) & (volume_2d > 0) & (Q_2d > 1e-3)
         rows, cols = np.where(mask)
         valid_rows = rows.astype(np.intp)
@@ -168,8 +155,7 @@ class AMDModel:
         num_valid = len(valid_rows)
 
         total_h_mol = (self._buffer["hydrogen_ion"][0] + self._sbuffer["hydrogen_ion"][0])
-        total_vol = np.where(v > 0, 
-                             (Q_2d / v) * self.dx * 1000 * (1 + self.A_s_ratio), 0.0)
+        total_vol = (Q_2d / self.v) * self.dx * 1000 * (1 + self.A_s_ratio)
         safe_vol = np.where(total_vol > 0, total_vol, np.inf)
         total_h_conc = total_h_mol / safe_vol
         capped_conc = np.minimum(total_h_conc, 1e4)
@@ -233,7 +219,6 @@ class AMDModel:
                         self._id_to_row,      
                         self._id_to_col,  
                         self.dx,    
-                        self._S_np,
                         self.a,
                         self.b,
                         self.c,
@@ -243,7 +228,7 @@ class AMDModel:
                         0.5,
                         self.alpha_s,
                         self.A_s_ratio,
-                        self.mannings,
+                        self.v,
                         1000,
                         self._cn_working_arrays["a"],
                         self._cn_working_arrays["b"],
@@ -286,14 +271,13 @@ class AMDModel:
             self._id_to_outid,
             ti,
             self.time_step_seconds,
-            self._S_np,
             self.dx,
             self.a,
             self.b,
             self.c, 
             self.f,
             self.wf,
-            self.mannings,
+            self.v,
             1000,
             len(self.dataset.lat),
             len(self.dataset.lon),
@@ -370,20 +354,10 @@ class AMDModel:
         self._time_index = {t: i for i, t in enumerate(self.dataset["time"].values)}
 
         self._Q_np = self.dataset["Q"].values
-        self._S_np = np.abs(self.dataset["slope"].values)
 
         # median long term volume array for protection against concentration explosions
         median_Q = np.median(self._Q_np, axis = 0)
-        W = self.a * median_Q**self.b
-        H = self.c * median_Q**self.f
-        _denom = 2 * H + W
-        RH = np.where(_denom > 0,
-                       (H * W) / 
-                       np.where(_denom > 0, _denom, 1.0), 0.0)
-        v = self.mannings**-1 * RH**(2/3) * self._S_np**0.5
-        median_vol = np.where(v > 0, 
-                              (median_Q / 
-                               np.where(v > 0, v, 1.0))  * self.dx * 1000, 0.0)
+        median_vol = (median_Q / self.v) * self.dx * 1000
         self._median_vol = np.maximum(median_vol, 1.0).astype(np.float32)
 
         self._ore_np = self.dataset["ore"].values.astype(np.float32)
@@ -516,12 +490,7 @@ class AMDModel:
         nc : netCDF4.Dataset()
             the open netCDF dataset to write to, created in _create_output_file
         """
-        W = self.a * Q_2d**self.b
-        H = self.c * Q_2d**self.f
-        _denom = 2 * H + W
-        RH = np.where(_denom > 0, (H * W) / np.where(_denom > 0, _denom, 1.0), 0.0)
-        v = self.mannings**-1 * RH**(2/3) * self._S_np**0.5
-        A_vals = np.where(v > 0, Q_2d / np.where(v > 0, v, 1.0), 1e-6)
+        A_vals = (Q_2d / self.v)
         A_vals = np.maximum(A_vals, 1e-6)  # m²
         V_cell = A_vals * self.dx # m³
         step_vol = V_cell * 1000 # litres, main storage volume
@@ -561,11 +530,7 @@ class AMDModel:
             nc.variables["pH"][ti, :, :] = ph.astype(np.float32)
 
     def _get_volume(self, ti):
-        W = self.a * self._Q_np[ti]**self.b
-        H = self.c * self._Q_np[ti]**self.f
-        RH = (W * H) / (H * 2 + W)
-        v = self.mannings**-1 * RH**(2/3) * self._S_np**0.5
-        return (self._Q_np[ti] / v) * self.dx * 1000
+        return (self._Q_np[ti] / self.v) * self.dx * 1000
     
     def _build_reaches(self):
         """Builds reaches and junction network for transport,
@@ -701,14 +666,8 @@ class AMDModel:
             moles = float(buf[tail_r, tail_c])
             if moles <= 0.0:
                 continue
-            W = self.a * Q_t**self.b
-            H = self.c * Q_t**self.f
-            _denom = 2 * H + W
-            RH = (W * H) / _denom if _denom > 0 else 0.0
-            v = self.mannings**-1 * RH**(2/3) * self._S_np[tail_r, tail_c]**0.5
-            if v <= 0:
-                continue
-            V_t = max((Q_t / v) * self.dx, 
+            
+            V_t = max((Q_t / self.v) * self.dx, 
                       float(self._median_vol[tail_r, tail_c]) / 1000) # m³
             courant = Q_t * self.time_step_seconds / V_t
             moles_out = min(courant, 1.0) * moles

@@ -24,7 +24,6 @@ def _transport_cn(
     I32[:] id_to_row,
     I32[:] id_to_col,
     double dx,
-    F32[:, ::1] S,
     double a, 
     double b,
     double c,
@@ -34,7 +33,7 @@ def _transport_cn(
     double theta,
     double alpha_s,
     double A_s_ratio,
-    double mannings,
+    double v,
     int max_substeps,
     F64[::1] a_arr,        
     F64[::1] b_arr,
@@ -87,25 +86,22 @@ def _transport_cn(
             r0 = rows[i]
             c0 = cols[i]
             Q_i = fmax(Q[r0, c0], eps)
-            S_i = fmax(S[r0, c0], 0.0)
+            A_i = fmax(Q_i / v, 1e-6)
+            A_arr[i] = A_i
             W_i = a * (Q_i ** b)
             H_i = c * (Q_i ** f)
             RH = (H_i * W_i) / (2.0 * H_i + W_i + eps)
-            v_i = mannings**-1 * RH**(2.0/3.0) * sqrt(S_i)
-            v_arr[i] = v_i
-            A_i = fmax(Q_i / v_i, 1e-6)
-            A_arr[i] = A_i
             V_i = A_i * dx
             V_i_arr[i] = V_i
-            C_cour = v_i * dt / dx
+            C_cour = v * dt / dx
             if C_cour > max_C:
                 max_C = C_cour
-            Re = (rho * v_i * 4.0 * RH) / mu
+            Re = (rho * v * 4.0 * RH) / mu
             f_fric = 64.0 / (Re + eps)
-            tau = (f_fric / 8.0) * rho * v_i * v_i
+            tau = (f_fric / 8.0) * rho * v * v
             u_star = sqrt(fmax(tau / rho, eps))
             D_i = 5.4 * ((W_i / (H_i + eps)) ** 0.7) * \
-                ((v_i / (u_star + eps)) ** 0.13) * H_i * v_i
+                ((v / (u_star + eps)) ** 0.13) * H_i * v
             D_arr[i] = D_i
 
         n_sub = <I64>ceil(max_C)
@@ -131,12 +127,11 @@ def _transport_cn(
                 
                 A_i = A_arr[i]
                 V_i = V_i_arr[i]
-                v_i = v_arr[i]
                 D_i = D_arr[i]
 
                 
                 r = D_i * dt_sub / (dx * dx)
-                s_adv = v_i * dt_sub / dx          
+                s_adv = v * dt_sub / dx          
                 q_lin_i = fmax(Q_lat[r0, c0], 0.0)
                 p = q_lin_i * dt_sub / (A_i * dx + eps)
 
@@ -148,12 +143,12 @@ def _transport_cn(
                     C_im1 = bc_top
                 else:
                     C_im1 = conc[rows[i - 1], cols[i - 1]] / \
-                        fmax(fmax(Q[rows[i - 1], cols[i - 1]], eps) / v_i * dx, eps)
+                        fmax(fmax(Q[rows[i - 1], cols[i - 1]], eps) / v * dx, eps)
 
                 # downstream concentration
                 if i < reach_len - 1:
                     C_ip1 = conc[rows[i + 1], cols[i + 1]] / \
-                        fmax(fmax(Q[rows[i + 1], cols[i + 1]], eps) / v_i * dx, eps)
+                        fmax(fmax(Q[rows[i + 1], cols[i + 1]], eps) / v * dx, eps)
                 else:
                     C_ip1 = C_i
 
@@ -233,14 +228,13 @@ def _transport_ad_dep(
     I32[:] id_to_outid,           # mapping from ID to outID
     long time_idx,                   
     double time_step_seconds,
-    F32[:, ::1] S,
     double dx,
     double a,
     double b,
     double c,
     double f,
     double wf, 
-    double mannings,
+    double v,
     int max_substeps,
     long nlat,
     long nlon,
@@ -306,11 +300,6 @@ def _transport_ad_dep(
         src_r = src_rows[i]
         src_c = src_cols[i]
         Q_val = Q[src_r, src_c]
-        S_val = S[src_r, src_c]
-        W = a * Q_val**b
-        H = c * Q_val**f
-        RH = (H * W) / (2 * H + W)
-        v = mannings ** -1 * RH ** (2.0/3.0) * sqrt(S_val)
         if Q_val > 0:
             A_cross = Q_val / v
             if A_cross < 1e-6:
@@ -348,11 +337,7 @@ def _transport_ad_dep(
             src_r = current_src_rows[i]
             src_c = current_src_cols[i]
             Q_val = Q[src_r, src_c]
-            S_val = S[src_r, src_c]
             W = a * Q_val ** b
-            H = c * Q_val ** f
-            RH = (H * W) / (2 * H + W)
-            v = mannings**-1 * RH**(2.0/3.0) * sqrt(S_val)
             if Q_val <= 0:
                 vol_valid[i] = 0
                 continue
