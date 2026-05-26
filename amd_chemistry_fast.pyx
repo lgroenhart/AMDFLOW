@@ -77,7 +77,8 @@ cdef inline void _davies_activity(
 
 
 cdef inline void _apply_equilibrium_precip(
-        double *fe3, double *h, double *fe_oh3, double *bedload,
+        double *fe3, double *h, double *fe2, double *so4, 
+        double *fe_oh3, double *bedload,
         double vol_safe) noexcept nogil:
     """
     Instantaneous Fe(OH)₃ ↔ Fe³⁺ equilibrium (closed-form).
@@ -86,14 +87,16 @@ cdef inline void _apply_equilibrium_precip(
     surplus/deficit to/from fe_oh3 (and bedload if needed).
     Modifies fe3, h, fe_oh3, bedload in place via pointers.
     """
-    cdef double h_c, fe3_c, gam_h, gam_fe3
+    cdef double h_c, fe3_c, gam_h, gam_fe3, fe2_c, so4_c
     cdef double act_h, eq_act, fe3_eq_mol, delta
     cdef double p, need, avail_sus, from_sus, remaining, from_bed
 
     h_c   = fmax(h[0]   / vol_safe, 1e-14)
     fe3_c = fmax(fe3[0] / vol_safe, 0.0)
+    fe2_c = fmax(fe2[0] / vol_safe, 0.0)
+    so4_c = fmax(so4[0] / vol_safe, 0.0)
 
-    _davies_activity(h_c, fe3_c, 0.0, 0.0, &gam_h, &gam_fe3)
+    _davies_activity(h_c, fe3_c, fe2_c, so4_c, &gam_h, &gam_fe3)
 
     act_h      = gam_h * h_c
     eq_act     = KSP * act_h * act_h * act_h   # KSP * [H+]_act^3
@@ -126,7 +129,7 @@ cdef inline void _apply_equilibrium_precip(
 
 cdef inline void _analytical_fe2_oxidation(
         double *fe2, double *fe3, double *h,
-        double vol_safe, double buffer_capacity,
+        double vol_safe,
         double dt) noexcept nogil:
     """
     Exact exponential solution for Fe²⁺ → Fe³⁺ oxidation.
@@ -145,13 +148,6 @@ cdef inline void _analytical_fe2_oxidation(
     fe2_new = fe2[0] * exp(-lam * dt)
     fe2_new = fmax(fe2_new, 0.0)
     fe2_ox  = fe2[0] - fe2_new
-
-    if buffer_capacity > 0.0 and fe2_ox > 0.0:
-        max_h = buffer_capacity * vol_safe
-        if fe2_ox > max_h:
-            scale   = max_h / fe2_ox
-            fe2_ox  = fe2_ox * scale
-            fe2_new = fe2[0] - fe2_ox
 
     fe3[0] += fe2_ox
     h[0]    = fmax(h[0] - fe2_ox, 0.0)
@@ -253,7 +249,8 @@ cdef inline void _backward_euler_pyrite(
     cdef double r2, r3, rs, rh                     # residuals
     cdef double norm, eps = 1e-7
     cdef double J[4][4]
-    cdef double R[4], delta[4]
+    cdef double R[4]
+    cdef double delta[4]
     cdef double f2e, f3e, fse, fhe                 # perturbed RHS
     cdef int s, it
     cdef double f2_k, f3_k, fs_k, fh_k # f(y_k) at current iteration
@@ -382,11 +379,16 @@ def process_chemistry(
     cdef Py_ssize_t k, r, c
     cdef double fe2_, fe3_, so4_, h_, foh_, bed_
     cdef double vol_, vol_safe, h2o, do_sqrt, h_cap
-    cdef double ore_
+    cdef double ore_, 
+    cdef double h_produced, 
+    cdef double h_initial, 
+    cdef double max_neutral, 
+    cdef double neutralised
+    cdef double h_new
 
     do_sqrt = do_val ** 0.5
 
-    for k in prange(num_valid, nogil=True, schedule="static"):
+    for k in prange(num_valid, nogil=True, schedule="dynamic"):
         r = valid_rows[k]
         c = valid_cols[k]
 
@@ -402,6 +404,7 @@ def process_chemistry(
         h_   = h[r, c]
         foh_ = fe_oh3[r, c]
         bed_ = bedload_storage[r, c]
+        h_initial = h_
 
         if (not isfinite(fe2_) or not isfinite(fe3_) or
                 not isfinite(so4_) or not isfinite(h_) or
@@ -420,16 +423,25 @@ def process_chemistry(
         # ── B: Fe²⁺ → Fe³⁺ oxidation  (exact analytical exponential) ────────
         _analytical_fe2_oxidation(
             &fe2_, &fe3_, &h_,
-            vol_safe, buffer_capacity, time_step_seconds)
+            vol_safe, time_step_seconds)
 
         # ── C: Fe(OH)₃ equilibrium  (analytical closed-form) ─────────────────
-        _apply_equilibrium_precip(&fe3_, &h_, &foh_, &bed_, vol_safe)
+        _apply_equilibrium_precip(&fe3_, &h_, &fe2_, &so4_, &foh_, &bed_, vol_safe)
+        
+        h_produced = h_ - h_initial
+
+        if h_produced > 0.0 and buffer_capacity > 0.0:
+            max_neutral = buffer_capacity * vol_safe
+            neutralised = fmin(h_produced, max_neutral)
+            h_new = h_ - neutralised
+        else:
+            h_new = h_
 
         # ── Clip & write back ─────────────────────────────────────────────────
         h_cap        = H_CAP * vol_
         fe2[r, c]             = fmax(fe2_, 0.0)
         fe3[r, c]             = fmax(fe3_, 0.0)
         so4[r, c]             = fmax(so4_, 0.0)
-        h[r, c]               = fmin(fmax(h_, 0.0), h_cap)
+        h[r, c]               = fmin(fmax(h_new, 0.0), h_cap)
         fe_oh3[r, c]          = fmax(foh_, 0.0)
         bedload_storage[r, c] = fmax(bed_, 0.0)
