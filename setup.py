@@ -47,7 +47,7 @@ ext = Extension(
     name="amd_chemistry_fast",
     sources=["amd_chemistry_fast.pyx"],
     include_dirs=[np.get_include()],
-    extra_compile_args=["-O3", "-fopenmp", "-ffast-math"],
+    extra_compile_args=["/O2", "/openmp", "/fp:fast"],
     extra_link_args=["-fopenmp"],
 )
  
@@ -62,6 +62,6 @@ setup(
             "nonecheck":    False,
             "language_level": "3",
         },
-        annotate=True,          # produces amd_chemistry_fast.html for profiling
+        annotate=True,          
     ),
 )
