@@ -1,7 +1,7 @@
 # class py file for AMDFLOW
 # contains main AMDModel class used for AMD modelling
 
-from amd_chemistry import process_chemistry
+from amd_chemistry_fast import process_chemistry
 from transport import _transport_cn, _transport_ad_dep
 import numpy as np
 import xarray as xr
@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from joblib import Parallel, delayed
 import os
 import netCDF4
+from collections import deque
 
 
 
@@ -137,10 +138,17 @@ class AMDModel:
                 
                 self._transport(t, Q_2d)
 
-                # write back to buffers
-                for var in self._chem_vars:
-                    self._buffer[var][0] = self._buffer[var][0] + self._buffer[var][1]
-                    self._buffer[var][1] = 0.0
+            for var in self._chem_vars:
+                # 1. Update main buffer
+                self._buffer[var][0] = self._buffer[var][0] + self._buffer[var][1]
+                self._buffer[var][1] = 0.0
+                self._buffer[var][0][self._off_network] = 0.0
+                
+                # 2. Update storage buffer ONLY if the variable exists in it
+                if var in self._sbuffer:
+                    self._sbuffer[var][0] = self._sbuffer[var][0] + self._sbuffer[var][1]
+                    self._sbuffer[var][1] = 0.0
+                    self._sbuffer[var][0][self._off_network] = 0.0
                 
                 self._write_timestep(ti, nc, Q_2d)
                 
@@ -163,27 +171,23 @@ class AMDModel:
         self._buffer["hydrogen_ion"][0] *= scaling
         self._sbuffer["hydrogen_ion"][0] *= scaling
 
-        for i in range(7):
-            if num_valid == 0:
-                return None
-            else:
-                process_chemistry(
-                    self._buffer["ferrous_iron"][0],
-                    self._buffer["ferric_iron"][0],
-                    self._buffer["sulphate"][0],
-                    self._buffer["hydrogen_ion"][0],
-                    self._buffer["iron_III_hydroxide"][0],
-                    self._buffer["bedload_storage"][0],
-                    self._ore_np,
-                    volume_2d,
-                    self._median_vol,
-                    self.do,
-                    self.buffer_capacity,
-                    self.time_step_seconds / 7,
-                    valid_rows,
-                    valid_cols,
-                    num_valid
-                )
+        process_chemistry(
+            self._buffer["ferrous_iron"][0],
+            self._buffer["ferric_iron"][0],
+            self._buffer["sulphate"][0],
+            self._buffer["hydrogen_ion"][0],
+            self._buffer["iron_III_hydroxide"][0],
+            self._buffer["bedload_storage"][0],
+            self._ore_np,
+            volume_2d,
+            self._median_vol,
+            self.do,
+            self.buffer_capacity,
+            self.time_step_seconds,
+            valid_rows,
+            valid_cols,
+            num_valid
+        )
         
     def _transport(self, t, Q_2d):
         """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
@@ -362,6 +366,8 @@ class AMDModel:
         self._sink_mask = self.outID_grid < 0
         
         self._build_reaches()
+        self._build_network_mask()
+        self._off_network = ~self._network_mask
 
         if self._max_reach_length >= 2:
             self._cn_working_arrays = {
@@ -681,3 +687,39 @@ class AMDModel:
         C_lat = np.divide(C_lat_num, Q_lat, out=np.full_like(C_lat_num, 0.0), where=mask)
         return Q_lat.astype(np.float32), C_lat.astype(np.float64)
     
+    def _build_network_mask(self):
+        """Builds a 2d bolean mask of stream network downstream from mine cells, 
+            used to set all buffers of cells outside the mask to 0
+            stored as self._network_mask,
+        """
+        shape = (len(self.dataset.lat), len(self.dataset.lon))
+        network_mask = np.zeros(shape, dtype = bool)
+
+        source_rows, source_cols = np.where((self.dataset["source"].values == 1) & (self.dataset["ore"] > 0))
+        queue = deque()
+        visited = set()
+
+        for r, c in zip(source_rows, source_cols):
+            cell_id = int(self._ID_grid[r, c])
+            if cell_id >= 0 and cell_id not in visited:
+                visited.add(cell_id)
+                network_mask[r, c] = True
+                queue.append(cell_id)
+        
+        while queue:
+            current_id = queue.popleft()
+            out_id = int(self._id_to_outid[current_id])
+            if out_id < 0 or out_id in visited:
+                continue
+            r = int(self._id_to_row[out_id])
+            c = int(self._id_to_col[out_id])
+            if r < 0 or c < 0:
+                continue
+            visited.add(out_id)
+            network_mask[r, c] = True
+            queue.append(out_id)
+        
+        self._network_mask = network_mask
+        n_network = network_mask.sum()
+        n_total = network_mask.size
+        print(f"Network mask built: {n_network:,} / {n_total:,} cells on AMD network")
