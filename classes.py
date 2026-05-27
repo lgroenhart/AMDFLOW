@@ -63,11 +63,11 @@ class AMDModel:
         self.dataset["outID"] = self.dataset["outID"].where(self.dataset["outID"] >= 0, -1)
         self.dataset["source"] = self.dataset["source"].where(self.dataset["source"] == 1, 0)
 
-        mask_source = (self.dataset["source"] == 1)
-        cond1 = ~mask_source.values
-        cond2 = (self.dataset["Q"].values > 0)
-        condition = np.logical_or(cond1, cond2)
-        self.dataset["Q"] = self.dataset["Q"].where(condition, 1e-3) # 
+        # mask_source = (self.dataset["source"] == 1)
+        # cond1 = ~mask_source.values
+        # cond2 = (self.dataset["Q"].values > 0)
+        # condition = np.logical_or(cond1, cond2)
+        # self.dataset["Q"] = self.dataset["Q"].where(condition, 1e-3) # 
         self._Q = self.dataset["Q"].copy(deep=True)
         self.dx = 1000 
         self.a = a
@@ -102,6 +102,10 @@ class AMDModel:
             for var in self._transport_vars
         }
 
+        self._Q_lat_buff = np.zeros(spatial_shape, dtype = np.float64)
+        self._C_lat_buff = np.zeros(spatial_shape, dtype = np.float64)
+        self._C_lat_num_buff = np.zeros(spatial_shape, dtype = np.float64)
+
         self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400, "hour": 3600, "minute": 60}[self.t_unit]
         
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
@@ -110,6 +114,7 @@ class AMDModel:
         self._sbuffer["hydrogen_ion"][0] = self._buffer["hydrogen_ion"][0].copy()
 
         self._Q_dataset = self.dataset["Q"]
+        self._median_vol = np.full(spatial_shape, 1000.0, dtype = np.float32)
 
         self._create_output_file(n_steps, spatial_shape)
         
@@ -138,24 +143,24 @@ class AMDModel:
                 
                 self._transport(t, Q_2d)
 
-            for var in self._chem_vars:
-                # 1. Update main buffer
-                self._buffer[var][0] = self._buffer[var][0] + self._buffer[var][1]
-                self._buffer[var][1] = 0.0
-                self._buffer[var][0][self._off_network] = 0.0
-                
-                # 2. Update storage buffer ONLY if the variable exists in it
-                if var in self._sbuffer:
-                    self._sbuffer[var][0] = self._sbuffer[var][0] + self._sbuffer[var][1]
-                    self._sbuffer[var][1] = 0.0
-                    self._sbuffer[var][0][self._off_network] = 0.0
+                for var in self._chem_vars:
+                    # 1. Update main buffer
+                    self._buffer[var][0] = self._buffer[var][0] + self._buffer[var][1]
+                    self._buffer[var][1] = 0.0
+                    self._buffer[var][0][self._off_network] = 0.0
+                    
+                    # 2. Update storage buffer ONLY if the variable exists in it
+                    if var in self._sbuffer:
+                        self._sbuffer[var][0] = self._sbuffer[var][0] + self._sbuffer[var][1]
+                        self._sbuffer[var][1] = 0.0
+                        self._sbuffer[var][0][self._off_network] = 0.0
                 
                 self._write_timestep(ti, nc, Q_2d)
                 
     def _chemistry(self, Q_2d):
         
         volume_2d = (Q_2d / self.v) * self.dx * 1000  # litres
-        mask = (np.isfinite(volume_2d)) & (volume_2d > 0) & (Q_2d > 1e-3)
+        mask = (np.isfinite(volume_2d)) & (volume_2d > 0) & (Q_2d > 1e-6)
         rows, cols = np.where(mask)
         valid_rows = rows.astype(np.intp)
         valid_cols = cols.astype(np.intp)
@@ -357,11 +362,6 @@ class AMDModel:
 
         self._Q_np = self.dataset["Q"].values
 
-        # median long term volume array for protection against concentration explosions
-        median_Q = np.median(self._Q_np, axis = 0)
-        median_vol = (median_Q / self.v) * self.dx * 1000
-        self._median_vol = np.maximum(median_vol, 1.0).astype(np.float32)
-
         self._ore_np = self.dataset["ore"].values.astype(np.float32)
         self._sink_mask = self.outID_grid < 0
         
@@ -369,7 +369,7 @@ class AMDModel:
         self._build_network_mask()
         self._off_network = ~self._network_mask
 
-        if self._max_reach_length >= 2:
+        if self._max_reach_length >= 1:
             self._cn_working_arrays = {
                 "a": np.empty((self._max_reach_length,), dtype=np.float64),
                 "b": np.empty((self._max_reach_length,), dtype=np.float64),
@@ -654,8 +654,9 @@ class AMDModel:
         Removes moles from tail cells (mass conservation).
         Returns Q_lat [m³/s] and C_lat [mol/m³] as float32 arrays.
         """
-        Q_lat     = np.zeros_like(Q_2d, dtype=np.float64)
-        C_lat_num = np.zeros_like(Q_2d, dtype=np.float64)  # flow-weighted numerator [mol/s]
+        self._Q_lat_buff.fill(0.0)
+        self._C_lat_buff.fill(0.0)
+        self._C_lat_num_buff.fill(0.0)
         buf = self._buffer[var][0]
 
         for junction in self._reach_junctions:
@@ -671,8 +672,7 @@ class AMDModel:
             if moles <= 0.0:
                 continue
             
-            V_t = max((Q_t / self.v) * self.dx, 
-                      float(self._median_vol[tail_r, tail_c]) / 1000) # m³
+            V_t = max((Q_t / self.v) * self.dx, 1.0) # m³
             courant = Q_t * self.time_step_seconds / V_t
             moles_out = min(courant, 1.0) * moles
 
@@ -680,12 +680,13 @@ class AMDModel:
             C_eff = moles_out / (Q_t * self.time_step_seconds)
 
             buf[tail_r, tail_c] -= moles_out
-            Q_lat[dst_r, dst_c] += Q_t
-            C_lat_num[dst_r, dst_c] += Q_t * C_eff
+            self._Q_lat_buff[dst_r, dst_c] += Q_t
+            self._C_lat_num_buff[dst_r, dst_c] += Q_t * C_eff
 
-        mask = Q_lat > 0.0
-        C_lat = np.divide(C_lat_num, Q_lat, out=np.full_like(C_lat_num, 0.0), where=mask)
-        return Q_lat.astype(np.float32), C_lat.astype(np.float64)
+        mask = self._Q_lat_buff > 0.0
+        np.divide(self._C_lat_num_buff, self._Q_lat_buff,
+                  out = self._C_lat_buff, where = mask)
+        return self._Q_lat_buff.astype(np.float32), self._C_lat_buff.astype(np.float64)
     
     def _build_network_mask(self):
         """Builds a 2d bolean mask of stream network downstream from mine cells, 
@@ -695,7 +696,7 @@ class AMDModel:
         shape = (len(self.dataset.lat), len(self.dataset.lon))
         network_mask = np.zeros(shape, dtype = bool)
 
-        source_rows, source_cols = np.where((self.dataset["source"].values == 1) & (self.dataset["ore"] > 0))
+        source_rows, source_cols = np.where(self.dataset["ore"] > 0)
         queue = deque()
         visited = set()
 

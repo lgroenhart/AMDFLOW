@@ -3,7 +3,7 @@
 
 import numpy as np
 cimport numpy as np
-from libc.math cimport exp, fmax, fmin, ceil, sqrt
+from libc.math cimport exp, fmax, fmin, ceil, sqrt, fabs
 from libc.stdlib cimport malloc, free
 
 ctypedef np.float64_t F64
@@ -53,7 +53,7 @@ def _transport_cn(
     cdef:
         I64 reach_len, i
         I64 r0, c0
-        double Q_i, A_i, V_i, W_i, H_i, D_i, S_i,
+        double Q_i, A_i, V_i, W_i, H_i, D_i, S_i
         double RH, Re, f_fric, tau, u_star, V_head
         double r, s, p, beta, gamma, kappa, v_i
         double C_im1, C_i, C_ip1, C_L_i, q_lin_i
@@ -68,8 +68,6 @@ def _transport_cn(
     for reach_ids_py in reaches:
         reach_ids = np.asarray(reach_ids_py, dtype=np.int64)
         reach_len = len(reach_ids)
-        if reach_len < 2:
-            continue
 
         if reach_len > max_reach_length:
             raise ValueError("Reach length exceeds pre-allocated workspace size")
@@ -119,7 +117,7 @@ def _transport_cn(
 
         # substep loops
         for sub in range(n_sub):
-
+            bc_top = conc[rows[0], cols[0]] / V_i_arr[0]
             # build tridiagonal coefficients 
             for i in range(reach_len):
                 r0 = rows[i]
@@ -133,7 +131,7 @@ def _transport_cn(
                 r = D_i * dt_sub / (dx * dx)
                 s_adv = v * dt_sub / dx          
                 q_lin_i = fmax(Q_lat[r0, c0], 0.0)
-                p = q_lin_i * dt_sub / (A_i * dx + eps)
+                p = q_lin_i * dt_sub / (V_i + eps)
 
                 C_i = conc[r0, c0] / V_i
                 C_L_i = C_lat[r0, c0]
@@ -158,7 +156,7 @@ def _transport_cn(
                 ci = -theta * r
 
                 if i == reach_len - 1:
-                    bi -= ci
+                    bi += ci
                     ci = 0.0
 
                 di = ( ((1.0 - theta) * r + (1.0 - psi) * s_adv) * C_im1
@@ -166,14 +164,24 @@ def _transport_cn(
                     - (1.0 - psi) * s_adv) * C_i
                     + (1.0 - theta) * r * C_ip1
                     + p * C_L_i )
-
+                
+                # boundary adjustment
+                if i == 0:
+                    # inbound
+                    bi += ci
+                    ai = 0.0
+                elif i == reach_len - 1:
+                    # outbound
+                    bi += ci
+                    ci = 0.0
+                
                 if alpha_s > 0.0:
                     beta = alpha_s / A_s_ratio
                     kappa = beta * dt_sub / 2.0
                     gamma = alpha_s * dt_sub / (1.0 + kappa)
 
                     V_s_i = A_s_ratio * V_i
-                    C_s_i = conc_s[rows[i], cols[i]] / fmax(V_s_i, eps)
+                    C_s_i = conc_s[r0, c0] / fmax(V_s_i, eps)
 
                     bi += gamma / 2.0
                     di += gamma * C_s_i - (gamma / 2.0) * C_i
@@ -190,7 +198,7 @@ def _transport_cn(
 
             for i in range(1, reach_len):
                 denom = b_arr[i] - a_arr[i] * c_prime[i - 1]
-                if abs(denom) < eps:
+                if fabs(denom) < eps:
                     denom = eps
                 c_prime[i] = c_arr[i] / denom
                 d_prime[i] = (d_arr[i] - a_arr[i] * d_prime[i - 1]) / denom
@@ -217,56 +225,55 @@ def _transport_cn(
                 conc[r0, c0] = (fmax(C_new, 0.0)) * V_i_arr[i]
                 conc_s[r0, c0] = (fmax(C_s_new, 0.0)) * V_s_i
 
+
 def _transport_ad_dep(
     double[:, :, ::1] feoh3_buf,
-    double[:, :, ::1] bedload_storage, # precipitated feoh3 on riverbed
-    F32[:, ::1] Q,               # flow at current time step [nlat, nlon]
-    I64[:, ::1] ID_grid,           # [nlat, nlon]
-    I64[:, ::1] outID_grid,        # [nlat, nlon]
-    I32[:] id_to_row,              # mapping from ID to row index (-1 if invalid)
-    I32[:] id_to_col,              # mapping from ID to col index
-    I32[:] id_to_outid,           # mapping from ID to outID
-    long time_idx,                   
+    double[:, :, ::1] bedload_storage,
+    F32[:, ::1] Q,
+    I64[:, ::1] ID_grid,
+    I64[:, ::1] outID_grid,
+    I32[:] id_to_row,
+    I32[:] id_to_col,
+    I32[:] id_to_outid,
+    long time_idx,
     double time_step_seconds,
     double dx,
     double a,
     double b,
     double c,
     double f,
-    double wf, 
+    double wf,
     double v,
     int max_substeps,
     long nlat,
     long nlon,
-    I64[:] src_rows,              
-    I64[:] src_cols,     
+    I64[:] src_rows,
+    I64[:] src_cols,
     I64[:] dst_rows,
     I64[:] dst_cols,
     int[:] valid_cell,
     int[:] vol_valid,
-    int[:] has_next         
+    int[:] has_next
     ):
     """
-    Cython kernel for advection-deposition transport of precipitate species,
-    along the flow network.
-    Buffers are modified in-place.
+    Corrected Cython kernel for advection-deposition transport of precipitate species.
+    Operates via fast, isolated heap arrays to preserve grid networks across substeps.
     """
     cdef:
         I64 n_cells = src_rows.shape[0]
-        I64 i, sub, var_idx
-        I64 src_r, src_c, dst_r, dst_c
-        double Q_val, A_cross, V_cell, C_courant, dt_sub,
-        double src_val, moved, src_vol
-        double mol_mass_feoh3, kg_per_mol, mass_precip, W, A_bed, ap, aq
-        double d_Sos, Qs_mass, DEP_mass, Qs_mol, DEP_mol, u_star, p, tau_zero
-        double friction_f, viscosity, hydraulic_dia, hydraulic_rad, H, Re, D
-        I64 n_sub, sub_step
-        I64 valid_count
-        I64 current_id, next_id
-        double epsilon = 1e-12
-        I64 max_cells = n_cells
+        I64 i, sub_step
+        I64 src_r, src_c, dst_r, dst_c, dst_id
+        double Q_val, A_cross, V_cell, C_courant, dt_sub
+        double mass_precip, W, A_bed, ap, aq
+        double d_Sos, Qs_mass, DEP_mass, Qs_mol, DEP_mol
+        double mol_mass_feoh3 = 106.87
+        double kg_per_mol = mol_mass_feoh3 / 1000.0
+        double max_C = 0.0
+        I64 n_sub, valid_count, current_n
+        I64 current_id, next_id, next_r, next_c
+        double total_req, mass_scale
 
-    # determine destination cells for each source
+    # 1. Map pristine source cells to their respective destinations
     for i in range(n_cells):
         src_r = src_rows[i]
         src_c = src_cols[i]
@@ -276,10 +283,12 @@ def _transport_ad_dep(
             dst_cols[i] = id_to_col[dst_id]
             if dst_rows[i] < 0 or dst_cols[i] < 0:
                 valid_cell[i] = 0
+            else:
+                valid_cell[i] = 1
         else:
             valid_cell[i] = 0
 
-    # filter to valid source‑destination pairs
+    # 2. Extract valid active network element count
     valid_count = 0
     for i in range(n_cells):
         if valid_cell[i]:
@@ -288,14 +297,13 @@ def _transport_ad_dep(
             dst_rows[valid_count] = dst_rows[i]
             dst_cols[valid_count] = dst_cols[i]
             valid_count += 1
+            
     if valid_count == 0:
         return
 
     n_cells = valid_count
 
-    # compute number of substeps (Courant‑like condition)
-
-    cdef double max_C = 0.0
+    # 3. Compute number of substeps (Courant condition)
     for i in range(n_cells):
         src_r = src_rows[i]
         src_c = src_cols[i]
@@ -316,116 +324,135 @@ def _transport_ad_dep(
         n_sub = max_substeps
     dt_sub = time_step_seconds / n_sub
 
-    cdef I64[:] current_src_rows = src_rows
-    cdef I64[:] current_src_cols = src_cols
-    cdef I64[:] current_dst_rows = dst_rows
-    cdef I64[:] current_dst_cols = dst_cols
-    cdef I64 current_n = n_cells
+    # 4. Allocate fast worker heap tracking memory
+    cdef I64 *working_src_rows = <I64 *>malloc(n_cells * sizeof(I64))
+    cdef I64 *working_src_cols = <I64 *>malloc(n_cells * sizeof(I64))
+    cdef I64 *working_dst_rows = <I64 *>malloc(n_cells * sizeof(I64))
+    cdef I64 *working_dst_cols = <I64 *>malloc(n_cells * sizeof(I64))
 
-    for sub_step in range(n_sub):
-        # merge incoming buffer into resident before each substep except first
-        # merge buffers at start of substep (chemicals from previous substep become available)
-        if sub_step > 0:
-            for i in range(current_n):
-                src_r = current_src_rows[i]
-                src_c = current_src_cols[i]
-                feoh3_buf[0, src_r, src_c] += feoh3_buf[1, src_r, src_c]
-                feoh3_buf[1, src_r, src_c] = 0.0
+    if not working_src_rows or not working_src_cols or not working_dst_rows or not working_dst_cols:
+        if working_src_rows: free(working_src_rows)
+        if working_src_cols: free(working_src_cols)
+        if working_dst_rows: free(working_dst_rows)
+        if working_dst_cols: free(working_dst_cols)
+        return
 
-        # compute transport fractions and volume validity for this substep
-        for i in range(current_n):
-            src_r = current_src_rows[i]
-            src_c = current_src_cols[i]
-            Q_val = Q[src_r, src_c]
-            W = a * Q_val ** b
-            if Q_val <= 0:
-                vol_valid[i] = 0
-                continue
+    try:
+        for sub_step in range(n_sub):
+            current_n = n_cells
             
-            A_cross = Q_val / v # m2
-            if A_cross < 1e-6:
-                A_cross = 1e-6
+            # Reset active cascades back to the original filtered state each substep loop
+            for i in range(n_cells):
+                working_src_rows[i] = src_rows[i]
+                working_src_cols[i] = src_cols[i]
+                working_dst_rows[i] = dst_rows[i]
+                working_dst_cols[i] = dst_cols[i]
 
-            V_cell = A_cross * dx # m3
+            # Merge incoming transport buffers (except step 1)
+            if sub_step > 0:
+                for i in range(current_n):
+                    src_r = working_src_rows[i]
+                    src_c = working_src_cols[i]
+                    feoh3_buf[0, src_r, src_c] += feoh3_buf[1, src_r, src_c]
+                    feoh3_buf[1, src_r, src_c] = 0.0
 
-            # advection-deposition calcs
-            mol_mass_feoh3 = 106.87 
-            kg_per_mol = mol_mass_feoh3 / 1000
-            mass_precip = feoh3_buf[0, src_r, src_c] * kg_per_mol
+            # Compute transport equations over active cascade track
+            while True:
+                for i in range(current_n):
+                    src_r = working_src_rows[i]
+                    src_c = working_src_cols[i]
+                    dst_r = working_dst_rows[i]
+                    dst_c = working_dst_cols[i]
+                    
+                    Q_val = Q[src_r, src_c]
+                    if Q_val <= 0 or feoh3_buf[0, src_r, src_c] <= 1e-12:
+                        vol_valid[i] = 0
+                        continue
+                    
+                    vol_valid[i] = 1
+                    W = a * (Q_val ** b)
+                    A_cross = Q_val / v
+                    if A_cross < 1e-6: A_cross = 1e-6
+                    V_cell = A_cross * dx
 
-            A_bed = W * dx
-            aq = Q_val / V_cell
-            ap = wf * A_bed / V_cell 
-            d_Sos = (1.0 - exp(-(aq + ap) * dt_sub)) * mass_precip
+                    mass_precip = feoh3_buf[0, src_r, src_c] * kg_per_mol
+                    A_bed = W * dx
+                    aq = Q_val / V_cell
+                    ap = wf * A_bed / V_cell
+                    
+                    d_Sos = (1.0 - exp(-(aq + ap) * dt_sub)) * mass_precip
+                    Qs_mass = (aq / (aq + ap)) * d_Sos
+                    DEP_mass = (ap / (aq + ap)) * d_Sos
 
-            Qs_mass = (aq / (aq + ap)) * d_Sos # note that the paper states (aq / (aq + aq)) which is strange and resolves to 0.5 always
-            DEP_mass = (ap / (aq + ap)) * d_Sos
+                    Qs_mol = Qs_mass / kg_per_mol
+                    DEP_mol = DEP_mass / kg_per_mol
 
-            Qs_mol = Qs_mass / kg_per_mol
-            DEP_mol = DEP_mass / kg_per_mol
+                    # Mass Balance Safeguard: Prevent negative mass creation
+                    total_req = Qs_mol + DEP_mol
+                    if total_req > feoh3_buf[0, src_r, src_c]:
+                        mass_scale = feoh3_buf[0, src_r, src_c] / total_req
+                        Qs_mol *= mass_scale
+                        DEP_mol *= mass_scale
 
+                    feoh3_buf[0, src_r, src_c] = fmax(feoh3_buf[0, src_r, src_c] - Qs_mol - DEP_mol, 0.0)
+                    feoh3_buf[1, dst_r, dst_c] += Qs_mol
+                    bedload_storage[0, src_r, src_c] += DEP_mol
 
-            # Fe(OH)3 (iron (III) hydroxide)
-            feoh3_buf[0, src_r, src_c] = fmax(feoh3_buf[0, src_r, src_c] - Qs_mol - DEP_mol, 
-            0.0)
-            feoh3_buf[1, current_dst_rows[i], current_dst_cols[i]] += Qs_mol
-            bedload_storage[0, src_r, src_c] += DEP_mol
+                # Filter out invalid, dry or processed elements inside local variables
+                valid_count = 0
+                for i in range(current_n):
+                    if vol_valid[i]:
+                        working_src_rows[valid_count] = working_src_rows[i]
+                        working_src_cols[valid_count] = working_src_cols[i]
+                        working_dst_rows[valid_count] = working_dst_rows[i]
+                        working_dst_cols[valid_count] = working_dst_cols[i]
+                        valid_count += 1
+                current_n = valid_count
+                if current_n == 0:
+                    break
 
-            src_vol = Q_val * time_step_seconds * 1000.0
-            if src_vol <= 0:
-                vol_valid[i] = 0
-            else:
-                vol_valid[i] = 1
+                # Advance cascades one step downstream
+                for i in range(current_n):
+                    has_next[i] = 0
+                    dst_r = working_dst_rows[i]
+                    dst_c = working_dst_cols[i]
+                    current_id = ID_grid[dst_r, dst_c]
+                    
+                    if current_id >= 0 and current_id < id_to_outid.shape[0]:
+                        next_id = id_to_outid[current_id]
+                        if next_id >= 0 and next_id < id_to_row.shape[0]:
+                            next_r = id_to_row[next_id]
+                            next_c = id_to_col[next_id]
+                            if next_r >= 0 and next_c >= 0:
+                                working_src_rows[i] = dst_r
+                                working_src_cols[i] = dst_c
+                                working_dst_rows[i] = next_r
+                                working_dst_cols[i] = next_c
+                                has_next[i] = 1
 
-        # filter out invalid cells (zero volume, zero flow, etc.)
-        valid_count = 0
-        for i in range(current_n):
-            if vol_valid[i]:
-                src_rows[valid_count] = src_rows[i]
-                src_cols[valid_count] = src_cols[i]
-                dst_rows[valid_count] = dst_rows[i]
-                dst_cols[valid_count] = dst_cols[i]
-                valid_count += 1
-        if valid_count == 0:
-            break
-        current_n = valid_count
+                # Compress cascade stack to active advancing nodes only
+                valid_count = 0
+                for i in range(current_n):
+                    if has_next[i]:
+                        working_src_rows[valid_count] = working_src_rows[i]
+                        working_src_cols[valid_count] = working_src_cols[i]
+                        working_dst_rows[valid_count] = working_dst_rows[i]
+                        working_dst_cols[valid_count] = working_dst_cols[i]
+                        valid_count += 1
+                current_n = valid_count
+                if current_n == 0:
+                    break
 
-        # cascade to next downstream cells
-        for i in range(current_n):
-            has_next[i] = 0
-        for i in range(current_n):
-            dst_r = current_dst_rows[i]
-            dst_c = current_dst_cols[i]
-            current_id = ID_grid[dst_r, dst_c]
-            if current_id >= 0 and current_id < id_to_outid.shape[0]:
-                next_id = id_to_outid[current_id]
-                if next_id >= 0 and next_id < id_to_row.shape[0]:
-                    next_r = id_to_row[next_id]
-                    next_c = id_to_col[next_id]
-                    if next_r >= 0 and next_c >= 0:
-                        # overwrite the source arrays in‑place for next iteration
-                        current_src_rows[i] = dst_r
-                        current_src_cols[i] = dst_c
-                        current_dst_rows[i] = next_r
-                        current_dst_cols[i] = next_c
-                        has_next[i] = 1
+        # Final terminal merge loop
+        for i in range(n_cells):
+            src_r = src_rows[i]
+            src_c = src_cols[i]
+            feoh3_buf[0, src_r, src_c] += feoh3_buf[1, src_r, src_c]
+            feoh3_buf[1, src_r, src_c] = 0.0
 
-        # compress to only cells that have a valid downstream neighbour
-        valid_count = 0
-        for i in range(current_n):
-            if has_next[i]:
-                current_src_rows[valid_count] = current_src_rows[i]
-                current_src_cols[valid_count] = current_src_cols[i]
-                current_dst_rows[valid_count] = current_dst_rows[i]
-                current_dst_cols[valid_count] = current_dst_cols[i]
-                valid_count += 1
-        if valid_count == 0:
-            break
-        current_n = valid_count
-
-    # final merge of any remaining incoming material into resident buffer
-    for i in range(current_n):
-        src_r = current_src_rows[i]
-        src_c = current_src_cols[i]
-        feoh3_buf[0, src_r, src_c] += feoh3_buf[1, src_r, src_c]
-        feoh3_buf[1, src_r, src_c] = 0.0 
+    finally:
+        # 5. Clean up local C allocations to eliminate system memory leaks
+        free(working_src_rows)
+        free(working_src_cols)
+        free(working_dst_rows)
+        free(working_dst_cols)
