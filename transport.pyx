@@ -1,4 +1,4 @@
-# cython: boundscheck=True, wraparound=True, initializedcheck=False, cdivision=True
+# cython: boundscheck=False, wraparound=False, initializedcheck=False, cdivision=True
 # distutils: language=c++
 
 import numpy as np
@@ -46,8 +46,8 @@ def _transport_cn(
     I64[::1] cols,
     F64[::1] V_i_arr,
     F32[::1] v_arr,
-    F32[::1] A_arr,
-    F32[::1] D_arr,
+    F64[::1] A_arr,
+    F64[::1] D_arr,
     long max_reach_length   
     ):
     cdef:
@@ -456,3 +456,67 @@ def _transport_ad_dep(
         free(working_src_cols)
         free(working_dst_rows)
         free(working_dst_cols)
+
+def _build_junction_inflows(
+    double[:, ::1] buf,
+    F32[:, ::1] Q,
+    F32[:, ::1] Q_lat_out,
+    double[:, ::1] C_lat_out,
+    double[:, :: 1] C_lat_num,
+    I32[::1] tail_r,
+    I32[::1] tail_c,
+    I32[::1] dst_r,
+    I32[::1] dst_c,
+    Py_ssize_t n_junctions,
+    double v,
+    double dx,
+    double dt,
+    ):
+    cdef:
+        Py_ssize_t k, r, c
+        Py_ssize_t nlat = Q_lat_out.shape[0]
+        Py_ssize_t nlon = Q_lat_out.shape[1]
+        I32 tr, tc, dr, dc
+        double Q_t, moles, V_t, courant, moles_out, C_eff
+        double eps = 1e-30
+    
+    with nogil:
+
+        # set to zeros
+        for r in range(nlat):
+            for c in range(nlon):
+                Q_lat_out[r, c] = 0.0
+                C_lat_num[r, c] = 0.0
+            
+        
+        for k in range(n_junctions):
+            tr = tail_r[k]
+            tc = tail_c[k]
+            dr = dst_r[k]
+            dc = dst_c[k]
+
+            Q_t = <double>Q[tr, tc]
+            if Q_t <= 0.0:
+                continue
+            
+            # calculate moles in/out -> C(onncentration) in/out
+            moles = buf[tr, tc]
+            if moles <= 0.0:
+                continue
+
+            V_t = fmax((Q_t / v) * dx, 1.0)
+            courant = fmin(Q_t * dt / V_t, 1.0)
+            moles_out = courant * moles
+
+            C_eff = moles_out / fmax(Q_t * dt, eps)
+
+            buf[tr, tc] -= moles_out
+            Q_lat_out[dr, dc] = Q_lat_out[dr, dc] + <F32>Q_t
+            C_lat_num[dr, dc] += Q_t * C_eff
+
+        for r in range(nlat):
+            for c in range(nlon):
+                if Q_lat_out[r, c] > 0.0:
+                    C_lat_out[r, c] = C_lat_num[r, c] / <double>Q_lat_out[r, c]
+                else:
+                    C_lat_out[r, c] = 0.0

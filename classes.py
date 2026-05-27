@@ -2,7 +2,7 @@
 # contains main AMDModel class used for AMD modelling
 
 from amd_chemistry_fast import process_chemistry
-from transport import _transport_cn, _transport_ad_dep
+from transport import _transport_cn, _transport_ad_dep, _build_junction_inflows
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -22,7 +22,7 @@ class AMDModel:
     """
     def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc",
                  a = 2.71, b = 0.557, c = 0.349, f = 0.341, wf = 0.00142, alpha_s = 1e-5, A_s_ratio = 0.5,
-                    buffer_capacity = 0.1, v = 1.0):
+                    buffer_capacity = 0.0, v = 1.0):
         """class initialisation
 
         Parameters
@@ -102,7 +102,7 @@ class AMDModel:
             for var in self._transport_vars
         }
 
-        self._Q_lat_buff = np.zeros(spatial_shape, dtype = np.float64)
+        self._Q_lat_buff = np.zeros(spatial_shape, dtype = np.float32)
         self._C_lat_buff = np.zeros(spatial_shape, dtype = np.float64)
         self._C_lat_num_buff = np.zeros(spatial_shape, dtype = np.float64)
 
@@ -360,7 +360,7 @@ class AMDModel:
 
         self._time_index = {t: i for i, t in enumerate(self.dataset["time"].values)}
 
-        self._Q_np = self.dataset["Q"].values
+        self._Q_np = self.dataset["Q"].values.astype(np.float32)
 
         self._ore_np = self.dataset["ore"].values.astype(np.float32)
         self._sink_mask = self.outID_grid < 0
@@ -382,8 +382,8 @@ class AMDModel:
                 "cols": np.empty((self._max_reach_length,), dtype=np.int64),
                 "V": np.empty((self._max_reach_length,), dtype=np.float64),
                 "v": np.empty((self._max_reach_length,), dtype=np.float32),
-                "A": np.empty((self._max_reach_length,), dtype=np.float32),
-                "D": np.empty((self._max_reach_length,), dtype=np.float32)
+                "A": np.empty((self._max_reach_length,), dtype=np.float64),
+                "D": np.empty((self._max_reach_length,), dtype=np.float64)
             }
         else:
             self._cn_working_arrays = None
@@ -557,6 +557,8 @@ class AMDModel:
             reach = []
             current = int(hw)
             while current >= 0 and current not in visited:
+                if self._id_to_row[current] < 0:
+                    break
                 visited.add(current)
                 reach.append(current)
                 out = int(self._id_to_outid[current])
@@ -619,6 +621,21 @@ class AMDModel:
 
         self._max_reach_length = max(len(r) for r in self._reaches)
 
+        _valid = [j for j in self._reach_junctions if j is not None]
+
+        if _valid:
+            _arr = np.array(_valid, dtype=np.int32)  # shape (n, 4)
+            self._junc_tail_r = np.ascontiguousarray(_arr[:, 0])
+            self._junc_tail_c = np.ascontiguousarray(_arr[:, 1])
+            self._junc_dst_r  = np.ascontiguousarray(_arr[:, 2])
+            self._junc_dst_c  = np.ascontiguousarray(_arr[:, 3])
+        else:
+            self._junc_tail_r = np.empty(0, dtype=np.int32)
+            self._junc_tail_c = np.empty(0, dtype=np.int32)
+            self._junc_dst_r  = np.empty(0, dtype=np.int32)
+            self._junc_dst_c  = np.empty(0, dtype=np.int32)
+        self._n_junctions = len(_valid)
+
     def diagnose_reach_lengths(self):
         """Count and show how the reaches of the network are distributed, diagnosing tool"""
         up_count = np.zeros(len(self._id_to_row), dtype=np.int32)
@@ -650,43 +667,26 @@ class AMDModel:
             print(f"  length {length:>3}: {count:>6} reaches")
 
     def _build_junction_inflows(self, Q_2d, var):
-        """Compute Q_lat and C_lat at each confluence head from upstream reach tails.
-        Removes moles from tail cells (mass conservation).
-        Returns Q_lat [m³/s] and C_lat [mol/m³] as float32 arrays.
         """
-        self._Q_lat_buff.fill(0.0)
-        self._C_lat_buff.fill(0.0)
-        self._C_lat_num_buff.fill(0.0)
-        buf = self._buffer[var][0]
-
-        for junction in self._reach_junctions:
-            if junction is None:
-                continue
-            tail_r, tail_c, dst_r, dst_c = junction
-
-            Q_t = float(Q_2d[tail_r, tail_c])
-            if Q_t <= 0.0:
-                continue
-
-            moles = float(buf[tail_r, tail_c])
-            if moles <= 0.0:
-                continue
-            
-            V_t = max((Q_t / self.v) * self.dx, 1.0) # m³
-            courant = Q_t * self.time_step_seconds / V_t
-            moles_out = min(courant, 1.0) * moles
-
-            # effective concentration so CN injects exactly moles_out [mol/m³]
-            C_eff = moles_out / (Q_t * self.time_step_seconds)
-
-            buf[tail_r, tail_c] -= moles_out
-            self._Q_lat_buff[dst_r, dst_c] += Q_t
-            self._C_lat_num_buff[dst_r, dst_c] += Q_t * C_eff
-
-        mask = self._Q_lat_buff > 0.0
-        np.divide(self._C_lat_num_buff, self._Q_lat_buff,
-                  out = self._C_lat_buff, where = mask)
-        return self._Q_lat_buff.astype(np.float32), self._C_lat_buff.astype(np.float64)
+        Calls build_junction_inflows Cython function in transport.pyx,
+        calculates the in/outflow from junctions as lateral in/outflow
+        """
+        _build_junction_inflows(
+            self._buffer[var][0],
+            Q_2d,
+            self._Q_lat_buff,
+            self._C_lat_buff,
+            self._C_lat_num_buff,
+            self._junc_tail_r,
+            self._junc_tail_c,
+            self._junc_dst_r,
+            self._junc_dst_c,
+            self._n_junctions,
+            self.v,
+            self.dx,
+            self.time_step_seconds,
+        )
+        return self._Q_lat_buff, self._C_lat_buff
     
     def _build_network_mask(self):
         """Builds a 2d bolean mask of stream network downstream from mine cells, 
