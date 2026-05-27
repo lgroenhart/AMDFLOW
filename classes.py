@@ -102,9 +102,9 @@ class AMDModel:
             for var in self._transport_vars
         }
 
-        self._Q_lat_buff_dict = {var: np.zeros(spatial_shape, dtype = np.float32) for var in self._transport_vars}
-        self._C_lat_buff_dict = {var: np.zeros(spatial_shape, dtype = np.float64) for var in self._transport_vars}
-        self._C_lat_num_buff_dict = {var: np.zeros(spatial_shape, dtype = np.float64) for var in self._transport_vars}
+        self._Q_lat_buff = np.zeros(spatial_shape, dtype = np.float32)
+        self._C_lat_buff = np.zeros(spatial_shape, dtype = np.float64)
+        self._C_lat_num_buff = np.zeros(spatial_shape, dtype = np.float64)
 
         self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400, "hour": 3600, "minute": 60}[self.t_unit]
         
@@ -205,62 +205,62 @@ class AMDModel:
         Q_2d : np.ndarray
             2d array of flow values at timestep t, used for transport calculations
         """
-        def _run_transport_for_var(var):     
-            Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
-            
-            work_arrays = self._cn_working_arrays_dict[var]
-            if self._cn_working_arrays_dict is not None:
-                _transport_cn(
-                    self._buffer[var][0],
-                    self._sbuffer[var][0],
-                    Q_2d,
-                    Q_lat,
-                    C_lat,
-                    self._median_vol,
-                    self._reaches,
-                    self._id_to_row,      
-                    self._id_to_col,  
-                    self.dx,    
-                    self.a,
-                    self.b,
-                    self.c,
-                    self.f,
-                    self.time_step_seconds,
-                    0.5,
-                    0.5,
-                    self.alpha_s,
-                    self.A_s_ratio,
-                    self.v,
-                    1000,
-                    work_arrays["a"],
-                    work_arrays["b"],
-                    work_arrays["c"],
-                    work_arrays["d"],
-                    work_arrays["c_prime"],
-                    work_arrays["d_prime"],
-                    work_arrays["x"],
-                    work_arrays["rows"],
-                    work_arrays["cols"],
-                    work_arrays["V"],
-                    work_arrays["v"],
-                    work_arrays["A"],
-                    work_arrays["D"],
-                    self._max_reach_length
-                    )
-            else:
-                for reach in self._reaches: 
-                    hr = int(self._id_to_row[reach[0]])
-                    hc = int(self._id_to_col[reach[0]])
-                    Q_l = float(Q_lat[hr, hc])
-                    if Q_l > 0.0:
-                        m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
-                        self._buffer[var][0, hr, hc] += m_in
-
         ti = self._time_index[t]
 
-        Parallel(n_jobs=4, require = "sharedmem")(
-            delayed(_run_transport_for_var)(var) for var in self._transport_vars
-        )
+        # call Cython kernel
+        for var in self._chem_vars: 
+            if var in ["iron_III_hydroxide", "bedload_storage"]:
+                pass
+            else:
+                Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
+                
+                if self._cn_working_arrays is not None:
+                    _transport_cn(
+                        self._buffer[var][0],
+                        self._sbuffer[var][0],
+                        Q_2d,
+                        Q_lat,
+                        C_lat,
+                        self._median_vol,
+                        self._reaches,
+                        self._id_to_row,      
+                        self._id_to_col,  
+                        self.dx,    
+                        self.a,
+                        self.b,
+                        self.c,
+                        self.f,
+                        self.time_step_seconds,
+                        0.5,
+                        0.5,
+                        self.alpha_s,
+                        self.A_s_ratio,
+                        self.v,
+                        1000,
+                        self._cn_working_arrays["a"],
+                        self._cn_working_arrays["b"],
+                        self._cn_working_arrays["c"],
+                        self._cn_working_arrays["d"],
+                        self._cn_working_arrays["c_prime"],
+                        self._cn_working_arrays["d_prime"],
+                        self._cn_working_arrays["x"],
+                        self._cn_working_arrays["rows"],
+                        self._cn_working_arrays["cols"],
+                        self._cn_working_arrays["V"],
+                        self._cn_working_arrays["v"],
+                        self._cn_working_arrays["A"],
+                        self._cn_working_arrays["D"],
+                        self._max_reach_length
+                        )
+                else:
+                    for reach in self._reaches: 
+                        hr = int(self._id_to_row[reach[0]])
+                        hc = int(self._id_to_col[reach[0]])
+                        Q_l = float(Q_lat[hr, hc])
+                        if Q_l > 0.0:
+                            m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
+                            self._buffer[var][0, hr, hc] += m_in
+
 
         mask = self._buffer["iron_III_hydroxide"][0] > 0
         src_rows, src_cols = np.where(mask)
@@ -370,8 +370,7 @@ class AMDModel:
         self._off_network = ~self._network_mask
 
         if self._max_reach_length >= 1:
-            self._cn_working_arrays_dict = {
-                var: {
+            self._cn_working_arrays = {
                 "a": np.empty((self._max_reach_length,), dtype=np.float64),
                 "b": np.empty((self._max_reach_length,), dtype=np.float64),
                 "c": np.empty((self._max_reach_length,), dtype=np.float64),
@@ -385,9 +384,7 @@ class AMDModel:
                 "v": np.empty((self._max_reach_length,), dtype=np.float32),
                 "A": np.empty((self._max_reach_length,), dtype=np.float64),
                 "D": np.empty((self._max_reach_length,), dtype=np.float64)
-                } for var in self._transport_vars
             }
-
         else:
             self._cn_working_arrays = None
         
@@ -604,7 +601,7 @@ class AMDModel:
             visited_set = set(sorted_order)
             sorted_order.extend(i for i in range(n) if i not in visited_set)
 
-        self._reaches = [np.array(reaches[i], dtype = np.int64) for i in sorted_order]
+        self._reaches = [reaches[i] for i in sorted_order]
 
         # --- junction cache: one entry per reach ---
         # each entry is (tail_r, tail_c, dst_r, dst_c) or None for sinks
@@ -677,9 +674,9 @@ class AMDModel:
         _build_junction_inflows(
             self._buffer[var][0],
             Q_2d,
-            self._Q_lat_buff_dict[var],
-            self._C_lat_buff_dict[var],
-            self._C_lat_num_buff_dict[var],
+            self._Q_lat_buff,
+            self._C_lat_buff,
+            self._C_lat_num_buff,
             self._junc_tail_r,
             self._junc_tail_c,
             self._junc_dst_r,
@@ -689,7 +686,7 @@ class AMDModel:
             self.dx,
             self.time_step_seconds,
         )
-        return self._Q_lat_buff_dict[var], self._C_lat_buff_dict[var]
+        return self._Q_lat_buff, self._C_lat_buff
     
     def _build_network_mask(self):
         """Builds a 2d bolean mask of stream network downstream from mine cells, 
