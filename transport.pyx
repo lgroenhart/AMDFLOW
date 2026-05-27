@@ -51,6 +51,7 @@ def _transport_cn(
     long max_reach_length   
     ):
     cdef:
+        I64[::1] reach_ids
         I64 reach_len, i
         I64 r0, c0
         double Q_i, A_i, V_i, W_i, H_i, D_i, S_i
@@ -66,8 +67,8 @@ def _transport_cn(
         I64 n_sub
         
     for reach_ids_py in reaches:
-        reach_ids = np.asarray(reach_ids_py, dtype=np.int64)
-        reach_len = len(reach_ids)
+        reach_ids = reach_ids_py
+        reach_len = reach_ids.shape[0]
 
         if reach_len > max_reach_length:
             raise ValueError("Reach length exceeds pre-allocated workspace size")
