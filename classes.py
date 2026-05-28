@@ -7,8 +7,6 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-from joblib import Parallel, delayed
 import os
 import netCDF4
 from collections import deque
@@ -22,7 +20,7 @@ class AMDModel:
     """
     def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc",
                  a = 2.71, b = 0.557, c = 0.349, f = 0.341, wf = 0.00142, alpha_s = 1e-5, A_s_ratio = 0.5,
-                    buffer_capacity = 0.0, v = 1.0):
+                    buffer_capacity = 0.0, v = 1.0, max_substeps = 100):
         """class initialisation
 
         Parameters
@@ -55,6 +53,8 @@ class AMDModel:
             buffer capacity for pH, non-physical instrument to buffer pH, by default 0.1
         v : float, optional
             global set velocity
+        max_substeps : int, optional
+            maximum amount of substeps the transport can make, is technically a max courant number, by default 100
         """
         self.dataset = dataset.copy(deep=True)
         self.dataset["Q"] = self.dataset["Q"].fillna(0.0)
@@ -85,6 +85,7 @@ class AMDModel:
         self.output_path = output_path
         spatial_shape = (len(self.dataset.lat), len(self.dataset.lon))
         n_steps = len(self.dataset.time)
+        self.max_substeps = max_substeps
 
         self._chem_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion",
                     "sulphate", "iron_III_hydroxide", "bedload_storage"]
@@ -140,7 +141,6 @@ class AMDModel:
             
                 Q_2d = self._Q_np[ti].astype(np.float32)
                 self._chemistry(Q_2d)
-                
                 self._transport(t, Q_2d)
 
                 for var in self._chem_vars:
@@ -208,58 +208,55 @@ class AMDModel:
         ti = self._time_index[t]
 
         # call Cython kernel
-        for var in self._chem_vars: 
-            if var in ["iron_III_hydroxide", "bedload_storage"]:
-                pass
-            else:
-                Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
+        for var in self._transport_vars:
+            Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
                 
-                if self._cn_working_arrays is not None:
-                    _transport_cn(
-                        self._buffer[var][0],
-                        self._sbuffer[var][0],
-                        Q_2d,
-                        Q_lat,
-                        C_lat,
-                        self._median_vol,
-                        self._reaches,
-                        self._id_to_row,      
-                        self._id_to_col,  
-                        self.dx,    
-                        self.a,
-                        self.b,
-                        self.c,
-                        self.f,
-                        self.time_step_seconds,
-                        0.5,
-                        0.5,
-                        self.alpha_s,
-                        self.A_s_ratio,
-                        self.v,
-                        1000,
-                        self._cn_working_arrays["a"],
-                        self._cn_working_arrays["b"],
-                        self._cn_working_arrays["c"],
-                        self._cn_working_arrays["d"],
-                        self._cn_working_arrays["c_prime"],
-                        self._cn_working_arrays["d_prime"],
-                        self._cn_working_arrays["x"],
-                        self._cn_working_arrays["rows"],
-                        self._cn_working_arrays["cols"],
-                        self._cn_working_arrays["V"],
-                        self._cn_working_arrays["v"],
-                        self._cn_working_arrays["A"],
-                        self._cn_working_arrays["D"],
-                        self._max_reach_length
-                        )
-                else:
-                    for reach in self._reaches: 
-                        hr = int(self._id_to_row[reach[0]])
-                        hc = int(self._id_to_col[reach[0]])
-                        Q_l = float(Q_lat[hr, hc])
-                        if Q_l > 0.0:
-                            m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
-                            self._buffer[var][0, hr, hc] += m_in
+            if self._cn_working_arrays is not None:
+                _transport_cn(
+                    self._buffer[var][0],
+                    self._sbuffer[var][0],
+                    Q_2d,
+                    Q_lat,
+                    C_lat,
+                    self._median_vol,
+                    self._reaches,
+                    self._id_to_row,      
+                    self._id_to_col,  
+                    self.dx,    
+                    self.a,
+                    self.b,
+                    self.c,
+                    self.f,
+                    self.time_step_seconds,
+                    0.5,
+                    0.5,
+                    self.alpha_s,
+                    self.A_s_ratio,
+                    self.v,
+                    self.max_substeps,
+                    self._cn_working_arrays["a"],
+                    self._cn_working_arrays["b"],
+                    self._cn_working_arrays["c"],
+                    self._cn_working_arrays["d"],
+                    self._cn_working_arrays["c_prime"],
+                    self._cn_working_arrays["d_prime"],
+                    self._cn_working_arrays["x"],
+                    self._cn_working_arrays["rows"],
+                    self._cn_working_arrays["cols"],
+                    self._cn_working_arrays["V"],
+                    self._cn_working_arrays["v"],
+                    self._cn_working_arrays["A"],
+                    self._cn_working_arrays["D"],
+                    self._max_reach_length
+                    )
+            else:
+                for reach in self._reaches: 
+                    hr = int(self._id_to_row[reach[0]])
+                    hc = int(self._id_to_col[reach[0]])
+                    Q_l = float(Q_lat[hr, hc])
+                    if Q_l > 0.0:
+                        m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
+                        self._buffer[var][0, hr, hc] += m_in
 
 
         mask = self._buffer["iron_III_hydroxide"][0] > 0
