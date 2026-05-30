@@ -19,7 +19,6 @@ def _transport_cn(
     F32[:, ::1] Q,
     F32[:, ::1] Q_lat,
     double[:, ::1] C_lat,
-    F32[:, ::1] median_vol,
     list reaches,
     I32[:] id_to_row,
     I32[:] id_to_col,
