@@ -96,7 +96,7 @@ def valid_masking(amd):
     valid_mask = (amd["pH"].isel(time=_sample_idx).notnull().any(dim="time").compute())
     
     # Iron mask: any positive sum of iron components
-    iron_sum = (amd["ferrous_iron"] + amd["ferric_iron"] + amd["iron_III_hydroxide"])
+    iron_sum = (amd["ferrous_iron"] + amd["ferric_iron"] + amd["ferric_oxyhydroxide"])
     iron_mask = (iron_sum.isel(time=_sample_idx) > 0).any(dim="time").compute()
     
     # 2D lat/lon grids
@@ -354,8 +354,10 @@ def extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq
     print(f"  AMD variable(s): {label}")
     
     def _extract_one(var):
+        _feoh3_to_fe = {"ferric_oxyhydroxide": (55.845 / 106.87)}
+        scale = _feoh3_to_fe.get(var, 1.0)
         return (amd[var].sel(time=slice(t_start, t_end))
-                .isel(lat=ilat_da, lon=ilon_da))
+                .isel(lat=ilat_da, lon=ilon_da)) * scale
     
     if len(amd_vars) == 1:
         amd_extract = _extract_one(amd_vars[0]).compute()
@@ -490,7 +492,7 @@ if __name__ == "__main__":
     var_map = {
         "pH": "pH",
         "Fe-Dis": ["ferrous_iron", "ferric_iron"],
-        "Fe-Tot": ["ferrous_iron", "ferric_iron", "iron_III_hydroxide"],
+        "Fe-Tot": ["ferrous_iron", "ferric_iron", "ferric_oxyhydroxide"],
     }
     
     print(f"Validating AMDFLOW Case Study {case_study_nr} ({times[0]}–{times[1]}),")

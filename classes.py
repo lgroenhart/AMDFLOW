@@ -1,16 +1,15 @@
 # class py file for AMDFLOW
 # contains main AMDModel class used for AMD modelling
 
-from amd_chemistry import process_chemistry
-from transport import _transport_cn, _transport_ad_dep
+from amd_chemistry_fast import process_chemistry
+from transport import _transport_cn, _transport_ad_dep, _build_junction_inflows
 import numpy as np
 import xarray as xr
 import pandas as pd
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-from joblib import Parallel, delayed
 import os
 import netCDF4
+from collections import deque
 
 
 
@@ -21,13 +20,13 @@ class AMDModel:
     """
     def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc",
                  a = 2.71, b = 0.557, c = 0.349, f = 0.341, wf = 0.00142, alpha_s = 1e-5, A_s_ratio = 0.5,
-                 ssa = 1.0, buffer_capacity = 0.1, mannings = 0.044):
+                    buffer_capacity = 0.0, v = 1.0, max_substeps = 100):
         """class initialisation
 
         Parameters
         ----------
         dataset : xr.Dataset
-            dataset containing variables: Q (time, lat, lon), ore (lat, lon), ID (lat, lon), outID (lat, lon), source (lat, lon), slope (lat, lon)
+            dataset containing variables: Q (time, lat, lon), ore (lat, lon), ID (lat, lon), outID (lat, lon), source (lat, lon)
         t_unit : str
             time unit for the model: "month", "week", "day", "hour", or "minute", should align with timesteps of the dataset
         do : float, optional
@@ -52,8 +51,10 @@ class AMDModel:
             specific surface area of pyrite, by default 1
         buffer_capacity : float, optional
             buffer capacity for pH, non-physical instrument to buffer pH, by default 0.1
-        mannings : float, optional
-            mannings roughness coefficient for velocity from slope calculation, by default 0.044 (set for global)
+        v : float, optional
+            global set velocity
+        max_substeps : int, optional
+            maximum amount of substeps the transport can make, is technically a max courant number, by default 100
         """
         self.dataset = dataset.copy(deep=True)
         self.dataset["Q"] = self.dataset["Q"].fillna(0.0)
@@ -61,13 +62,12 @@ class AMDModel:
         self.dataset["ID"] = self.dataset["ID"].where(self.dataset["ID"] >= 0, -1)
         self.dataset["outID"] = self.dataset["outID"].where(self.dataset["outID"] >= 0, -1)
         self.dataset["source"] = self.dataset["source"].where(self.dataset["source"] == 1, 0)
-        self.dataset["slope"] = self.dataset["slope"].where(self.dataset["slope"] > 0, 0.0)
 
-        mask_source = (self.dataset["source"] == 1)
-        cond1 = ~mask_source.values
-        cond2 = (self.dataset["Q"].values > 0)
-        condition = np.logical_or(cond1, cond2)
-        self.dataset["Q"] = self.dataset["Q"].where(condition, 1e-3) # 
+        # mask_source = (self.dataset["source"] == 1)
+        # cond1 = ~mask_source.values
+        # cond2 = (self.dataset["Q"].values > 0)
+        # condition = np.logical_or(cond1, cond2)
+        # self.dataset["Q"] = self.dataset["Q"].where(condition, 1e-3) # 
         self._Q = self.dataset["Q"].copy(deep=True)
         self.dx = 1000 
         self.a = a
@@ -77,21 +77,21 @@ class AMDModel:
         self.wf = wf
         self.alpha_s = alpha_s
         self.A_s_ratio = A_s_ratio
-        self.mannings = mannings
+        self.v = v
         self.t_unit = t_unit
         self.time_steps = self.dataset["time"]
         self.do = do
-        self.ssa = ssa
         self.buffer_capacity = buffer_capacity
         self.output_path = output_path
         spatial_shape = (len(self.dataset.lat), len(self.dataset.lon))
         n_steps = len(self.dataset.time)
+        self.max_substeps = max_substeps
 
         self._chem_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion",
-                    "sulphate", "iron_III_hydroxide", "bedload_storage"]
+                    "sulphate", "ferric_oxyhydroxide", "bedload_storage"]
         
         self._transport_vars = [v for v in self._chem_vars
-                                if v not in ["iron_III_hydroxide", "bedload_storage"]]
+                                if v not in ["ferric_oxyhydroxide", "bedload_storage"]]
         
         self._buffer = {
             var: np.zeros((2, *spatial_shape), dtype = np.float64)
@@ -103,17 +103,14 @@ class AMDModel:
             for var in self._transport_vars
         }
 
+        self._Q_lat_buff = np.zeros(spatial_shape, dtype = np.float32)
+        self._C_lat_buff = np.zeros(spatial_shape, dtype = np.float64)
+        self._C_lat_num_buff = np.zeros(spatial_shape, dtype = np.float64)
+
         self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400, "hour": 3600, "minute": 60}[self.t_unit]
         
         # init the hydrogen ion at a pH of 7: 10**-7 hydrogen ions per litre at step 0
-        W = self.a * self.dataset["Q"].isel(time=0).values**self.b
-        H = self.c * self.dataset["Q"].isel(time=0).values**self.f
-        _denom = 2 * H + W
-        RH = np.where(_denom > 0, (H * W) / np.where(_denom >0, _denom, 1.0), 0.0)
-        v = self.mannings**-1 * RH**(2/3) * self.dataset["slope"].values**0.5
-        volume_0 = np.where(v > 0,
-                            (self.dataset["Q"].isel(time=0).values /
-                              np.where(v > 0, v, 1.0)) * self.dx * 1000, 0.0) # V = (Q / v) * dx = m**3, *1000 = L
+        volume_0 = (self.dataset["Q"].isel(time=0).values / self.v) * self.dx * 1000 # V = (Q / v) * dx = m**3, *1000 = L
         self._buffer["hydrogen_ion"][0] = (1e-7 * volume_0).astype(np.float64)
         self._sbuffer["hydrogen_ion"][0] = self._buffer["hydrogen_ion"][0].copy()
 
@@ -128,7 +125,7 @@ class AMDModel:
             "ferric_iron":        55.845 * 1000,
             "sulphate":           96.056 * 1000,
             "hydrogen_ion":       1.008 * 1000,
-            "iron_III_hydroxide": 55.845 * 1000,
+            "ferric_oxyhydroxide": 106.87 * 1000,
             "bedload_storage": 106.87 * 1000
         }
 
@@ -143,33 +140,33 @@ class AMDModel:
             
                 Q_2d = self._Q_np[ti].astype(np.float32)
                 self._chemistry(Q_2d)
-                
                 self._transport(t, Q_2d)
 
-                # write back to buffers
                 for var in self._chem_vars:
+                    # 1. Update main buffer
                     self._buffer[var][0] = self._buffer[var][0] + self._buffer[var][1]
                     self._buffer[var][1] = 0.0
+                    self._buffer[var][0][self._off_network] = 0.0
+                    
+                    # 2. Update storage buffer ONLY if the variable exists in it
+                    if var in self._sbuffer:
+                        self._sbuffer[var][0] = self._sbuffer[var][0] + self._sbuffer[var][1]
+                        self._sbuffer[var][1] = 0.0
+                        self._sbuffer[var][0][self._off_network] = 0.0
                 
                 self._write_timestep(ti, nc, Q_2d)
                 
     def _chemistry(self, Q_2d):
-        W = self.a * Q_2d**self.b
-        H = self.c * Q_2d**self.f
-        _denom = 2 * H + W
-        RH = np.where(_denom > 0, (H * W) / np.where(_denom > 0, _denom, 1.0), 0.0)
-        v = self.mannings**-1 * RH**(2/3) * self._S_np**0.5
-        v = np.where(v > 0, v, 1.0)
-        volume_2d = np.where(v > 0, (Q_2d / v) * self.dx * 1000, 0.0)  # litres
-        mask = (np.isfinite(volume_2d)) & (volume_2d > 0) & (Q_2d > 1e-3)
+        
+        volume_2d = (Q_2d / self.v) * self.dx * 1000  # litres
+        mask = (np.isfinite(volume_2d)) & (volume_2d > 0) & (Q_2d > 1e-6)
         rows, cols = np.where(mask)
         valid_rows = rows.astype(np.intp)
         valid_cols = cols.astype(np.intp)
         num_valid = len(valid_rows)
 
         total_h_mol = (self._buffer["hydrogen_ion"][0] + self._sbuffer["hydrogen_ion"][0])
-        total_vol = np.where(v > 0, 
-                             (Q_2d / v) * self.dx * 1000 * (1 + self.A_s_ratio), 0.0)
+        total_vol = (Q_2d / self.v) * self.dx * 1000 * (1 + self.A_s_ratio)
         safe_vol = np.where(total_vol > 0, total_vol, np.inf)
         total_h_conc = total_h_mol / safe_vol
         capped_conc = np.minimum(total_h_conc, 1e4)
@@ -178,28 +175,22 @@ class AMDModel:
         self._buffer["hydrogen_ion"][0] *= scaling
         self._sbuffer["hydrogen_ion"][0] *= scaling
 
-        for i in range(7):
-            if num_valid == 0:
-                return None
-            else:
-                process_chemistry(
-                    self._buffer["ferrous_iron"][0],
-                    self._buffer["ferric_iron"][0],
-                    self._buffer["sulphate"][0],
-                    self._buffer["hydrogen_ion"][0],
-                    self._buffer["iron_III_hydroxide"][0],
-                    self._buffer["bedload_storage"][0],
-                    self._ore_np,
-                    volume_2d,
-                    self._median_vol,
-                    self.do,
-                    self.ssa,
-                    self.buffer_capacity,
-                    self.time_step_seconds / 7,
-                    valid_rows,
-                    valid_cols,
-                    num_valid
-                )
+        process_chemistry(
+            self._buffer["ferrous_iron"][0],
+            self._buffer["ferric_iron"][0],
+            self._buffer["sulphate"][0],
+            self._buffer["hydrogen_ion"][0],
+            self._buffer["ferric_oxyhydroxide"][0],
+            self._buffer["bedload_storage"][0],
+            self._ore_np,
+            volume_2d,
+            self.do,
+            self.buffer_capacity,
+            self.time_step_seconds,
+            valid_rows,
+            valid_cols,
+            num_valid
+        )
         
     def _transport(self, t, Q_2d):
         """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
@@ -215,68 +206,64 @@ class AMDModel:
         ti = self._time_index[t]
 
         # call Cython kernel
-        for var in self._chem_vars: 
-            if var in ["iron_III_hydroxide", "bedload_storage"]:
-                pass
+        for var in self._transport_vars:
+            Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
+            # if var == "hydrogen_ion":
+            #     C_lat[C_lat < 1e-10] = 1e-4
+            if self._cn_working_arrays is not None:
+                _transport_cn(
+                    self._buffer[var][0],
+                    self._sbuffer[var][0],
+                    Q_2d,
+                    Q_lat,
+                    C_lat,
+                    self._reaches,
+                    self._id_to_row,      
+                    self._id_to_col,  
+                    self.dx,    
+                    self.a,
+                    self.b,
+                    self.c,
+                    self.f,
+                    self.time_step_seconds,
+                    0.5,
+                    0.5,
+                    self.alpha_s,
+                    self.A_s_ratio,
+                    self.v,
+                    self.max_substeps,
+                    self._cn_working_arrays["a"],
+                    self._cn_working_arrays["b"],
+                    self._cn_working_arrays["c"],
+                    self._cn_working_arrays["d"],
+                    self._cn_working_arrays["c_prime"],
+                    self._cn_working_arrays["d_prime"],
+                    self._cn_working_arrays["x"],
+                    self._cn_working_arrays["rows"],
+                    self._cn_working_arrays["cols"],
+                    self._cn_working_arrays["V"],
+                    self._cn_working_arrays["v"],
+                    self._cn_working_arrays["A"],
+                    self._cn_working_arrays["D"],
+                    self._max_reach_length
+                    )
             else:
-                Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
-                
-                if self._cn_working_arrays is not None:
-                    _transport_cn(
-                        self._buffer[var][0],
-                        self._sbuffer[var][0],
-                        Q_2d,
-                        Q_lat,
-                        C_lat,
-                        self._median_vol,
-                        self._reaches,
-                        self._id_to_row,      
-                        self._id_to_col,  
-                        self.dx,    
-                        self._S_np,
-                        self.a,
-                        self.b,
-                        self.c,
-                        self.f,
-                        self.time_step_seconds,
-                        0.5,
-                        0.5,
-                        self.alpha_s,
-                        self.A_s_ratio,
-                        self.mannings,
-                        1000,
-                        self._cn_working_arrays["a"],
-                        self._cn_working_arrays["b"],
-                        self._cn_working_arrays["c"],
-                        self._cn_working_arrays["d"],
-                        self._cn_working_arrays["c_prime"],
-                        self._cn_working_arrays["d_prime"],
-                        self._cn_working_arrays["x"],
-                        self._cn_working_arrays["rows"],
-                        self._cn_working_arrays["cols"],
-                        self._cn_working_arrays["V"],
-                        self._cn_working_arrays["v"],
-                        self._cn_working_arrays["A"],
-                        self._cn_working_arrays["D"],
-                        self._max_reach_length
-                        )
-                else:
-                    for reach in self._reaches: 
-                        hr = int(self._id_to_row[reach[0]])
-                        hc = int(self._id_to_col[reach[0]])
-                        Q_l = float(Q_lat[hr, hc])
-                        if Q_l > 0.0:
-                            m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
-                            self._buffer[var][0, hr, hc] += m_in
+                for reach in self._reaches: 
+                    hr = int(self._id_to_row[reach[0]])
+                    hc = int(self._id_to_col[reach[0]])
+                    Q_l = float(Q_lat[hr, hc])
+                    if Q_l > 0.0:
+                        m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
+                        self._buffer[var][0, hr, hc] += m_in
 
 
-        mask = self._buffer["iron_III_hydroxide"][0] > 0
+        mask = self._buffer["ferric_oxyhydroxide"][0] > 0
         src_rows, src_cols = np.where(mask)
         src_rows = src_rows.astype(np.int64)
         src_cols = src_cols.astype(np.int64)
 
         _transport_ad_dep(
-            self._buffer["iron_III_hydroxide"],
+            self._buffer["ferric_oxyhydroxide"],
             self._buffer["bedload_storage"],
             Q_2d,
             self._ID_grid,
@@ -286,14 +273,13 @@ class AMDModel:
             self._id_to_outid,
             ti,
             self.time_step_seconds,
-            self._S_np,
             self.dx,
             self.a,
             self.b,
             self.c, 
             self.f,
             self.wf,
-            self.mannings,
+            self.v,
             1000,
             len(self.dataset.lat),
             len(self.dataset.lon),
@@ -354,7 +340,7 @@ class AMDModel:
 
         self._arrays = {
             var: self._buffer[var]
-            for var in ["ferrous_iron", "ferric_iron", "sulphate", "hydrogen_ion", "iron_III_hydroxide"]
+            for var in ["ferrous_iron", "ferric_iron", "sulphate", "hydrogen_ion", "ferric_oxyhydroxide"]
         }
 
         self._var_dims = {
@@ -369,29 +355,16 @@ class AMDModel:
 
         self._time_index = {t: i for i, t in enumerate(self.dataset["time"].values)}
 
-        self._Q_np = self.dataset["Q"].values
-        self._S_np = np.abs(self.dataset["slope"].values)
-
-        # median long term volume array for protection against concentration explosions
-        median_Q = np.median(self._Q_np, axis = 0)
-        W = self.a * median_Q**self.b
-        H = self.c * median_Q**self.f
-        _denom = 2 * H + W
-        RH = np.where(_denom > 0,
-                       (H * W) / 
-                       np.where(_denom > 0, _denom, 1.0), 0.0)
-        v = self.mannings**-1 * RH**(2/3) * self._S_np**0.5
-        median_vol = np.where(v > 0, 
-                              (median_Q / 
-                               np.where(v > 0, v, 1.0))  * self.dx * 1000, 0.0)
-        self._median_vol = np.maximum(median_vol, 1.0).astype(np.float32)
+        self._Q_np = self.dataset["Q"].values.astype(np.float32)
 
         self._ore_np = self.dataset["ore"].values.astype(np.float32)
         self._sink_mask = self.outID_grid < 0
         
         self._build_reaches()
+        self._build_network_mask()
+        self._off_network = ~self._network_mask
 
-        if self._max_reach_length >= 2:
+        if self._max_reach_length >= 1:
             self._cn_working_arrays = {
                 "a": np.empty((self._max_reach_length,), dtype=np.float64),
                 "b": np.empty((self._max_reach_length,), dtype=np.float64),
@@ -404,8 +377,8 @@ class AMDModel:
                 "cols": np.empty((self._max_reach_length,), dtype=np.int64),
                 "V": np.empty((self._max_reach_length,), dtype=np.float64),
                 "v": np.empty((self._max_reach_length,), dtype=np.float32),
-                "A": np.empty((self._max_reach_length,), dtype=np.float32),
-                "D": np.empty((self._max_reach_length,), dtype=np.float32)
+                "A": np.empty((self._max_reach_length,), dtype=np.float64),
+                "D": np.empty((self._max_reach_length,), dtype=np.float64)
             }
         else:
             self._cn_working_arrays = None
@@ -474,8 +447,8 @@ class AMDModel:
                 "ferric_iron": ("µg/L", "Fe³⁺"),
                 "sulphate": ("µg/L", "SO₄²⁻"),
                 "hydrogen_ion": ("µg/L", "H⁺"),
-                "iron_III_hydroxide": ("µg/L", "Fe in Fe(OH)₃ (suspended)"),
-                "bedload_storage": ("mol total", "Fe(OH)₃ deposited on riverbed")
+                "ferric_oxyhydroxide": ("µg/L", "Fe(OH)₃ (suspended)"),
+                "bedload_storage": ("µg/L", "Fe(OH)₃ (deposited)")
                 }
 
 
@@ -492,7 +465,7 @@ class AMDModel:
                 v.units = attrs[var][0]
                 if var == "bedload_storage": 
                     v.description = attrs[var][1]
-                elif var == "iron_III_hydroxide":
+                elif var == "ferric_oxyhydroxide":
                     v.description = f"{attrs[var][1]} - suspended concentration at timestep in main channel"
                 else:
                     v.description = f"{attrs[var][1]} - instant concentration at timestep in both storage zone and main channel (sum)" 
@@ -516,12 +489,7 @@ class AMDModel:
         nc : netCDF4.Dataset()
             the open netCDF dataset to write to, created in _create_output_file
         """
-        W = self.a * Q_2d**self.b
-        H = self.c * Q_2d**self.f
-        _denom = 2 * H + W
-        RH = np.where(_denom > 0, (H * W) / np.where(_denom > 0, _denom, 1.0), 0.0)
-        v = self.mannings**-1 * RH**(2/3) * self._S_np**0.5
-        A_vals = np.where(v > 0, Q_2d / np.where(v > 0, v, 1.0), 1e-6)
+        A_vals = (Q_2d / self.v)
         A_vals = np.maximum(A_vals, 1e-6)  # m²
         V_cell = A_vals * self.dx # m³
         step_vol = V_cell * 1000 # litres, main storage volume
@@ -538,34 +506,34 @@ class AMDModel:
                     self._sbuffer[var][0][mask] = 0
                 
                 if var == "bedload_storage":
-                    nc.variables[var][ti, :, :] = (self._buffer[var][0] + self._buffer[var][1])
-                elif var == "iron_III_hydroxide":
+                    mol_amount = (self._buffer[var][0] + self._buffer[var][1])
+                    concentration_molar   = mol_amount / step_vol # mol/L (main channel volume)
+                    concentration_mg_per_L = concentration_molar * self.molar_masses[var] # mg/L
+                    concentration_ug_per_L = concentration_mg_per_L * 1000 # µg/L 
+                    nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
+                elif var == "ferric_oxyhydroxide":
                     # output concentration in main channel, as precip is split into bedload storage and suspended
                     mol_amount = (self._buffer[var][0] + self._buffer[var][1])
-                    concentration_molar = mol_amount / step_vol #+ storage_V)  # moles per litre
-                    concentration_mg_per_L = concentration_molar * self.molar_masses[var]  # mg/L
-                    concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
+                    concentration_molar = mol_amount / step_vol #+ storage_V) # moles per litre
+                    concentration_mg_per_L = concentration_molar * self.molar_masses[var] # mg/L
+                    concentration_ug_per_L = concentration_mg_per_L * 1000 # µg/L
 
                     nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
                 else:
                     # output concentration of total chem (storage + main channel) of dissolved chems
                     mol_amount = (self._buffer[var][0] + self._buffer[var][1] + self._sbuffer[var][0] + self._sbuffer[var][1])
-                    concentration_molar = mol_amount / (step_vol + storage_V)  # moles per litre
-                    concentration_mg_per_L = concentration_molar * self.molar_masses[var]  # mg/L
-                    concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
+                    concentration_molar = mol_amount / (step_vol + storage_V) # moles per litre
+                    concentration_mg_per_L = concentration_molar * self.molar_masses[var] # mg/L
+                    concentration_ug_per_L = concentration_mg_per_L * 1000 # µg/L
                     nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
 
             h_mol = self._buffer["hydrogen_ion"][0] + self._buffer["hydrogen_ion"][1] + self._sbuffer["hydrogen_ion"][0] + self._sbuffer["hydrogen_ion"][1]
-            h_conc = h_mol / (step_vol + storage_V)  # mol/L
+            h_conc = h_mol / (step_vol + storage_V) # mol/L
             ph = np.where(h_conc > 0, -np.log10(np.maximum(h_conc, 1e-14)), np.nan)
             nc.variables["pH"][ti, :, :] = ph.astype(np.float32)
 
     def _get_volume(self, ti):
-        W = self.a * self._Q_np[ti]**self.b
-        H = self.c * self._Q_np[ti]**self.f
-        RH = (W * H) / (H * 2 + W)
-        v = self.mannings**-1 * RH**(2/3) * self._S_np**0.5
-        return (self._Q_np[ti] / v) * self.dx * 1000
+        return (self._Q_np[ti] / self.v) * self.dx * 1000
     
     def _build_reaches(self):
         """Builds reaches and junction network for transport,
@@ -588,6 +556,8 @@ class AMDModel:
             reach = []
             current = int(hw)
             while current >= 0 and current not in visited:
+                if self._id_to_row[current] < 0:
+                    break
                 visited.add(current)
                 reach.append(current)
                 out = int(self._id_to_outid[current])
@@ -650,6 +620,21 @@ class AMDModel:
 
         self._max_reach_length = max(len(r) for r in self._reaches)
 
+        _valid = [j for j in self._reach_junctions if j is not None]
+
+        if _valid:
+            _arr = np.array(_valid, dtype=np.int32)  # shape (n, 4)
+            self._junc_tail_r = np.ascontiguousarray(_arr[:, 0])
+            self._junc_tail_c = np.ascontiguousarray(_arr[:, 1])
+            self._junc_dst_r  = np.ascontiguousarray(_arr[:, 2])
+            self._junc_dst_c  = np.ascontiguousarray(_arr[:, 3])
+        else:
+            self._junc_tail_r = np.empty(0, dtype=np.int32)
+            self._junc_tail_c = np.empty(0, dtype=np.int32)
+            self._junc_dst_r  = np.empty(0, dtype=np.int32)
+            self._junc_dst_c  = np.empty(0, dtype=np.int32)
+        self._n_junctions = len(_valid)
+
     def diagnose_reach_lengths(self):
         """Count and show how the reaches of the network are distributed, diagnosing tool"""
         up_count = np.zeros(len(self._id_to_row), dtype=np.int32)
@@ -681,46 +666,60 @@ class AMDModel:
             print(f"  length {length:>3}: {count:>6} reaches")
 
     def _build_junction_inflows(self, Q_2d, var):
-        """Compute Q_lat and C_lat at each confluence head from upstream reach tails.
-        Removes moles from tail cells (mass conservation).
-        Returns Q_lat [m³/s] and C_lat [mol/m³] as float32 arrays.
         """
-        Q_lat     = np.zeros_like(Q_2d, dtype=np.float64)
-        C_lat_num = np.zeros_like(Q_2d, dtype=np.float64)  # flow-weighted numerator [mol/s]
-        buf = self._buffer[var][0]
-
-        for junction in self._reach_junctions:
-            if junction is None:
-                continue
-            tail_r, tail_c, dst_r, dst_c = junction
-
-            Q_t = float(Q_2d[tail_r, tail_c])
-            if Q_t <= 0.0:
-                continue
-
-            moles = float(buf[tail_r, tail_c])
-            if moles <= 0.0:
-                continue
-            W = self.a * Q_t**self.b
-            H = self.c * Q_t**self.f
-            _denom = 2 * H + W
-            RH = (W * H) / _denom if _denom > 0 else 0.0
-            v = self.mannings**-1 * RH**(2/3) * self._S_np[tail_r, tail_c]**0.5
-            if v <= 0:
-                continue
-            V_t = max((Q_t / v) * self.dx, 
-                      float(self._median_vol[tail_r, tail_c]) / 1000) # m³
-            courant = Q_t * self.time_step_seconds / V_t
-            moles_out = min(courant, 1.0) * moles
-
-            # effective concentration so CN injects exactly moles_out [mol/m³]
-            C_eff = moles_out / (Q_t * self.time_step_seconds)
-
-            buf[tail_r, tail_c] -= moles_out
-            Q_lat[dst_r, dst_c] += Q_t
-            C_lat_num[dst_r, dst_c] += Q_t * C_eff
-
-        mask = Q_lat > 0.0
-        C_lat = np.divide(C_lat_num, Q_lat, out=np.full_like(C_lat_num, 0.0), where=mask)
-        return Q_lat.astype(np.float32), C_lat.astype(np.float64)
+        Calls build_junction_inflows Cython function in transport.pyx,
+        calculates the in/outflow from junctions as lateral in/outflow
+        """
+        _build_junction_inflows(
+            self._buffer[var][0],
+            Q_2d,
+            self._Q_lat_buff,
+            self._C_lat_buff,
+            self._C_lat_num_buff,
+            self._junc_tail_r,
+            self._junc_tail_c,
+            self._junc_dst_r,
+            self._junc_dst_c,
+            self._n_junctions,
+            self.v,
+            self.dx,
+            self.time_step_seconds,
+        )
+        return self._Q_lat_buff, self._C_lat_buff
     
+    def _build_network_mask(self):
+        """Builds a 2d bolean mask of stream network downstream from mine cells, 
+            used to set all buffers of cells outside the mask to 0
+            stored as self._network_mask,
+        """
+        shape = (len(self.dataset.lat), len(self.dataset.lon))
+        network_mask = np.zeros(shape, dtype = bool)
+
+        source_rows, source_cols = np.where(self.dataset["ore"] > 0)
+        queue = deque()
+        visited = set()
+
+        for r, c in zip(source_rows, source_cols):
+            cell_id = int(self._ID_grid[r, c])
+            if cell_id >= 0 and cell_id not in visited:
+                visited.add(cell_id)
+                network_mask[r, c] = True
+                queue.append(cell_id)
+        
+        while queue:
+            current_id = queue.popleft()
+            out_id = int(self._id_to_outid[current_id])
+            if out_id < 0 or out_id in visited:
+                continue
+            r = int(self._id_to_row[out_id])
+            c = int(self._id_to_col[out_id])
+            if r < 0 or c < 0:
+                continue
+            visited.add(out_id)
+            network_mask[r, c] = True
+            queue.append(out_id)
+        
+        self._network_mask = network_mask
+        n_network = network_mask.sum()
+        n_total = network_mask.size
+        print(f"Network mask built: {n_network:,} / {n_total:,} cells on AMD network")

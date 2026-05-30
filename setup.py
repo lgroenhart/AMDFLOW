@@ -5,34 +5,13 @@ from setuptools import setup, Extension
 from Cython.Build import cythonize
 import numpy as np
 
-ext = Extension(
-    name = "amd_chemistry",
-    sources = ["amd_chemistry.pyx"],
-    include_dirs = [np.get_include()],
-    extra_compile_args = ["/O2", "/arch:AVX2", "/fp:fast"]
-)
-
 ext_transport = Extension(
     name = "transport",
     sources = ["transport.pyx"],
     include_dirs = [np.get_include()],
-    extra_compile_args = ["/O2", "/arch:AVX2", "/fp:fast", "/wd4244", "/wd4551", "/wd4700"]
+    extra_compile_args = ["/O2", "/fp:fast", "/openmp", "/wd4551"]
 )
 
-setup(
-    name = "amd_chemistry",
-    ext_modules = cythonize(
-        [ext],
-        compiler_directives = {
-            "language_level": "3",
-            "boundscheck": False,
-            "wraparound": False,
-            "cdivision": True,
-            "nonecheck": False,
-        },
-        annotate = True,
-    ),
-)
 
 setup(
     name = "transport",
@@ -40,5 +19,28 @@ setup(
         [ext_transport],
         compiler_directives = {"language_level": "3"},
         annotate = True
+    ),
+)
+
+ext = Extension(
+    name="amd_chemistry_fast",
+    sources=["amd_chemistry_fast.pyx"],
+    include_dirs=[np.get_include()],
+    extra_compile_args=["/O2", "/openmp", "/fp:fast"],
+    extra_link_args=["-fopenmp"],
+)
+ 
+setup(
+    name="amd_chemistry_fast",
+    ext_modules=cythonize(
+        [ext],
+        compiler_directives={
+            "boundscheck":  False,
+            "wraparound":   False,
+            "cdivision":    True,
+            "nonecheck":    False,
+            "language_level": "3",
+        },
+        annotate=True,          
     ),
 )
