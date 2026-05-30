@@ -1,7 +1,7 @@
 # class py file for AMDFLOW
 # contains main AMDModel class used for AMD modelling
 
-from amd_chemistry_fast import process_chemistry
+from chemistry import process_chemistry
 from transport import _transport_cn, _transport_ad_dep, _build_junction_inflows
 import numpy as np
 import xarray as xr
