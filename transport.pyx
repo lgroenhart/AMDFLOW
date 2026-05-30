@@ -23,6 +23,7 @@ def _transport_cn(
     I32[:] id_to_row,
     I32[:] id_to_col,
     double dx,
+    F32[:, ::1] S,
     double a, 
     double b,
     double c,
@@ -32,7 +33,7 @@ def _transport_cn(
     double theta,
     double alpha_s,
     double A_s_ratio,
-    double v,
+    double mannings,
     int max_substeps,
     F64[::1] a_arr,        
     F64[::1] b_arr,
@@ -83,22 +84,25 @@ def _transport_cn(
             r0 = rows[i]
             c0 = cols[i]
             Q_i = fmax(Q[r0, c0], eps)
-            A_i = fmax(Q_i / v, 1e-6)
-            A_arr[i] = A_i
+            S_i = fmax(S[r0, c0], 0.0)
             W_i = a * (Q_i ** b)
             H_i = c * (Q_i ** f)
             RH = (H_i * W_i) / (2.0 * H_i + W_i + eps)
+            v_i = mannings**-1 * RH**(2.0/3.0) * sqrt(S_i)
+            v_arr[i] = v_i
+            A_i = fmax(Q_i / v_i, 1e-6)
+            A_arr[i] = A_i
             V_i = A_i * dx
             V_i_arr[i] = V_i
-            C_cour = v * dt / dx
+            C_cour = v_i * dt / dx
             if C_cour > max_C:
                 max_C = C_cour
-            Re = (rho * v * 4.0 * RH) / mu
+            Re = (rho * v_i * 4.0 * RH) / mu
             f_fric = 64.0 / (Re + eps)
-            tau = (f_fric / 8.0) * rho * v * v
+            tau = (f_fric / 8.0) * rho * v_i * v_i
             u_star = sqrt(fmax(tau / rho, eps))
             D_i = 5.4 * ((W_i / (H_i + eps)) ** 0.7) * \
-                ((v / (u_star + eps)) ** 0.13) * H_i * v
+                ((v_i / (u_star + eps)) ** 0.13) * H_i * v_i
             D_arr[i] = D_i
 
         n_sub = <I64>ceil(max_C)
@@ -125,10 +129,11 @@ def _transport_cn(
                 A_i = A_arr[i]
                 V_i = V_i_arr[i]
                 D_i = D_arr[i]
+                v_i = v_arr[i]
 
                 
                 r = D_i * dt_sub / (dx * dx)
-                s_adv = v * dt_sub / dx          
+                s_adv = v_i * dt_sub / dx          
                 q_lin_i = fmax(Q_lat[r0, c0], 0.0)
                 p = q_lin_i * dt_sub / (V_i + eps)
 
@@ -140,12 +145,12 @@ def _transport_cn(
                     C_im1 = bc_top
                 else:
                     C_im1 = conc[rows[i - 1], cols[i - 1]] / \
-                        fmax(fmax(Q[rows[i - 1], cols[i - 1]], eps) / v * dx, eps)
+                        fmax(fmax(Q[rows[i - 1], cols[i - 1]], eps) / v_i* dx, eps)
 
                 # downstream concentration
                 if i < reach_len - 1:
                     C_ip1 = conc[rows[i + 1], cols[i + 1]] / \
-                        fmax(fmax(Q[rows[i + 1], cols[i + 1]], eps) / v * dx, eps)
+                        fmax(fmax(Q[rows[i + 1], cols[i + 1]], eps) / v_i * dx, eps)
                 else:
                     C_ip1 = C_i
 
@@ -236,13 +241,14 @@ def _transport_ad_dep(
     I32[:] id_to_outid,
     long time_idx,
     double time_step_seconds,
+    F32[:, ::1] S,
     double dx,
     double a,
     double b,
     double c,
     double f,
     double wf,
-    double v,
+    double mannings,
     int max_substeps,
     long nlat,
     long nlon,
@@ -307,6 +313,11 @@ def _transport_ad_dep(
         src_r = src_rows[i]
         src_c = src_cols[i]
         Q_val = Q[src_r, src_c]
+        S_val = S[src_r, src_c]
+        W = a * Q_val**b
+        H = c * Q_val**f
+        RH = (H * W) / (2 * H + W)
+        v = mannings ** -1 * RH ** (2.0/3.0) * sqrt(S_val)
         if Q_val > 0:
             A_cross = Q_val / v
             if A_cross < 1e-6:
@@ -364,12 +375,16 @@ def _transport_ad_dep(
                     dst_c = working_dst_cols[i]
                     
                     Q_val = Q[src_r, src_c]
+                    S_val = S[src_r, src_c]
                     if Q_val <= 0 or feoh3_buf[0, src_r, src_c] <= 1e-12:
                         vol_valid[i] = 0
                         continue
                     
                     vol_valid[i] = 1
                     W = a * (Q_val ** b)
+                    H = c * Q_val ** f
+                    RH = (H * W) / (2 * H + W)
+                    v = mannings**-1 * RH**(2.0/3.0) * sqrt(S_val)
                     A_cross = Q_val / v
                     if A_cross < 1e-6: A_cross = 1e-6
                     V_cell = A_cross * dx
@@ -467,25 +482,30 @@ def _build_junction_inflows(
     I32[::1] dst_r,
     I32[::1] dst_c,
     Py_ssize_t n_junctions,
-    double v,
+    double mannings,
+    F32[:, ::1] S,
     double dx,
     double dt,
+    double a,
+    double b,
+    double c,
+    double f
     ):
     cdef:
-        Py_ssize_t k, r, c
+        Py_ssize_t k, r, co
         Py_ssize_t nlat = Q_lat_out.shape[0]
         Py_ssize_t nlon = Q_lat_out.shape[1]
         I32 tr, tc, dr, dc
-        double Q_t, moles, V_t, courant, moles_out, C_eff
+        double Q_t, S_t, moles, V_t, courant, moles_out, C_eff, W, H, RH, v
         double eps = 1e-30
     
     with nogil:
 
         # set to zeros
         for r in range(nlat):
-            for c in range(nlon):
-                Q_lat_out[r, c] = 0.0
-                C_lat_num[r, c] = 0.0
+            for co in range(nlon):
+                Q_lat_out[r, co] = 0.0
+                C_lat_num[r, co] = 0.0
             
         
         for k in range(n_junctions):
@@ -495,6 +515,7 @@ def _build_junction_inflows(
             dc = dst_c[k]
 
             Q_t = <double>Q[tr, tc]
+            S_t = S[tc, tc]
             if Q_t <= 0.0:
                 continue
             
@@ -502,7 +523,11 @@ def _build_junction_inflows(
             moles = buf[tr, tc]
             if moles <= 0.0:
                 continue
-
+            
+            W = a * Q_t ** b
+            H = c * Q_t ** f
+            RH = (H * W) / (2 * H + W)
+            v = mannings**-1 * RH**(2.0/3.0) * (S_t)**0.5
             V_t = fmax((Q_t / v) * dx, 1.0)
             courant = fmin(Q_t * dt / V_t, 1.0)
             moles_out = courant * moles
@@ -514,8 +539,8 @@ def _build_junction_inflows(
             C_lat_num[dr, dc] += Q_t * C_eff
 
         for r in range(nlat):
-            for c in range(nlon):
-                if Q_lat_out[r, c] > 0.0:
-                    C_lat_out[r, c] = C_lat_num[r, c] / <double>Q_lat_out[r, c]
+            for co in range(nlon):
+                if Q_lat_out[r, co] > 0.0:
+                    C_lat_out[r, co] = C_lat_num[r, co] / <double>Q_lat_out[r, co]
                 else:
-                    C_lat_out[r, c] = 0.0
+                    C_lat_out[r, co] = 0.0
