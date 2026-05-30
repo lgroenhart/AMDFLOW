@@ -88,10 +88,10 @@ class AMDModel:
         self.max_substeps = max_substeps
 
         self._chem_vars = ["ferrous_iron", "ferric_iron", "hydrogen_ion",
-                    "sulphate", "iron_III_hydroxide", "bedload_storage"]
+                    "sulphate", "ferric_oxyhydroxide", "bedload_storage"]
         
         self._transport_vars = [v for v in self._chem_vars
-                                if v not in ["iron_III_hydroxide", "bedload_storage"]]
+                                if v not in ["ferric_oxyhydroxide", "bedload_storage"]]
         
         self._buffer = {
             var: np.zeros((2, *spatial_shape), dtype = np.float64)
@@ -115,7 +115,6 @@ class AMDModel:
         self._sbuffer["hydrogen_ion"][0] = self._buffer["hydrogen_ion"][0].copy()
 
         self._Q_dataset = self.dataset["Q"]
-        self._median_vol = np.full(spatial_shape, 1000.0, dtype = np.float32)
 
         self._create_output_file(n_steps, spatial_shape)
         
@@ -126,7 +125,7 @@ class AMDModel:
             "ferric_iron":        55.845 * 1000,
             "sulphate":           96.056 * 1000,
             "hydrogen_ion":       1.008 * 1000,
-            "iron_III_hydroxide": 55.845 * 1000,
+            "ferric_oxyhydroxide": 106.87 * 1000,
             "bedload_storage": 106.87 * 1000
         }
 
@@ -181,11 +180,10 @@ class AMDModel:
             self._buffer["ferric_iron"][0],
             self._buffer["sulphate"][0],
             self._buffer["hydrogen_ion"][0],
-            self._buffer["iron_III_hydroxide"][0],
+            self._buffer["ferric_oxyhydroxide"][0],
             self._buffer["bedload_storage"][0],
             self._ore_np,
             volume_2d,
-            self._median_vol,
             self.do,
             self.buffer_capacity,
             self.time_step_seconds,
@@ -210,7 +208,8 @@ class AMDModel:
         # call Cython kernel
         for var in self._transport_vars:
             Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
-                
+            # if var == "hydrogen_ion":
+            #     C_lat[C_lat < 1e-10] = 1e-4
             if self._cn_working_arrays is not None:
                 _transport_cn(
                     self._buffer[var][0],
@@ -218,7 +217,6 @@ class AMDModel:
                     Q_2d,
                     Q_lat,
                     C_lat,
-                    self._median_vol,
                     self._reaches,
                     self._id_to_row,      
                     self._id_to_col,  
@@ -259,13 +257,13 @@ class AMDModel:
                         self._buffer[var][0, hr, hc] += m_in
 
 
-        mask = self._buffer["iron_III_hydroxide"][0] > 0
+        mask = self._buffer["ferric_oxyhydroxide"][0] > 0
         src_rows, src_cols = np.where(mask)
         src_rows = src_rows.astype(np.int64)
         src_cols = src_cols.astype(np.int64)
 
         _transport_ad_dep(
-            self._buffer["iron_III_hydroxide"],
+            self._buffer["ferric_oxyhydroxide"],
             self._buffer["bedload_storage"],
             Q_2d,
             self._ID_grid,
@@ -342,7 +340,7 @@ class AMDModel:
 
         self._arrays = {
             var: self._buffer[var]
-            for var in ["ferrous_iron", "ferric_iron", "sulphate", "hydrogen_ion", "iron_III_hydroxide"]
+            for var in ["ferrous_iron", "ferric_iron", "sulphate", "hydrogen_ion", "ferric_oxyhydroxide"]
         }
 
         self._var_dims = {
@@ -449,8 +447,8 @@ class AMDModel:
                 "ferric_iron": ("µg/L", "Fe³⁺"),
                 "sulphate": ("µg/L", "SO₄²⁻"),
                 "hydrogen_ion": ("µg/L", "H⁺"),
-                "iron_III_hydroxide": ("µg/L", "Fe in Fe(OH)₃ (suspended)"),
-                "bedload_storage": ("mol total", "Fe(OH)₃ deposited on riverbed")
+                "ferric_oxyhydroxide": ("µg/L", "Fe(OH)₃ (suspended)"),
+                "bedload_storage": ("µg/L", "Fe(OH)₃ (deposited)")
                 }
 
 
@@ -467,7 +465,7 @@ class AMDModel:
                 v.units = attrs[var][0]
                 if var == "bedload_storage": 
                     v.description = attrs[var][1]
-                elif var == "iron_III_hydroxide":
+                elif var == "ferric_oxyhydroxide":
                     v.description = f"{attrs[var][1]} - suspended concentration at timestep in main channel"
                 else:
                     v.description = f"{attrs[var][1]} - instant concentration at timestep in both storage zone and main channel (sum)" 
@@ -508,25 +506,29 @@ class AMDModel:
                     self._sbuffer[var][0][mask] = 0
                 
                 if var == "bedload_storage":
-                    nc.variables[var][ti, :, :] = (self._buffer[var][0] + self._buffer[var][1])
-                elif var == "iron_III_hydroxide":
+                    mol_amount = (self._buffer[var][0] + self._buffer[var][1])
+                    concentration_molar   = mol_amount / step_vol # mol/L (main channel volume)
+                    concentration_mg_per_L = concentration_molar * self.molar_masses[var] # mg/L
+                    concentration_ug_per_L = concentration_mg_per_L * 1000 # µg/L 
+                    nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
+                elif var == "ferric_oxyhydroxide":
                     # output concentration in main channel, as precip is split into bedload storage and suspended
                     mol_amount = (self._buffer[var][0] + self._buffer[var][1])
-                    concentration_molar = mol_amount / step_vol #+ storage_V)  # moles per litre
-                    concentration_mg_per_L = concentration_molar * self.molar_masses[var]  # mg/L
-                    concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
+                    concentration_molar = mol_amount / step_vol #+ storage_V) # moles per litre
+                    concentration_mg_per_L = concentration_molar * self.molar_masses[var] # mg/L
+                    concentration_ug_per_L = concentration_mg_per_L * 1000 # µg/L
 
                     nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
                 else:
                     # output concentration of total chem (storage + main channel) of dissolved chems
                     mol_amount = (self._buffer[var][0] + self._buffer[var][1] + self._sbuffer[var][0] + self._sbuffer[var][1])
-                    concentration_molar = mol_amount / (step_vol + storage_V)  # moles per litre
-                    concentration_mg_per_L = concentration_molar * self.molar_masses[var]  # mg/L
-                    concentration_ug_per_L = concentration_mg_per_L * 1000  # µg/L
+                    concentration_molar = mol_amount / (step_vol + storage_V) # moles per litre
+                    concentration_mg_per_L = concentration_molar * self.molar_masses[var] # mg/L
+                    concentration_ug_per_L = concentration_mg_per_L * 1000 # µg/L
                     nc.variables[var][ti, :, :] = concentration_ug_per_L.astype(np.float32)
 
             h_mol = self._buffer["hydrogen_ion"][0] + self._buffer["hydrogen_ion"][1] + self._sbuffer["hydrogen_ion"][0] + self._sbuffer["hydrogen_ion"][1]
-            h_conc = h_mol / (step_vol + storage_V)  # mol/L
+            h_conc = h_mol / (step_vol + storage_V) # mol/L
             ph = np.where(h_conc > 0, -np.log10(np.maximum(h_conc, 1e-14)), np.nan)
             nc.variables["pH"][ti, :, :] = ph.astype(np.float32)
 
