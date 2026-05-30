@@ -23,15 +23,15 @@ setup(
 )
 
 ext = Extension(
-    name="amd_chemistry_fast",
-    sources=["amd_chemistry_fast.pyx"],
+    name="chemistry",
+    sources=["chemistry.pyx"],
     include_dirs=[np.get_include()],
     extra_compile_args=["/O2", "/openmp", "/fp:fast"],
     extra_link_args=["-fopenmp"],
 )
  
 setup(
-    name="amd_chemistry_fast",
+    name="chemistry",
     ext_modules=cythonize(
         [ext],
         compiler_directives={
