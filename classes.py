@@ -2,7 +2,7 @@
 # contains main AMDModel class used for AMD modelling
 
 from chemistry import process_chemistry
-from transport import _transport_cn, _transport_ad_dep, _build_junction_inflows
+from transport import _transport, _build_junction_inflows
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -100,7 +100,7 @@ class AMDModel:
 
         self._sbuffer = {
             var: np.zeros((2, *spatial_shape), dtype = np.float64)
-            for var in self._transport_vars
+            for var in self._chem_vars
         }
 
         self._Q_lat_buff = np.zeros(spatial_shape, dtype = np.float32)
@@ -202,12 +202,31 @@ class AMDModel:
             self.time_step_seconds,
             valid_rows,
             valid_cols,
-            num_valid
+            num_valid,
+            self.max_substeps
+        )
+
+        process_chemistry(
+            self._sbuffer["ferrous_iron"][0],
+            self._sbuffer["ferric_iron"][0],
+            self._sbuffer["sulphate"][0],
+            self._sbuffer["hydrogen_ion"][0],
+            self._sbuffer["ferric_oxyhydroxide"][0],
+            self._sbuffer["bedload_storage"][0],
+            self._ore_np,
+            volume_2d * self.A_s_ratio,
+            self.do,
+            self.buffer_capacity,
+            self.time_step_seconds,
+            valid_rows,
+            valid_cols,
+            num_valid,
+            self.max_substeps
         )
         
     def _transport(self, t, Q_2d):
         """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
-            uses transport_cython from transport.pyx 
+            uses _transport, _build_junction_inflows from transport.pyx 
 
         Parameters
         ----------
@@ -217,35 +236,66 @@ class AMDModel:
             2d array of flow values at timestep t, used for transport calculations
         """
         ti = self._time_index[t]
+        Q_lat, C_lat_fe2 = self._build_junction_inflows(Q_2d, "ferrous_iron")
+        C_lat_fe2 = C_lat_fe2.copy()
 
-        # call Cython kernel
-        for var in self._transport_vars:
-            Q_lat, C_lat = self._build_junction_inflows(Q_2d, var)
-            # if var == "hydrogen_ion":
-            #     C_lat[C_lat < 1e-10] = 1e-4
-            if self._cn_working_arrays is not None:
-                _transport_cn(
-                    self._buffer[var][0],
-                    self._sbuffer[var][0],
+        _, C_lat_fe3 = self._build_junction_inflows(Q_2d, "ferric_iron")
+        C_lat_fe3 = C_lat_fe3.copy()
+
+        _, C_lat_h = self._build_junction_inflows(Q_2d, "hydrogen_ion")
+        C_lat_h = C_lat_h.copy()
+
+        _, C_lat_so4 = self._build_junction_inflows(Q_2d, "sulphate")
+        C_lat_so4 = C_lat_so4.copy()
+
+        _, C_lat_precip = self._build_junction_inflows(Q_2d, "ferric_oxyhydroxide")
+        C_lat_precip = C_lat_precip.copy()
+        
+        _transport(
+                    # main channel
+                    self._buffer["ferrous_iron"][0],
+                    self._buffer["ferric_iron"][0],
+                    self._buffer["hydrogen_ion"][0],
+                    self._buffer["sulphate"][0],
+                    self._buffer["ferric_oxyhydroxide"][0],      
+                    
+                    # storage zone
+                    self._sbuffer["ferrous_iron"][0],
+                    self._sbuffer["ferric_iron"][0],
+                    self._sbuffer["hydrogen_ion"][0],
+                    self._sbuffer["sulphate"][0],
+                    
+                    # bedload Storage
+                    self._buffer["bedload_storage"][0],
+                    
+                    # hydrology /lateral inflow
                     Q_2d,
-                    Q_lat,
-                    C_lat,
+                    Q_lat, Q_lat, Q_lat, Q_lat, Q_lat,  
+                    
+                    # lateral inflow concentrations
+                    C_lat_fe2,        
+                    C_lat_fe3,
+                    C_lat_h,
+                    C_lat_so4,
+                    C_lat_precip,
+                    
+                    # network
                     self._reaches,
                     self._id_to_row,      
                     self._id_to_col,  
+                    
+                    # constants and geometries
                     self.dx, 
                     self._S_np,   
-                    self.a,
-                    self.b,
-                    self.c,
-                    self.f,
+                    self.a, self.b, self.c, self.f,
                     self.time_step_seconds,
-                    0.5,
-                    0.5,
                     self.alpha_s,
                     self.A_s_ratio,
                     self.mannings,
+                    self.wf,
                     self.max_substeps,
+                    
+                    # working arrays
                     self._cn_working_arrays["a"],
                     self._cn_working_arrays["b"],
                     self._cn_working_arrays["c"],
@@ -259,54 +309,10 @@ class AMDModel:
                     self._cn_working_arrays["v"],
                     self._cn_working_arrays["A"],
                     self._cn_working_arrays["D"],
+                    self._cn_working_arrays["H"],
                     self._max_reach_length
-                    )
-            else:
-                for reach in self._reaches: 
-                    hr = int(self._id_to_row[reach[0]])
-                    hc = int(self._id_to_col[reach[0]])
-                    Q_l = float(Q_lat[hr, hc])
-                    if Q_l > 0.0:
-                        m_in = Q_l * float(C_lat[hr, hc]) * self.time_step_seconds
-                        self._buffer[var][0, hr, hc] += m_in
-
-
-        mask = self._buffer["ferric_oxyhydroxide"][0] > 0
-        src_rows, src_cols = np.where(mask)
-        src_rows = src_rows.astype(np.int64)
-        src_cols = src_cols.astype(np.int64)
-
-        _transport_ad_dep(
-            self._buffer["ferric_oxyhydroxide"],
-            self._buffer["bedload_storage"],
-            Q_2d,
-            self._ID_grid,
-            self.outID_grid,
-            self._id_to_row,
-            self._id_to_col,
-            self._id_to_outid,
-            ti,
-            self.time_step_seconds,
-            self._S_np,
-            self.dx,
-            self.a,
-            self.b,
-            self.c, 
-            self.f,
-            self.wf,
-            self.mannings,
-            1000,
-            len(self.dataset.lat),
-            len(self.dataset.lon),
-            src_rows,
-            src_cols,
-            self._addep_working_arrays["dst_rows"],
-            self._addep_working_arrays["dst_cols"],
-            self._addep_working_arrays["valid_cell"],
-            self._addep_working_arrays["vol_valid"],
-            self._addep_working_arrays["has_next"]
-        )
-
+                )
+        
     def _build_cache(self):
         """Build cache at initialisation to pre-process certain static variables and mappings for faster access during model run, 
         such as ID to row/col mapping, chemistry variable arrays, and next time mapping for timesteps
@@ -329,7 +335,7 @@ class AMDModel:
             flat_out[flat_out >= 0]
         ]))
         id_remap = {orig: new for new, orig in enumerate(unique_ids.tolist())}
-        array_size = len(unique_ids)  # ~36,300 instead of 67,586,153
+        array_size = len(unique_ids) 
 
         self._id_to_row   = np.full(array_size, -1, dtype=np.int32)
         self._id_to_col   = np.full(array_size, -1, dtype=np.int32)
@@ -371,7 +377,7 @@ class AMDModel:
         self._time_index = {t: i for i, t in enumerate(self.dataset["time"].values)}
 
         self._Q_np = self.dataset["Q"].values.astype(np.float32)
-        self._S_np = np.abs(self.dataset["slope"].values)
+        self._S_np = np.abs(self.dataset["slope"].values).astype(np.float32)
 
         self._ore_np = self.dataset["ore"].values.astype(np.float32)
         self._sink_mask = self.outID_grid < 0
@@ -394,7 +400,8 @@ class AMDModel:
                 "V": np.empty((self._max_reach_length,), dtype=np.float64),
                 "v": np.empty((self._max_reach_length,), dtype=np.float32),
                 "A": np.empty((self._max_reach_length,), dtype=np.float64),
-                "D": np.empty((self._max_reach_length,), dtype=np.float64)
+                "D": np.empty((self._max_reach_length,), dtype=np.float64),
+                "H": np.empty((self._max_reach_length,), dtype =np.float64)
             }
         else:
             self._cn_working_arrays = None

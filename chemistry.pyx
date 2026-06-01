@@ -410,7 +410,7 @@ def process_chemistry(
                 not isfinite(foh_)):
             continue
 
-        vol_safe = fmax(vol_, 1e-6)
+        vol_safe = fmax(vol_, 1e-30)
         h2o      = (0.99704702 * vol_ * 1000.0) / 18.01528
 
         # ── A: pyrite oxidation  (Backward-Euler Newton, mildly stiff) ───────
