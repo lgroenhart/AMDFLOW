@@ -482,8 +482,8 @@ def _build_junction_inflows(
     I32[::1] dst_r,
     I32[::1] dst_c,
     Py_ssize_t n_junctions,
-    double mannings,
     F32[:, ::1] S,
+    double mannings,
     double dx,
     double dt,
     double a,
@@ -515,7 +515,7 @@ def _build_junction_inflows(
             dc = dst_c[k]
 
             Q_t = <double>Q[tr, tc]
-            S_t = S[tc, tc]
+            S_t = S[tr, tc]
             if Q_t <= 0.0:
                 continue
             
