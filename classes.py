@@ -170,24 +170,28 @@ class AMDModel:
         RH = np.where(_denom > 0, (H * W) / np.where(_denom > 0, _denom, 1.0), 0.0)
         v = self.mannings**-1 * RH**(2/3) * self._S_np**0.5
         v = np.where(v > 0, v, 1.0)
-        volume_2d = np.where(v > 0, (Q_2d / v) * self.dx * 1000, 0.0)
+        
+        A_vals = np.where(v > 0, Q_2d / v, 1e-6)
+        A_vals = np.maximum(A_vals, 1e-6)           
+        volume_2d = A_vals * self.dx * 1000          
+        total_vol = volume_2d * (1 + self.A_s_ratio) 
+
         mask = (np.isfinite(volume_2d)) & (volume_2d > 0) & (Q_2d > 1e-6)
         rows, cols = np.where(mask)
         valid_rows = rows.astype(np.intp)
         valid_cols = cols.astype(np.intp)
         num_valid = len(valid_rows)
 
+       
         total_h_mol = (self._buffer["hydrogen_ion"][0] + self._sbuffer["hydrogen_ion"][0])
-        total_vol = np.where(v > 0, 
-                             (Q_2d / v) * self.dx * 1000 * (1 + self.A_s_ratio), 0.0)
-        safe_vol = np.where(total_vol > 0, total_vol, np.inf)
-        total_h_conc = total_h_mol / safe_vol
-        capped_conc = np.minimum(total_h_conc, 1e4)
+        total_h_conc = total_h_mol / total_vol
+        capped_conc = np.minimum(total_h_conc, 100.0) 
         with np.errstate(divide='ignore', invalid='ignore'):
             scaling = np.divide(capped_conc, total_h_conc, out=np.ones_like(total_h_conc), where=total_h_conc>0)
         self._buffer["hydrogen_ion"][0] *= scaling
         self._sbuffer["hydrogen_ion"][0] *= scaling
 
+        # Process main channel chemistry
         process_chemistry(
             self._buffer["ferrous_iron"][0],
             self._buffer["ferric_iron"][0],
@@ -206,6 +210,7 @@ class AMDModel:
             self.max_substeps
         )
 
+        # Process storage zone chemistry
         process_chemistry(
             self._sbuffer["ferrous_iron"][0],
             self._sbuffer["ferric_iron"][0],
@@ -223,6 +228,37 @@ class AMDModel:
             num_valid,
             self.max_substeps
         )
+        
+        for var in self._chem_vars:
+            if var == "hydrogen_ion":
+                total_h_mol = self._buffer["hydrogen_ion"][0] + self._sbuffer["hydrogen_ion"][0]
+                total_h_conc = np.where(total_vol > 0, total_h_mol / total_vol, 0.0)
+                capped_h_conc = np.minimum(total_h_conc, 100.0)  # Rigid pH = -2 barrier
+                scaling = np.divide(capped_h_conc, total_h_conc, out=np.ones_like(total_h_conc), where=total_h_conc>0)
+                self._buffer["hydrogen_ion"][0] *= scaling
+                self._sbuffer["hydrogen_ion"][0] *= scaling
+            else:
+                # Cap other species concentrations at a safe physical limit (e.g., 50.0 mol/L)
+                # to instantly arrest runaway exponential loops
+                if var in self._sbuffer:
+                    # Dissolved species in main channel
+                    c_main = np.where(volume_2d > 0, self._buffer[var][0] / volume_2d, 0.0)
+                    capped_c_main = np.minimum(c_main, 50.0)
+                    scale_main = np.divide(capped_c_main, c_main, out=np.ones_like(c_main), where=c_main>0)
+                    self._buffer[var][0] *= scale_main
+                    
+                    # Dissolved species in storage zone
+                    vol_s = volume_2d * self.A_s_ratio
+                    c_s = np.where(vol_s > 0, self._sbuffer[var][0] / vol_s, 0.0)
+                    capped_c_s = np.minimum(c_s, 50.0)
+                    scale_s = np.divide(capped_c_s, c_s, out=np.ones_like(c_s), where=c_s>0)
+                    self._sbuffer[var][0] *= scale_s
+                else:
+                    # Particulate variables (only present in main buffer)
+                    c_main = np.where(volume_2d > 0, self._buffer[var][0] / volume_2d, 0.0)
+                    capped_c_main = np.minimum(c_main, 50.0)
+                    scale_main = np.divide(capped_c_main, c_main, out=np.ones_like(c_main), where=c_main>0)
+                    self._buffer[var][0] *= scale_main
         
     def _transport(self, t, Q_2d):
         """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
