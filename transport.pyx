@@ -117,7 +117,7 @@ def _transport(
             v_i = mannings**(-1.0) * RH**(2.0/3.0) * sqrt(fmax(S_i, 0.0))
             
             A_i = fmax(Q_i / v_i, 1e-6)
-            V_i = A_i * dx
+            V_i = A_i * dx * 1000.0
             
             Re = (997.1 * v_i * 4.0 * RH) / 0.894e-3
             f_fric = 64.0 / (Re + 1e-30)
@@ -349,12 +349,12 @@ def _build_junction_inflows(
                 H = c * Q_t ** f
                 RH = (H * W) / (2 * H + W)
                 v = mannings**-1 * RH**(2.0/3.0) * (S_t)**0.5
-                V_t = fmax((Q_t / v) * dx, 1.0)
+                V_t = fmax((Q_t / v) * dx * 1000.0, 1.0)
                 
                 courant = fmin(Q_t * dt / V_t, 1.0)
                 moles_out = courant * moles
 
-                C_eff = moles_out / fmax(Q_t * dt, eps)
+                C_eff = moles_out / fmax(Q_t * dt * 1000.0, eps)
 
                 buf[tr, tc] -= moles_out
                 C_lat_num[dr, dc] += Q_t * C_eff

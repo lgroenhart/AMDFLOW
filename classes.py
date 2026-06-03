@@ -231,12 +231,18 @@ class AMDModel:
         
         for var in self._chem_vars:
             if var == "hydrogen_ion":
-                total_h_mol = self._buffer["hydrogen_ion"][0] + self._sbuffer["hydrogen_ion"][0]
-                total_h_conc = np.where(total_vol > 0, total_h_mol / total_vol, 0.0)
-                capped_h_conc = np.minimum(total_h_conc, 100.0)  # Rigid pH = -2 barrier
-                scaling = np.divide(capped_h_conc, total_h_conc, out=np.ones_like(total_h_conc), where=total_h_conc>0)
-                self._buffer["hydrogen_ion"][0] *= scaling
-                self._sbuffer["hydrogen_ion"][0] *= scaling
+                # main channel
+                c_main = np.where(volume_2d > 0, self._buffer[var][0] / volume_2d, 0.0)
+                capped_c_main = np.minimum(c_main, 100.0)
+                scale_main = np.divide(capped_c_main, c_main, out=np.ones_like(c_main), where=c_main>0)
+                self._buffer[var][0] *= scale_main
+
+                # storage zone
+                vol_s = volume_2d * self.A_s_ratio
+                c_s = np.where(vol_s > 0, self._sbuffer[var][0] / vol_s, 0.0)
+                capped_c_s = np.minimum(c_s, 100.0)
+                scale_s = np.divide(capped_c_s, c_s, out=np.ones_like(c_s), where=c_s>0)
+                self._sbuffer[var][0] *= scale_s
             else:
                 # Cap other species concentrations at a safe physical limit (e.g., 50.0 mol/L)
                 # to instantly arrest runaway exponential loops
