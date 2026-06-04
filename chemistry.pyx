@@ -114,7 +114,7 @@ cdef inline void _apply_equilibrium_precip(
         # Dissolution:  Fe(OH)₃ → Fe³⁺  (consumes 3 H⁺)
         need     = -delta
         avail_sus = fmax(fe_oh3[0], 0.0)
-        max_diss_h = fmax([h[0] / 3.0, 0.0])
+        max_diss_h = fmax(h[0] / 3.0, 0.0)
         from_sus  = fmin(need, fmin(avail_sus, max_diss_h))
         fe_oh3[0]-= from_sus
         fe3[0]   += from_sus
