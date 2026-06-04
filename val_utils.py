@@ -196,7 +196,7 @@ def assign_uparea_from_acc(amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_tr
         if 0 <= row_int < acc_array.shape[0] and 0 <= col_int < acc_array.shape[1]:
             acc_val = acc_array[row_int, col_int]
             if acc_val > 0 and acc_val != acc_nodata:
-                cell_area_km2 = cell_area_func(lat, lon)
+                cell_area_km2 = 1.0
                 uparea_km2 = acc_val * cell_area_km2
                 uparea_dict[(ilat, ilon)] = uparea_km2
             else:
