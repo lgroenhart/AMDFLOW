@@ -89,7 +89,7 @@ cdef inline void _apply_equilibrium_precip(
     """
     cdef double h_c, fe3_c, gam_h, gam_fe3, fe2_c, so4_c
     cdef double act_h, eq_act, fe3_eq_mol, delta
-    cdef double p, need, avail_sus, from_sus, remaining, from_bed
+    cdef double p, need, avail_sus, from_sus, remaining, from_bed, max_diss_h, max_diss_h_bed
 
     h_c   = fmax(h[0]   / vol_safe, 1e-14)
     fe3_c = fmax(fe3[0] / vol_safe, 0.0)
@@ -114,14 +114,16 @@ cdef inline void _apply_equilibrium_precip(
         # Dissolution:  Fe(OH)₃ → Fe³⁺  (consumes 3 H⁺)
         need     = -delta
         avail_sus = fmax(fe_oh3[0], 0.0)
-        from_sus  = fmin(need, avail_sus)
+        max_diss_h = fmax([h[0] / 3.0, 0.0])
+        from_sus  = fmin(need, fmin(avail_sus, max_diss_h))
         fe_oh3[0]-= from_sus
         fe3[0]   += from_sus
         h[0]      = fmax(h[0] - 3.0*from_sus, 0.0)
 
         remaining = need - from_sus
         if remaining > 0.0:
-            from_bed    = fmin(remaining, fmax(bedload[0], 0.0))
+            max_diss_h_bed = fmax(h[0] / 3.0, 0.0)
+            from_bed    = fmin(remaining, fmin(fmax(bedload[0], 0.0), max_diss_h_bed))
             bedload[0] -= from_bed
             fe3[0]     += from_bed
             h[0]        = fmax(h[0] - 3.0*from_bed, 0.0)
@@ -147,7 +149,7 @@ cdef inline void _analytical_fe2_oxidation(
 
     fe2_new = fe2[0] * exp(-lam * dt)
     fe2_new = fmax(fe2_new, 0.0)
-    fe2_ox  = fe2[0] - fe2_new
+    fe2_ox  = fmin(fe2[0] - fe2_new, h[0])
 
     fe3[0] += fe2_ox
     h[0]    = fmax(h[0] - fe2_ox, 0.0)
@@ -172,7 +174,6 @@ cdef inline void _pyrite_rhs(
         fe3_c = fmax(fe3 / vol_safe, 1e-10)
         h_c   = fmax(h   / vol_safe, 1e-7)
         rate1 = K_FERRIC * sqrt(fe3_c) / sqrt(h_c) * ore
-        rate1 = fmin(rate1, fmin(fe3, h2o))
         dfe2[0] += rate1 * 1.07
         dfe3[0] -= rate1
         dh[0]   += rate1 * 1.14
@@ -182,7 +183,6 @@ cdef inline void _pyrite_rhs(
     if ore > 0.0:
         h_c   = fmax(h / vol_safe, 1e-7)
         rate2 = K_DO * do_sqrt / cpow(h_c, 0.11) * ore
-        rate2 = fmin(rate2, h2o)
         dfe2[0] += rate2
         dso4[0] += 2.0 * rate2
         dh[0]   += 2.0 * rate2
