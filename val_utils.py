@@ -18,6 +18,16 @@ warnings.filterwarnings("ignore")
 
 def extract_caravan_stations(input_path = "../data/validation data/Caravan-Qual_lite.zarr", 
                              output_path = "../data/validation data/stations_"):
+    """Helper function to get and save the global water quality observation stations of Caravan-Qual Lite,
+        useful for plotting, mapping, looking for case studies, etc.
+
+    Parameters
+    ----------
+    input_path : str, optional
+        Path to Caravan-Qual Lite dataset in zarr format, by default "../data/validation data/Caravan-Qual_lite.zarr"
+    output_path : str, optional
+        Path to save the extracted station data as csv files (per variable), by default "../data/validation data/stations_"
+    """
     ds = xr.open_zarr(input_path)
 
     target_vars = ["pH", "Fe-Dis", "Fe-Tot"]
@@ -50,9 +60,40 @@ def extract_caravan_stations(input_path = "../data/validation data/Caravan-Qual_
     return 
 
 def load_datasets(amd_path, caravan_path, acc_path, rivers_path):
-    """
-    Load AMDFLOW NetCDF, Caravan-Qual Zarr, HydroSHEDS ACC raster, and river network.
-    Returns: amd, caravan, acc_array, acc_transform, rivers_gdf, cell_area_func
+    """ Load AMDFLOW NetCDF, Caravan-Qual Zarr, HydroSHEDS ACC raster, and river network.
+        all dataset should have WG84 lat/lon coordinates
+
+    Parameters
+    ----------
+    amd_path : str
+        path to AMDFLOW netcdf file
+    caravan_path : str
+        path to Caravan-Qual Lite zarr file
+    acc_path : str
+        path to HydroSHEDS flow accumulation raster (ACC), .tif format
+    rivers_path : str
+        path to HydroRIVERS river network shapefile, .shp file
+
+    Returns
+    -------
+    amd : xr.Dataset
+        dataset of AMDFLOW output
+    caravan : xr.Dataset
+        Caravan-Qual Lite dataset
+    acc_array : np.ndarray
+        2d array of flow accumulation (ACC) raster values, values are amount of upstream cells
+    acc_transform : rio.transform
+        transform object of ACC raster
+    acc_nodata : rio.nodata 
+        nodata value of ACC raster
+    rivers : Geodataframe
+        river network with columns HYRIV_ID, NEXT_DOWN, LENGTH_KM, geometry
+    cell_area_func : function (deprecated)
+        function(lat, lon) that calculates area of raster cell, no longer used, 1 km2 cell assumed 
+    Raises
+    ------
+    ValueError
+        River network missing one of required columns
     """
     print("\nLoading all datasets.....")
     amd = xr.open_dataset(amd_path, chunks={})
@@ -81,6 +122,25 @@ def load_datasets(amd_path, caravan_path, acc_path, rivers_path):
     return amd, caravan, acc_array, acc_transform, acc_nodata, rivers, cell_area_km2
 
 def wqms_stations_domain_filter(amd, caravan):
+    """bounding box filter of caravan stations to be within general AMD region 
+
+    Parameters
+    ----------
+    amd : xr.Dataset
+        AMDFLOW output dataset
+    caravan : xr.Dataset
+        Caravan-Qual Lite dataset
+
+    Returns
+    -------
+    candidates : pd.DataFrame
+        Dataframe of candidate stations, columns: wqms_id, lat, lon, area_sqkm
+
+    Raises
+    ------
+    SystemExit
+        If no stations fall within the AMD domain, exits with message
+    """
     stations = caravan[["wqms_id", "wqms_lat", "wqms_lon", "merged_LINKNO"]].to_dataframe().reset_index()
     stations = stations.rename(columns={
         "wqms_lat": "lat",
@@ -118,8 +178,17 @@ def wqms_stations_domain_filter(amd, caravan):
     return candidates
 
 def valid_masking(amd):
-    """
-    Compute boolean masks for cells that have valid data for pH and for iron.
+    """Compute boolean masks for cells that have valid data for pH and for iron.
+
+    Parameters
+    ----------
+    amd : xr.Dataset
+        AMDFLOW output dataset
+
+    Returns
+    -------
+    tuple
+        Tuple of boolean masks and corresponding indices
     """
     print("\nComputing valid-cell mask …")
     _sample_idx = np.linspace(0, amd.sizes["time"] - 1, 10, dtype=int)
@@ -157,7 +226,18 @@ def valid_masking(amd):
             valid_mask, iron_mask)
 
 def build_river_graph(rivers_gdf):
-    """Build directed graph of river segments (nodes: HYRIV_ID)."""
+    """Build directed graph of river segments (nodes: HYRIV_ID).
+
+    Parameters
+    ----------
+    rivers_gdf : gpd.GeoDataFrame
+        GeoDataFrame of river network (HydroRIVERS), must contain columns HYRIV_ID, NEXT_DOWN, LENGTH_KM
+
+    Returns
+    -------
+    G : networkx.DiGraph
+        Directed graph of river segments, with length edges and HYRIV_ID nodes
+    """
     G = nx.DiGraph()
     for _, row in rivers_gdf.iterrows():
         sid = row["HYRIV_ID"]
@@ -169,9 +249,25 @@ def build_river_graph(rivers_gdf):
     return G
 
 def snap_cells_to_river(amd_lat_2d, amd_lon_2d, valid_mask, rivers_gdf, target_crs):
-    """
-    For each valid AMDFLOW cell, find nearest point on river network.
+    """For each valid AMDFLOW cell, find nearest point on river network.
     Returns dict: (ilat, ilon) -> {HYRIV_ID, point_proj, distance_m, point_deg}
+
+    Parameters
+    ----------
+    amd_lat_2d : np.ndarray
+        2D array of latitudes for AMDFLOW grid cells, shape (nlat, nlon)
+    amd_lon_2d : np.ndarray
+        2D array of longitudes for AMDFLOW grid cells, shape (nlat, nlon)
+    valid_mask : np.ndarray (bool)
+        2D boolean array indicating valid cells (shape (nlat, nlon))
+    rivers_gdf : gpd.GeoDataFrame
+        GeoDataFrame of river network (HydroRIVERS), must contain column HYRIV_ID and geometry
+    target_crs : str
+        CRS string for reprojection (e.g. "EPSG:3857"), should be a projected CRS in metres for distance calculations
+
+    Returns
+    -------
+    dict: (ilat, ilon) -> {HYRIV_ID, point_proj, distance_m, point_deg}
     """
     print("Snapping cells to river(s)")
     # reproject rivers to target CRS
@@ -213,9 +309,30 @@ def snap_cells_to_river(amd_lat_2d, amd_lon_2d, valid_mask, rivers_gdf, target_c
     return cell_to_river
 
 def assign_uparea_from_acc(amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_transform, acc_nodata, cell_area_func):
-    """
-    Read upstream area (km²) for each valid AMDFLOW cell from ACC grid.
+    """ Read upstream area (km²) for each valid AMDFLOW cell from ACC grid.
     acc_array is a 2D numpy array (already read).
+
+    Parameters
+    ----------
+    amd_lat_2d : np.ndarray
+        2D array of latitudes for AMDFLOW grid cells, shape (nlat, nlon)
+    amd_lon_2d : np.ndarray
+        2D array of longitudes for AMDFLOW grid cells, shape (nlat, nlon)
+    valid_mask : np.ndarray (bool)
+        2D boolean array indicating valid cells (shape (nlat, nlon))
+    acc_array : np.ndarray
+        2D numpy array of flow accumulation values
+    acc_transform : affine.Affine
+        Affine transformation for converting coordinates to grid indices
+    acc_nodata : float
+        No-data value for the flow accumulation array
+        _description_
+    cell_area_func : function (deprecated)
+        area calculation of raster cell, no longer used, 1 km2 cell assumed
+
+    Returns
+    -------
+    dict: (ilat, ilon) -> uparea_km2
     """
     print("Assigning upstream watershed area to cells from flow accumulation")
     uparea_dict = {}
@@ -238,9 +355,28 @@ def assign_uparea_from_acc(amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_tr
     return uparea_dict
 
 def compute_network_distance(seg_id_a, point_a_proj, seg_id_b, point_b_proj, rivers_proj, graph):
-    """
-    Compute shortest path distance (km) along river network between two points.
+    """ Compute shortest path distance (km) along river network between two points.
     Assumes all geometries are in the same projected CRS (metres).
+
+    Parameters
+    ----------
+    seg_id_a : str
+        HYRIV_ID of segment A
+    point_a_proj : shapely.geometry.Point
+        projected point of cell A
+    seg_id_b : str
+        HYRIV_ID of segment B
+    point_b_proj : shapely.geometry.Point
+        projected point of cell B
+    rivers_proj : gpd.GeoDataFrame
+        projected river network GeoDataFrame, must contain HYRIV_ID and geometry
+    graph : networkx.DIGraph
+        network graph of river network, with HYRIV_ID as nodes and edge lengths in km
+
+    Returns
+    -------
+    float
+        shortest path distance in kilometers
     """
     if seg_id_a == seg_id_b:
         # Same segment: linear distance along the line
@@ -271,9 +407,39 @@ def snap_stations_hydrosheds(candidates, amd_lat_2d, amd_lon_2d, valid_mask,
                              uparea_dict, cell_to_river, rivers_gdf, river_graph,
                              target_crs, max_network_km=5.0,
                              area_ratio_min=0.5, area_ratio_max=1.5):
-    """
-    Match Caravan stations to AMDFLOW cells using network distance and area ratio.
-    Returns DataFrame with matched stations and cell indices.
+    """ Match Caravan stations to AMDFLOW cells using network distance and area ratio.
+
+    Parameters
+    ----------
+    candidates : pd.DataFrame
+        DataFrame of candidate stations after domain filter, columns: wqms_id, lat, lon, area_sqkm
+    amd_lat_2d : np.ndarray
+        2D array of latitudes for AMDFLOW grid cells, shape (nlat, nlon)
+    amd_lon_2d : np.ndarray
+        2D array of longitudes for AMDFLOW grid cells, shape (nlat, nlon)
+    valid_mask : np.ndarray (bool)
+        2D boolean array indicating valid cells (shape (nlat, nlon))
+    uparea_dict : dict
+        dict mapping (ilat, ilon) to upstream area in km² for valid cells
+    cell_to_river : dict
+        dict mapping (ilat, ilon) to the nearest river segment ID and projected point
+    rivers_gdf : gpd.GeoDataFrame
+        GeoDataFrame of river network, must contain HYRIV_ID and geometry
+    river_graph : networkx.DIGraph
+        network graph of river network, with HYRIV_ID as nodes and edge lengths in km
+    target_crs : str
+        CRS string for reprojection (e.g. "EPSG:3857"), should be a projected CRS in metres for distance calculations
+    max_network_km : float, optional
+        maximum network distance between stations and cells snapped to a river in kilometers, by default 5.0
+    area_ratio_min : float, optional
+        minimum ratio bound of station area to cell area, by default 0.5
+    area_ratio_max : float, optional
+        maximum ratio bound of station area to cell area, by default 1.5
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with matched stations and cell indices.
     """
     print("Snapping stations to rivers and then cells")
     # reproject rivers and stations to target CRS
@@ -365,7 +531,34 @@ def snap_stations_hydrosheds(candidates, amd_lat_2d, amd_lon_2d, valid_mask,
     return pd.DataFrame(matches)
 
 def extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq):
-    """Extract and align model and observed time series for matched stations."""
+    """Extract and align model and observed time series for matched stations
+
+    Parameters
+    ----------
+    matches : pd.DataFrame
+        Dataframe of matched stations and cell indices
+    amd : xr.Dataset
+        AMDFLOW output dataset
+    caravan : xr.Dataset
+        Caravan-Qual Lite dataset
+    caravan_var : str
+        variable name in caravan dataset (e.g. "pH", "Fe-Dis")
+    amd_var : str or list of str
+         variable name(s) in AMD dataset to extract (e.g. "pH" or ["ferrous_iron", "ferric_iron", "ferric_oxyhydroxide"])
+         if list, will sum the variables (after unit conversion if needed) to compare with the caravan variable
+    resample_freq : str
+        resampling frequency for caravan observations (e.g. "W" for weekly), or None to keep original frequency
+
+    Returns
+    -------
+    pd.DataFrame
+         DataFrame with columns: wqms_id, time, observed, modelled, dist_m, where each row is a paired observation-model timestep for a station
+
+    Raises
+    ------
+    ValueError
+        If no overlapping period between model and observations, or if caravan_var not in caravan dataset, or if amd_var(s) not in AMD dataset
+    """
     # Overlapping period
     t_start = max(pd.Timestamp(amd.time.values[0]),
                   pd.Timestamp(caravan.time.values[0]))
@@ -429,7 +622,30 @@ def extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq
 
 def full_run(var_map, matches_ph, matches_iron, amd, caravan,
              min_paired_obs=3, resample_freq="W"):
-    """Run extraction and alignment for all variables."""
+    """Run extraction and alignment for all variables
+
+    Parameters
+    ----------
+    var_map : dict
+        Dictionary mapping caravan variables to AMD variables
+    matches_ph : pd.DataFrame
+        DataFrame of matched stations for pH variables
+    matches_iron : pd.DataFrame
+        DataFrame of matched stations for iron variables
+    amd : xr.Dataset
+        AMD dataset
+    caravan : xr.Dataset
+        Caravan dataset
+    min_paired_obs : int, optional
+        Minimum number of paired observations required, by default 3
+    resample_freq : str, optional
+        Frequency for resampling observations, by default "W"
+
+    Returns
+    -------
+    dict
+        Dictionary of results for each variable
+    """
     all_results = {}
     iron_vars = {"Fe-Dis", "Fe-Tot"}
     
@@ -465,7 +681,20 @@ def full_run(var_map, matches_ph, matches_iron, amd, caravan,
     return all_results
 
 def compute_metrics(obs, mod):
-    """Compute RMSE, bias, NSE, KGE, R for two pandas Series (aligned by time)."""
+    """Compute RMSE, bias, NSE, KGE, R for two pandas Series (aligned by time)
+
+    Parameters
+    ----------
+    obs : pd.Series
+        observed values (Caravan-Qual Lite), indexed by time
+    mod : pd.Series
+        modelled values (AMDFLOW), indexed by time, must be aligned with obs
+
+    Returns
+    -------
+    dict
+        Dictionary of metrics: n, RMSE, bias, NSE, KGE, R
+    """
     o = obs.resample("W").mean()
     m = mod.resample("W").mean()
 
@@ -490,7 +719,19 @@ def compute_metrics(obs, mod):
     return {"n": n, "RMSE": rmse, "bias": bias, "NSE": nse, "KGE": kge, "R": r}
 
 def validation_metrics(ts):
-    """Compute per-station metrics and return DataFrame."""
+    """Compute per-station metrics and return DataFrame.
+
+    Parameters
+    ----------
+    ts : pd.DataFrame
+        DataFrame with columns: wqms_id, time, observed, modelled, dist_m
+
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns: wqms_id, n, RMSE, bias, NSE, KGE, R
+    """
     if ts.empty:
         return pd.DataFrame(columns=["n", "RMSE", "bias", "NSE", "KGE", "R"])
     rows = []
