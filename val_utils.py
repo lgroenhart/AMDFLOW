@@ -16,6 +16,38 @@ import geopandas as gpd
 # Suppress warnings if desired
 warnings.filterwarnings("ignore")
 
+def extract_caravan_stations(input_path = "../data/validation data/Caravan-Qual_lite.zarr", 
+                             output_path = "../data/validation data/stations_"):
+    ds = xr.open_zarr(input_path)
+
+    target_vars = ["pH", "Fe-Dis", "Fe-Tot"]
+
+    # load lat/lon once, both are (wqms_id,) arrays
+    lats = ds["wqms_lat"].compute()
+    lons = ds["wqms_lon"].compute()
+
+    for var in target_vars:
+        if var not in ds.data_vars:
+            print(f"Skipping '{var}': not found in dataset")
+            continue
+
+        da = ds[var]  
+
+        # boolean mask: stations with at least one valid observation
+        has_data = da.notnull().any(dim="time").compute()
+
+        valid_mask = has_data.values
+
+        df = pd.DataFrame({
+            "wqms_id":   ds["wqms_id"].values[valid_mask],
+            "latitude":  lats.values[valid_mask],
+            "longitude": lons.values[valid_mask],
+        })
+
+        filename = f"{output_path}{var.replace('-', '_')}.csv"
+        df.to_csv(filename, index=False)
+        print(f"{var}: {len(df)} stations → saved to '{filename}'")
+    return 
 
 def load_datasets(amd_path, caravan_path, acc_path, rivers_path):
     """
