@@ -201,11 +201,11 @@ def _transport(
                     r_coef = D_i * dt_sub / (dx * dx)
                     s_adv = v_i * dt_sub / dx
             
-                    # FIX 1: Convert Q_lat from m³/s to L/s to match V_i (Liters)
+                    
                     q_lin = fmax(Q_lat[r0, c0], 0.0)
                     p = (q_lin * 1000.0) * dt_sub / (V_i + 1e-30)
                 
-                    # FIX 2: C_lat is now Mass Flux Rate (mol/s). Direct concentration addition:
+                    
                     lateral_source = (C_lat[r0, c0] * dt_sub) / (V_i + 1e-30)
                 
                     C_i = C_old_arr[i]
@@ -221,12 +221,12 @@ def _transport(
                         C_ip1 = C_i
                 
                     # Standard CN Coefficients
-                    ai = -(0.5 * r_coef - 0.5 * s_adv)
+                    ai = -(0.5 * r_coef + 0.5 * s_adv)
                     bi = 1.0 + 0.5 * (2.0 * r_coef + p) + 0.5 * s_adv
                     ci = -0.5 * r_coef
             
                     # Base RHS vector assignment including direct lateral mass entry
-                    di = (0.5 * (0.5 * r_coef - 0.5 * s_adv) * C_im1
+                    di = ((0.5 * r_coef + 0.5 * s_adv) * C_im1
                         + (1.0 - 0.5 * (2.0 * r_coef + p) - 0.5 * s_adv) * C_i
                         + 0.5 * r_coef * C_ip1
                         + lateral_source)
@@ -365,7 +365,7 @@ def _build_junction_inflows(
 
                 C_lat_num[dr, dc] += moles_out
 
-            Q_lat_out[dr, dc] = <F32>Q_t
+            Q_lat_out[dr, dc] += <F32>Q_t
             
         for r in range(nlat):
             for co in range(nlon):
