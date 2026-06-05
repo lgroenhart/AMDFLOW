@@ -47,8 +47,6 @@ class AMDModel:
             storage exchange coefficient, by default 1e-5
         A_s_ratio : float, optional
             storage zone cross sectional area ratio relative to main channel cross sectional area, by default 0.5
-        ssa : float, optional
-            specific surface area of pyrite, by default 1
         buffer_capacity : float, optional
             buffer capacity for pH, non-physical instrument to buffer pH, by default 0.1
         mannings : float, optional
@@ -63,11 +61,6 @@ class AMDModel:
         self.dataset["outID"] = self.dataset["outID"].where(self.dataset["outID"] >= 0, -1)
         self.dataset["source"] = self.dataset["source"].where(self.dataset["source"] == 1, 0)
         self.dataset["slope"] = self.dataset["slope"].where(self.dataset["slope"] > 0, 0.0)
-        # mask_source = (self.dataset["source"] == 1)
-        # cond1 = ~mask_source.values
-        # cond2 = (self.dataset["Q"].values > 0)
-        # condition = np.logical_or(cond1, cond2)
-        # self.dataset["Q"] = self.dataset["Q"].where(condition, 1e-3) # 
         self._Q = self.dataset["Q"].copy(deep=True)
         self.dx = 1000 
         self.a = a
@@ -104,8 +97,12 @@ class AMDModel:
         }
 
         self._Q_lat_buff = np.zeros(spatial_shape, dtype = np.float32)
-        self._C_lat_buff = np.zeros(spatial_shape, dtype = np.float64)
-        self._C_lat_num_buff = np.zeros(spatial_shape, dtype = np.float64)
+
+        self.C_lat_fe2    = np.zeros(spatial_shape, dtype=np.float64)
+        self.C_lat_fe3    = np.zeros(spatial_shape, dtype=np.float64)
+        self.C_lat_h      = np.zeros(spatial_shape, dtype=np.float64)
+        self.C_lat_so4    = np.zeros(spatial_shape, dtype=np.float64)
+        self.C_lat_precip = np.zeros(spatial_shape, dtype=np.float64)
 
         self.time_step_seconds = {"month": 2628000, "week" : 604800, "day": 86400, "hour": 3600, "minute": 60}[self.t_unit]
         
@@ -265,95 +262,88 @@ class AMDModel:
                     capped_c_main = np.minimum(c_main, 50.0)
                     scale_main = np.divide(capped_c_main, c_main, out=np.ones_like(c_main), where=c_main>0)
                     self._buffer[var][0] *= scale_main
-        
+                    
     def _transport(self, t, Q_2d):
-        """Transport chemistry downstream based on flow network, updating self._buffer with transported chemistry for next timestep
-            uses _transport, _build_junction_inflows from transport.pyx 
+        # 1. Zero the per‑species C_lat accumulators
+        self.C_lat_fe2.fill(0.0)
+        self.C_lat_fe3.fill(0.0)
+        self.C_lat_h.fill(0.0)
+        self.C_lat_so4.fill(0.0)
+        self.C_lat_precip.fill(0.0)
 
-        Parameters
-        ----------
-        t : np.datetime64
-            timestep of model
-        Q_2d : np.ndarray
-            2d array of flow values at timestep t, used for transport calculations
-        """
-        ti = self._time_index[t]
-        Q_lat, C_lat_fe2 = self._build_junction_inflows(Q_2d, "ferrous_iron")
-        C_lat_fe2 = C_lat_fe2.copy()
+        # 2. Fill Q_lat from junction flows (same for all species)
+        self._compute_junction_flows(Q_2d)
+        Q_lat = self._Q_lat_buff   # use the same flow array for all species
 
-        _, C_lat_fe3 = self._build_junction_inflows(Q_2d, "ferric_iron")
-        C_lat_fe3 = C_lat_fe3.copy()
-
-        _, C_lat_h = self._build_junction_inflows(Q_2d, "hydrogen_ion")
-        C_lat_h = C_lat_h.copy()
-
-        _, C_lat_so4 = self._build_junction_inflows(Q_2d, "sulphate")
-        C_lat_so4 = C_lat_so4.copy()
-
-        _, C_lat_precip = self._build_junction_inflows(Q_2d, "ferric_oxyhydroxide")
-        C_lat_precip = C_lat_precip.copy()
-        
+        # 3. Call the new _transport with junction topology
         _transport(
-                    # main channel
-                    self._buffer["ferrous_iron"][0],
-                    self._buffer["ferric_iron"][0],
-                    self._buffer["hydrogen_ion"][0],
-                    self._buffer["sulphate"][0],
-                    self._buffer["ferric_oxyhydroxide"][0],      
-                    
-                    # storage zone
-                    self._sbuffer["ferrous_iron"][0],
-                    self._sbuffer["ferric_iron"][0],
-                    self._sbuffer["hydrogen_ion"][0],
-                    self._sbuffer["sulphate"][0],
-                    
-                    # bedload Storage
-                    self._buffer["bedload_storage"][0],
-                    
-                    # hydrology /lateral inflow
-                    Q_2d,
-                    Q_lat, Q_lat, Q_lat, Q_lat, Q_lat,  
-                    
-                    # lateral inflow concentrations
-                    C_lat_fe2,        
-                    C_lat_fe3,
-                    C_lat_h,
-                    C_lat_so4,
-                    C_lat_precip,
-                    
-                    # network
-                    self._reaches,
-                    self._id_to_row,      
-                    self._id_to_col,  
-                    
-                    # constants and geometries
-                    self.dx, 
-                    self._S_np,   
-                    self.a, self.b, self.c, self.f,
-                    self.time_step_seconds,
-                    self.alpha_s,
-                    self.A_s_ratio,
-                    self.mannings,
-                    self.wf,
-                    self.max_substeps,
-                    
-                    # working arrays
-                    self._cn_working_arrays["a"],
-                    self._cn_working_arrays["b"],
-                    self._cn_working_arrays["c"],
-                    self._cn_working_arrays["d"],
-                    self._cn_working_arrays["c_prime"],
-                    self._cn_working_arrays["d_prime"],
-                    self._cn_working_arrays["x"],
-                    self._cn_working_arrays["rows"],
-                    self._cn_working_arrays["cols"],
-                    self._cn_working_arrays["V"],
-                    self._cn_working_arrays["v"],
-                    self._cn_working_arrays["A"],
-                    self._cn_working_arrays["D"],
-                    self._cn_working_arrays["H"],
-                    self._max_reach_length
-                )
+            # main channel
+            self._buffer["ferrous_iron"][0],
+            self._buffer["ferric_iron"][0],
+            self._buffer["hydrogen_ion"][0],
+            self._buffer["sulphate"][0],
+            self._buffer["ferric_oxyhydroxide"][0],
+
+            # storage zone
+            self._sbuffer["ferrous_iron"][0],
+            self._sbuffer["ferric_iron"][0],
+            self._sbuffer["hydrogen_ion"][0],
+            self._sbuffer["sulphate"][0],
+
+            # bedload storage
+            self._buffer["bedload_storage"][0],
+
+            # hydrology
+            Q_2d,
+            Q_lat, Q_lat, Q_lat, Q_lat, Q_lat,   # same Q_lat for all species
+
+            # lateral mass sources (the accumulators)
+            self.C_lat_fe2,
+            self.C_lat_fe3,
+            self.C_lat_h,
+            self.C_lat_so4,
+            self.C_lat_precip,
+
+            # network
+            self._reaches,
+            self._id_to_row,
+            self._id_to_col,
+
+            # JUNCTION TOPOLOGY – NEW
+            self._junc_tail_r,
+            self._junc_tail_c,
+            self._junc_dst_r,
+            self._junc_dst_c,
+            self._n_junctions,
+
+            # hydraulics
+            self.dx,
+            self._S_np,
+            self.a, self.b, self.c, self.f,
+            self.time_step_seconds,
+            self.alpha_s,
+            self.A_s_ratio,
+            self.mannings,
+            self.wf,
+            self.max_substeps,
+
+            # working arrays
+            self._cn_working_arrays["a"],
+            self._cn_working_arrays["b"],
+            self._cn_working_arrays["c"],
+            self._cn_working_arrays["d"],
+            self._cn_working_arrays["c_prime"],
+            self._cn_working_arrays["d_prime"],
+            self._cn_working_arrays["x"],
+            self._cn_working_arrays["rows"],
+            self._cn_working_arrays["cols"],
+            self._cn_working_arrays["V"],
+            self._cn_working_arrays["v"],
+            self._cn_working_arrays["A"],
+            self._cn_working_arrays["D"],
+            self._cn_working_arrays["H"],
+            self._max_reach_length,
+        )
         
     def _build_cache(self):
         """Build cache at initialisation to pre-process certain static variables and mappings for faster access during model run, 
@@ -739,32 +729,21 @@ class AMDModel:
         for length, count in sorted(length_counts.items()):
             print(f"  length {length:>3}: {count:>6} reaches")
 
-    def _build_junction_inflows(self, Q_2d, var):
+    def _compute_junction_flows(self, Q_2d):
         """
-        Calls build_junction_inflows Cython function in transport.pyx,
-        calculates the in/outflow from junctions as lateral in/outflow
+        Fills self._Q_lat_buff with lateral flow rates from junctions.
+        Mass transfer is handled inside _transport.
         """
+        self._Q_lat_buff.fill(0.0)   # ensure clean start
         _build_junction_inflows(
-            self._buffer[var][0],
             Q_2d,
             self._Q_lat_buff,
-            self._C_lat_buff,
-            self._C_lat_num_buff,
             self._junc_tail_r,
             self._junc_tail_c,
             self._junc_dst_r,
             self._junc_dst_c,
             self._n_junctions,
-            self._S_np,
-            self.mannings,
-            self.dx,
-            self.time_step_seconds,
-            self.a, 
-            self.b,
-            self.c,
-            self.f
         )
-        return self._Q_lat_buff, self._C_lat_buff
     
     def _build_network_mask(self):
         """Builds a 2d bolean mask of stream network downstream from mine cells, 
