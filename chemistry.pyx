@@ -174,10 +174,10 @@ cdef inline void _pyrite_rhs(
         fe3_c = fmax(fe3 / vol_safe, 1e-10)
         h_c   = fmax(h   / vol_safe, 1e-7)
         rate1 = K_FERRIC * sqrt(fe3_c) / sqrt(h_c) * ore
-        dfe2[0] += rate1 * 1.07
-        dfe3[0] -= rate1
-        dh[0]   += rate1 * 1.14
-        dso4[0] += rate1 * (2.0 / 14.0)
+        dfe2[0] += rate1 * 15.0
+        dfe3[0] -= rate1 * 14.0
+        dh[0]   += rate1 * 16.0
+        dso4[0] += rate1 * 2.0
 
     # Step 2: FeS₂ + O₂
     if ore > 0.0:
