@@ -72,9 +72,9 @@ def _transport(
     cdef:
         I64 reach_id, i, r0, c0, sub, species_idx
         double Q_i, v_i, A_i, V_i, D_i, H_i, S_i, settling_loss
-        double r_coef, s_adv, p, q_lin, alpha, beta, gamma
+        double r_coef, s_adv, p, q_lin, alpha_m, alpha_st, gamma
         double denom, C_im1, C_i, C_ip1, C_L_i, ai, bi, ci, di
-        double C_new, C_old, C_s_old, C_s_new, settled_moles
+        double C_new, C_old, C_s_old, C_s_new, settled_moles, lateral_source
         Py_ssize_t reach_len 
         I64 n_sub
         double dt_sub, max_C, bc_top, settling_term
@@ -117,7 +117,7 @@ def _transport(
             v_i = mannings**(-1.0) * RH**(2.0/3.0) * sqrt(fmax(S_i, 0.0))
             
             A_i = fmax(Q_i / v_i, 1e-6)
-            V_i = A_i * dx * 1000.0
+            V_i = A_i * dx * 1000.0  # Volume in Liters
             
             Re = (997.1 * v_i * 4.0 * RH) / 0.894e-3
             f_fric = 64.0 / (Re + 1e-30)
@@ -201,11 +201,14 @@ def _transport(
                     r_coef = D_i * dt_sub / (dx * dx)
                     s_adv = v_i * dt_sub / dx
             
+                    # FIX 1: Convert Q_lat from m³/s to L/s to match V_i (Liters)
                     q_lin = fmax(Q_lat[r0, c0], 0.0)
-                    p = q_lin * dt_sub / (V_i + 1e-30)
+                    p = (q_lin * 1000.0) * dt_sub / (V_i + 1e-30)
+                
+                    # FIX 2: C_lat is now Mass Flux Rate (mol/s). Direct concentration addition:
+                    lateral_source = (C_lat[r0, c0] * dt_sub) / (V_i + 1e-30)
                 
                     C_i = C_old_arr[i]
-                    C_L_i = C_lat[r0, c0]
                 
                     if i == 0:
                         C_im1 = bc_top
@@ -222,10 +225,11 @@ def _transport(
                     bi = 1.0 + 0.5 * (2.0 * r_coef + p) + 0.5 * s_adv
                     ci = -0.5 * r_coef
             
+                    # Base RHS vector assignment including direct lateral mass entry
                     di = (0.5 * (0.5 * r_coef - 0.5 * s_adv) * C_im1
                         + (1.0 - 0.5 * (2.0 * r_coef + p) - 0.5 * s_adv) * C_i
                         + 0.5 * r_coef * C_ip1
-                        + p * C_L_i)
+                        + lateral_source)
                 
                     # Boundary adjustments
                     if i == 0:
@@ -235,14 +239,17 @@ def _transport(
                         bi += ci
                         ci = 0.0
                 
-                    # Include transient storage (Runkel Eq 17 main channel terms)
+                    # FIX 3: Cleaned up analytical transient storage substitution (Runkel Eq. 17)
                     if has_storage:
-                        alpha = alpha_s / A_s_ratio
-                        bi += 0.5 * alpha * dt_sub
-            
+                        alpha_m = alpha_s                         # Main channel rate
+                        alpha_st = alpha_s / A_s_ratio            # Storage zone rate
+                        gamma = 0.5 * alpha_st * dt_sub
+                        
                         C_s_old = conc_s[r0, c0] / fmax(A_s_ratio * V_i, 1e-30)
-                        di += (0.5 * alpha * C_s_old * dt_sub) - (0.5 * alpha * C_i * dt_sub) + (alpha * C_s_old * dt_sub)
-                        di += alpha * C_s_old * dt_sub 
+                        
+                        # Add cleanly substituted implicit and explicit terms
+                        bi += (0.5 * alpha_m * dt_sub) / (1.0 + gamma)
+                        di += (alpha_m * dt_sub * C_s_old) / (1.0 + gamma) - (0.5 * alpha_m * dt_sub * C_i) / (1.0 + gamma)
                 
                     # Settling loss
                     if has_settling:
@@ -289,8 +296,8 @@ def _transport(
 
                     # Storage zone update (Runkel Eq 25)
                     if has_storage:
-                        alpha = alpha_s / A_s_ratio
-                        gamma = (dt_sub * alpha) / 2.0
+                        alpha_st = alpha_s / A_s_ratio
+                        gamma = (dt_sub * alpha_st) / 2.0
                     
                         C_s_old = conc_s[r0, c0] / fmax(A_s_ratio * V_i, 1e-30)
                         C_s_new = (C_s_old * (1.0 - gamma) + gamma * (C_new + C_old)) / (1.0 + gamma)
@@ -351,19 +358,18 @@ def _build_junction_inflows(
                 v = mannings**-1 * RH**(2.0/3.0) * (S_t)**0.5
                 V_t = fmax((Q_t / v) * dx * 1000.0, 1.0)
                 
-                courant = fmin(Q_t * dt / V_t, 1.0)
+                courant = fmin((Q_t * dt * 1000.0)/ V_t, 1.0)
                 moles_out = courant * moles
 
-                C_eff = moles_out / fmax(Q_t * dt * 1000.0, eps)
-
                 buf[tr, tc] -= moles_out
-                C_lat_num[dr, dc] += Q_t * C_eff
 
-            Q_lat_out[dr, dc] = Q_lat_out[dr, dc] + <F32>Q_t
+                C_lat_num[dr, dc] += moles_out
+
+            Q_lat_out[dr, dc] = <F32>Q_t
             
         for r in range(nlat):
             for co in range(nlon):
                 if Q_lat_out[r, co] > 0.0:
-                    C_lat_out[r, co] = C_lat_num[r, co] / <double>Q_lat_out[r, co]
+                    C_lat_out[r, co] = C_lat_num[r, co] / dt # mol / s
                 else:
                     C_lat_out[r, co] = 0.0
