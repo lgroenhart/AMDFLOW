@@ -621,7 +621,7 @@ def extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq
     return result[["wqms_id", "time", "observed", "modelled", "dist_m"]]
 
 def full_run(var_map, matches_ph, matches_iron, amd, caravan,
-             min_paired_obs=3, resample_freq="W"):
+             min_paired_obs=3, resample_freq="W", output_path=None):
     """Run extraction and alignment for all variables
 
     Parameters
@@ -647,6 +647,7 @@ def full_run(var_map, matches_ph, matches_iron, amd, caravan,
         Dictionary of results for each variable
     """
     all_results = {}
+    dropped_info = {}
     iron_vars = {"Fe-Dis", "Fe-Tot"}
     
     for caravan_var, amd_var in var_map.items():
@@ -660,23 +661,53 @@ def full_run(var_map, matches_ph, matches_iron, amd, caravan,
             continue
         
         ts = extract_and_align(matches, amd, caravan, caravan_var, amd_var, resample_freq)
-        
+        ts_all = ts.copy()
+
         # filter stations with too few paired observations
         n_paired = ts.dropna(subset=["observed", "modelled"]).groupby("wqms_id").size()
-        keep = n_paired[n_paired >= min_paired_obs].index
+        keep = set(n_paired[n_paired >= min_paired_obs].index)
         dropped = n_paired[n_paired < min_paired_obs]
+
+        # prepare dropped-info dataframe (stations that failed the paired-observation threshold)
         if len(dropped):
-            print(f"  Dropped {len(dropped)} station(s) with < {min_paired_obs} paired observations")
-        
+            dropped_df = matches[matches["wqms_id"].isin(dropped.index)].copy()
+            dropped_df = dropped_df.drop_duplicates(subset=["wqms_id"]).reset_index(drop=True)
+            # add n_paired column (may be NaN for stations present in matches but not in n_paired)
+            dropped_map = dropped.to_dict()
+            dropped_df["n_paired"] = dropped_df["wqms_id"].map(dropped_map).fillna(0).astype(int)
+            dropped_df["drop_reason"] = "few_obs"
+            dropped_info[caravan_var] = dropped_df
+            print(f"  Recording {len(dropped_df)} station(s) with < {min_paired_obs} paired observations")
+
         # drop stations where modelled all zero
         all_zero = ts.groupby("wqms_id")["modelled"].apply(lambda x: (x == 0).all())
         zero_stations = all_zero[all_zero].index
         if len(zero_stations):
-            print(f"  Dropped {len(zero_stations)} station(s) with all-zero modelled values")
-            keep = keep.difference(zero_stations)
-        
+            # record zero stations too
+            zero_df = matches[matches["wqms_id"].isin(zero_stations)].copy()
+            zero_df = zero_df.drop_duplicates(subset=["wqms_id"]).reset_index(drop=True)
+            zero_df["n_paired"] = n_paired.reindex(zero_df["wqms_id"]).fillna(0).astype(int).values
+            zero_df["drop_reason"] = "all_zero"
+            # merge with existing dropped_info if present
+            if caravan_var in dropped_info:
+                dropped_info[caravan_var] = pd.concat([dropped_info[caravan_var], zero_df], ignore_index=True)
+            else:
+                dropped_info[caravan_var] = zero_df
+            print(f"  Recording {len(zero_df)} station(s) with all-zero modelled values")
+
+        # finalize keep set by removing zero stations
+        keep = set(keep).difference(zero_stations)
+
         ts = ts[ts["wqms_id"].isin(keep)].reset_index(drop=True)
-        all_results[caravan_var] = ts
+        # keep the full (unfiltered) timeseries in all_results so CSVs include stations with few observations
+        all_results[caravan_var] = ts_all
+
+        # optionally save dropped stations to CSV in provided output path
+        if output_path is not None and caravan_var in dropped_info:
+            os.makedirs(output_path, exist_ok=True)
+            outfn = os.path.join(output_path, f"dropped_stations_{caravan_var.replace(' ', '_')}.csv")
+            dropped_info[caravan_var].to_csv(outfn, index=False)
+            print(f"  Saved {len(dropped_info[caravan_var])} dropped stations → {outfn}")
     
     return all_results
 
@@ -718,7 +749,7 @@ def compute_metrics(obs, mod):
     kge = sc.continuous.kge(o_da, m_da).compute().values.item()
     return {"n": n, "RMSE": rmse, "bias": bias, "NSE": nse, "KGE": kge, "R": r}
 
-def validation_metrics(ts):
+def validation_metrics(ts, min_n=3):
     """Compute per-station metrics and return DataFrame.
 
     Parameters
@@ -733,21 +764,68 @@ def validation_metrics(ts):
         DataFrame with columns: wqms_id, n, RMSE, bias, NSE, KGE, R
     """
     if ts.empty:
-        return pd.DataFrame(columns=["n", "RMSE", "bias", "NSE", "KGE", "R"])
+        return pd.DataFrame(columns=["n", "RMSE", "bias", "NSE", "KGE", "R"]).set_index(pd.Index([], name="wqms_id"))
+
     rows = []
     for sid, grp in ts.groupby("wqms_id"):
         grp = grp.set_index("time").sort_index()
-        metrics = compute_metrics(grp["observed"], grp["modelled"])
-        metrics["wqms_id"] = sid
-        rows.append(metrics)
+
+        # align weekly and compute valid pairs
+        o = grp["observed"].resample("W").mean()
+        m = grp["modelled"].resample("W").mean()
+        common = o.index.intersection(m.index)
+        o = o.loc[common]
+        m = m.loc[common]
+        valid = np.isfinite(o) & np.isfinite(m)
+        o = o[valid]
+        m = m[valid]
+        n = len(o)
+
+        # compute bias even for small n
+        bias = np.nan
+        if n > 0:
+            bias = np.mean(m - o)
+
+        # other metrics only when n >= min_n and both series have variance
+        RMSE = np.nan
+        NSE = np.nan
+        KGE = np.nan
+        R = np.nan
+        if n >= min_n and o.std() != 0 and m.std() != 0:
+            # Use xarray for compatibility with scores
+            o_da = xr.DataArray(o.values, dims=["time"])
+            m_da = xr.DataArray(m.values, dims=["time"])
+            try:
+                RMSE = sc.continuous.rmse(m_da, o_da).compute().values.item()
+            except Exception:
+                RMSE = np.nan
+            try:
+                NSE = sc.continuous.nse(o_da, m_da).compute().values.item()
+            except Exception:
+                NSE = np.nan
+            try:
+                KGE = sc.continuous.kge(o_da, m_da).compute().values.item()
+            except Exception:
+                KGE = np.nan
+            try:
+                R = r2_score(o, m)
+            except Exception:
+                R = np.nan
+
+        rows.append({"wqms_id": sid, "n": n, "RMSE": RMSE, "bias": bias, "NSE": NSE, "KGE": KGE, "R": R})
+
     df = pd.DataFrame(rows).set_index("wqms_id")
     
-    # drop rows where all metrics are NaN
-    metric_cols = ["RMSE", "bias", "NSE", "KGE", "R"]
-    all_nan = df[metric_cols].isna().all(axis=1)
-    if all_nan.any():
-        print(f"  Excluded {all_nan.sum()} station(s) with all-NaN metrics (n<3)")
-        df = df[~all_nan]
+    # drop stations with n=0 (no paired observations)
+    n_zero = (df["n"] == 0).sum()
+    if n_zero:
+        df = df[df["n"] > 0]
+        print(f"  Dropped {n_zero} station(s) with zero paired observations")
+    
+    # report how many stations had 0 < n < min_n
+    few = (df["n"] < min_n).sum()
+    if few:
+        print(f"  Included {few} station(s) with 0 < n < {min_n} — bias computed, other metrics NaN")
     return df
 
 if __name__ == "__main__":
