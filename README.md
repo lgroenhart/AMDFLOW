@@ -81,3 +81,36 @@ The default file structure for the data, model, and output is as follows:
 5. **\upperfolder\data\validation data**: The output of the model is by default also places in the validation data subfolder.
 
 The file structure for the data, model and output can be easily changed using keyword arguments.
+
+## References
+Barbarossa, Valerio, Mark A.J. Huijbregts, Arthur H.W. Beusen, Hylke E.
+Beck, Henry King, and Aafke M. Schipper. 2018. "FLO1K, Global Maps of
+Mean, Maximum and Minimum Annual Streamflow at 1 Km Resolution from 1960
+Through 2015." *Scientific Data* 5 (1): 180052.
+https://doi.org/10.1038/sdata.2018.52.
+
+Lehner, Bernhard, and Günther Grill. 2013. “Global River Hydrography and Network Routing:
+Baseline Data and New Approaches to Study the World's Large River Systems.” Hydrological
+Processes 27 (15): 2171–86. https://doi.org/10.1002/hyp.9740.
+
+Lehner, Bernhard, Kristine Verdin, and Andy Jarvis. 2008. “New Global Hydrography Derived
+From Spaceborne Elevation Data.” Eos, Transactions American Geophysical Union 89 (10):
+93–94. https://doi.org/10.1029/2008EO100001.
+
+Ma, Xiaogang, Jolyon Ralph, Jiyin Zhang, et al. 2024. “OpenMindat : Open and FAIR
+Mineralogy Data from the Mindat Database.” Geoscience Data Journal 11 (1): 94–104.
+https://doi.org/10.1002/gdj3.204.
+
+Jones, Edward R, Frederik Kratzert, and Michelle van Vliet. 2025. "Caravan-Qual: A
+Global Scale Integration of Water Quality Observations into a
+Large-Sample Hydrology Dataset." *Pre-print*. https://doi.org//10.31223/X54J39
+
+Tang, Liang, and Tim T. Werner. 2023. “Global Mining Footprint Mapped from High-Resolution
+Satellite Imagery.” Communications Earth & Environment 4 (1): 134. https://doi.org/10.1038/s43247-023-00805-6.
+
+Zhang, Jiyin, Cory Clairmont, and Xiaogang Ma. 2024. “OpenMindat: A Python Package for
+Geomaterial Data Analysis and Retrieval from Mindat API.” In GitHub Repository. GitHub.
+https://github.com/ChuBL/OpenMindat.
+
+
+
