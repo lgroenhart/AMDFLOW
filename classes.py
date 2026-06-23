@@ -15,7 +15,7 @@ from collections import deque
 
 class AMDModel:
     """AMDModel class for Acid Mine Drainage modelling
-    This class takes in a dataset containing variables (Q, ore, ID, outID, source) and runs the AMD flow model over time (.run()),
+    This class takes in a dataset containing variables (Q, ore, ID, outID, source, slope) and runs the AMD flow model over time (.run()),
     results are written to output_path as a netCDF file
     """
     def __init__(self, dataset, t_unit, do = 10 / 31998, output_path = "amdflow_output.nc",
@@ -47,7 +47,7 @@ class AMDModel:
             storage exchange coefficient, by default 1e-5
         A_s_ratio : float, optional
             storage zone cross sectional area ratio relative to main channel cross sectional area, by default 0.5
-        buffer_capacity : float, optional
+        buffer_capacity : float, optional, deprecated
             buffer capacity for pH, non-physical instrument to buffer pH, by default 0.1
         mannings : float, optional
             mannings roughness coefficient for velocity from slope calculation, by default 0.044 (set for global)
@@ -144,7 +144,7 @@ class AMDModel:
             
                 Q_2d = self._Q_np[ti].astype(np.float32)
                 self._chemistry(Q_2d)
-                self._transport(t, Q_2d)
+                self._transport(Q_2d)
 
                 for var in self._chem_vars:
                     # 1. Update main buffer
@@ -161,6 +161,15 @@ class AMDModel:
                 self._write_timestep(ti, nc, Q_2d)
                 
     def _chemistry(self, Q_2d):
+        """runs chemistry for one timestep, all variables and all zones, uses process_chemistry() from chemistry.pyx
+
+        Parameters
+        ----------
+        Q_2d : np.ndarray
+            2d array of streamflow
+        """
+
+        # calc velocity and volume
         W = self.a * Q_2d**self.b
         H = self.c * Q_2d**self.f
         _denom = 2 * H + W
@@ -179,7 +188,7 @@ class AMDModel:
         valid_cols = cols.astype(np.intp)
         num_valid = len(valid_rows)
 
-       
+       # calc capping of hydrons
         total_h_mol = (self._buffer["hydrogen_ion"][0] + self._sbuffer["hydrogen_ion"][0])
         total_h_conc = total_h_mol / total_vol
         capped_conc = np.minimum(total_h_conc, 100.0) 
@@ -188,7 +197,7 @@ class AMDModel:
         self._buffer["hydrogen_ion"][0] *= scaling
         self._sbuffer["hydrogen_ion"][0] *= scaling
 
-        # Process main channel chemistry
+        # process main channel chemistry
         process_chemistry(
             self._buffer["ferrous_iron"][0],
             self._buffer["ferric_iron"][0],
@@ -207,7 +216,7 @@ class AMDModel:
             self.max_substeps
         )
 
-        # Process storage zone chemistry
+        # process storage zone chemistry
         process_chemistry(
             self._sbuffer["ferrous_iron"][0],
             self._sbuffer["ferric_iron"][0],
@@ -225,7 +234,7 @@ class AMDModel:
             num_valid,
             self.max_substeps
         )
-        
+        # capping of variables
         for var in self._chem_vars:
             if var == "hydrogen_ion":
                 # main channel
@@ -241,41 +250,49 @@ class AMDModel:
                 scale_s = np.divide(capped_c_s, c_s, out=np.ones_like(c_s), where=c_s>0)
                 self._sbuffer[var][0] *= scale_s
             else:
-                # Cap other species concentrations at a safe physical limit (e.g., 50.0 mol/L)
+                # cap other species concentrations at a safe physical limit: 50 mol/L
                 # to instantly arrest runaway exponential loops
                 if var in self._sbuffer:
-                    # Dissolved species in main channel
+                    # dissolved species in main channel
                     c_main = np.where(volume_2d > 0, self._buffer[var][0] / volume_2d, 0.0)
                     capped_c_main = np.minimum(c_main, 50.0)
                     scale_main = np.divide(capped_c_main, c_main, out=np.ones_like(c_main), where=c_main>0)
                     self._buffer[var][0] *= scale_main
                     
-                    # Dissolved species in storage zone
+                    # dissolved species in storage zone
                     vol_s = volume_2d * self.A_s_ratio
                     c_s = np.where(vol_s > 0, self._sbuffer[var][0] / vol_s, 0.0)
                     capped_c_s = np.minimum(c_s, 50.0)
                     scale_s = np.divide(capped_c_s, c_s, out=np.ones_like(c_s), where=c_s>0)
                     self._sbuffer[var][0] *= scale_s
                 else:
-                    # Particulate variables (only present in main buffer)
+                    # precipitate variables (only present in main buffer)
                     c_main = np.where(volume_2d > 0, self._buffer[var][0] / volume_2d, 0.0)
                     capped_c_main = np.minimum(c_main, 50.0)
                     scale_main = np.divide(capped_c_main, c_main, out=np.ones_like(c_main), where=c_main>0)
                     self._buffer[var][0] *= scale_main
                     
-    def _transport(self, t, Q_2d):
-        # 1. Zero the per‑species C_lat accumulators
+    def _transport(self, Q_2d):
+        """runs transport for one timestep, all variables and both zones, uses _transport() from transport.pyx
+
+        Parameters
+        ----------
+        Q_2d : np.ndarray
+            2d array of streamflow
+        """
+
+        # zero the per‑species C_lat accumulators
         self.C_lat_fe2.fill(0.0)
         self.C_lat_fe3.fill(0.0)
         self.C_lat_h.fill(0.0)
         self.C_lat_so4.fill(0.0)
         self.C_lat_precip.fill(0.0)
 
-        # 2. Fill Q_lat from junction flows (same for all species)
+        # fill Q_lat from junction flows (same for all species)
         self._compute_junction_flows(Q_2d)
         Q_lat = self._Q_lat_buff   # use the same flow array for all species
 
-        # 3. Call the new _transport with junction topology
+        # transport call
         _transport(
             # main channel
             self._buffer["ferrous_iron"][0],
@@ -297,7 +314,7 @@ class AMDModel:
             Q_2d,
             Q_lat, Q_lat, Q_lat, Q_lat, Q_lat,   # same Q_lat for all species
 
-            # lateral mass sources (the accumulators)
+            # lateral mass sources
             self.C_lat_fe2,
             self.C_lat_fe3,
             self.C_lat_h,
@@ -309,7 +326,7 @@ class AMDModel:
             self._id_to_row,
             self._id_to_col,
 
-            # JUNCTION TOPOLOGY – NEW
+            # topology
             self._junc_tail_r,
             self._junc_tail_c,
             self._junc_dst_r,
@@ -349,6 +366,8 @@ class AMDModel:
         """Build cache at initialisation to pre-process certain static variables and mappings for faster access during model run, 
         such as ID to row/col mapping, chemistry variable arrays, and next time mapping for timesteps
         """
+
+        # make mapping of topology
         id_vals = self.dataset["ID"].values
         out_vals = self.dataset["outID"].values
 
@@ -418,6 +437,7 @@ class AMDModel:
         self._build_network_mask()
         self._off_network = ~self._network_mask
 
+        # make working arrays
         if self._max_reach_length >= 1:
             self._cn_working_arrays = {
                 "a": np.empty((self._max_reach_length,), dtype=np.float64),
@@ -537,6 +557,7 @@ class AMDModel:
 
     def _write_timestep(self, ti, nc, Q_2d):
         """Writes chemistry results for timestep index ti from self._buffer to netCDF dataset nc at output_path
+
         Parameters
         ----------
         ti : int
@@ -593,6 +614,18 @@ class AMDModel:
             nc.variables["pH"][ti, :, :] = ph.astype(np.float32)
 
     def _get_volume(self, ti):
+        """calculates volume at timestep
+
+        Parameters
+        ----------
+        ti : int
+            index of current timestep
+
+        Returns
+        -------
+        np.ndarray
+            2d array of volumes
+        """
         W = self.a * self._Q_np[ti]**self.b
         H = self.c * self._Q_np[ti]**self.f
         RH = (W * H) / (H * 2 + W)
@@ -631,8 +664,8 @@ class AMDModel:
             if len(reach) >= 1:
                 reaches.append(reach)
 
-        # --- topological sort (Kahn's algorithm) ---
-        # map each reach's head cell → reach index
+        # topological sort (Kahn's algorithm) 
+        # map each reach's head cell -> reach index
         head_to_reach = {r[0]: i for i, r in enumerate(reaches)}
 
         # for each reach, which reach index is immediately downstream (-1 = none)
@@ -659,14 +692,14 @@ class AMDModel:
                 if in_degree[d] == 0:
                     queue.append(d)
 
-        # guard against cycles (shouldn't occur in a valid river network)
+
         if len(sorted_order) < n:
             visited_set = set(sorted_order)
             sorted_order.extend(i for i in range(n) if i not in visited_set)
 
         self._reaches = [reaches[i] for i in sorted_order]
 
-        # --- junction cache: one entry per reach ---
+        # junction cache: one entry per reach 
         # each entry is (tail_r, tail_c, dst_r, dst_c) or None for sinks
         self._reach_junctions = []
         for reach in self._reaches:
