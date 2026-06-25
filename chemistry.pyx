@@ -35,10 +35,10 @@ cdef inline void _davies_activity(
         molar concentration of ferrous iron (mol/L)
     so4_c :np.ndarray (double)
         molar concentration of sulphate (mol/L)
-    gam_h : np.ndarray (double)
-        output of function: the activity coefficient of hydrons in the solution
-    gam_fe3 : np.ndarray (double)
-        output of function: the activity coefficient of ferric iron in the solution
+    gam_h : np.ndarray (*double)
+        output of function (modified in-place): the activity coefficient of hydrons in the solution
+    gam_fe3 : np.ndarray (*double)
+        output of function (modified in-place): the activity coefficient of ferric iron in the solution
     """
     cdef double I, sqI, d
     I = 0.5 * (h_c + 9.0*fe3_c + 4.0*fe2_c + 4.0*so4_c)
@@ -61,17 +61,17 @@ cdef inline void _apply_equilibrium_precip(
 
     Parameters:
     ---------------------------
-    fe3 : np.ndarray (double)
+    fe3 : np.ndarray (*double)
         ferric iron amount (mol)
-    h : np.ndarray (double)
+    h : np.ndarray (*double)
         hydron amount (mol)
-    fe2 : np.ndarray (double)
+    fe2 : np.ndarray (*double)
         ferrous iron amount (mol)
-    so4 : np.ndarray (double)
+    so4 : np.ndarray (*double)
         sulphate amount (mol)
-    fe_oh3 : np.ndarray (double)
+    fe_oh3 : np.ndarray (*double)
         suspended ferric oxyhydroxide amount (mol)
-    bedload : np.ndarray (double)
+    bedload : np.ndarray (*double)
         deposited ferric oxyhydroxide amount (mol)
     vol_safe : np.ndarray (double)
         safe (clipped to 1e-30) volume amount (L)
@@ -126,11 +126,11 @@ cdef inline void _analytical_fe2_oxidation(
     
     Parameters:
     ---------------------
-    fe2 : np.ndarray (double)
+    fe2 : np.ndarray (*double)
         ferrous iron amount (mol)
-    fe3 : np.ndarray (double)
+    fe3 : np.ndarray (*double)
         ferric iron amount (mol)
-    h : np.ndarray (double)
+    h : np.ndarray (*double)
         hydron amount (mol)
     vol_safe : np.ndarray (double)
         safe (clipped to 1e-30) volume amount (L)
@@ -172,18 +172,18 @@ cdef inline void _pyrite_rhs(
         reactive surface area of pyrite (m**2)
     vol_safe : np.ndarray (double)
         safe (clipped to 1e-30) volume amount (L)
-    h2o : np.ndarray (double)
-        available water for reactions (mol)
+    h2o : np.ndarray (double) 
+        available water for reactions (mol) !!!!deprecated!!!!
     do_sqrt : float (double)
-        square root of the amount of dissolved oxygen (mol/L)
+        square root of the amount of dissolved oxygen (mol/L**0.5)
         amount of do set in __init__() of AMDModel (classes.py)
-    dfe2 : np.ndarray (double)
+    dfe2 : np.ndarray (*double)
         output: rate of fe2 creation (mol/s)
-    dfe3 : np.ndarray (double)
+    dfe3 : np.ndarray (*double)
         output: rate fe3 creation (mol/s)
-    dso4 : np.ndarray (double)
+    dso4 : np.ndarray (*double)
         rate of sulphate creation (mol/s)
-    dh : np.ndarray (mol/s)
+    dh : np.ndarray (*double)
         rate of hydron creation (mol/s)
     """
     cdef double fe3_c, h_c, rate1, rate2
@@ -413,8 +413,8 @@ def process_chemistry(
         active cell indices (contiguous int arrays)
     num_valid : int (Py_ssize_t)
         number of active cells
-    n_substeps : 
-        Backward-Euler sub-steps for pyrite ODEs (default 100 from classes.py)
+    n_substeps : int
+        Backward-Euler sub-steps for pyrite ODEs (default 2, 100 default passed from classes.py)
     """
     cdef Py_ssize_t k, r, c
     cdef double fe2_, fe3_, so4_, h_, foh_, bed_

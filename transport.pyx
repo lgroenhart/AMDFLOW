@@ -74,55 +74,55 @@ def _transport(
     F64[::1] H_arr,
     long max_reach_length,
 ):
-"""main transport function. solves the transport equations from OTEQ/OTIS using Crank-Nicolson method of central finite differences
+    """main transport function. solves the transport equations from OTEQ/OTIS using Crank-Nicolson method of central finite differences
 
-Parameters:
--------------------------
-conc_fe2, conc_fe3, conc_h, conc_so4, conc_precip : np.ndarray (double)
-    concentrations of a chemical species in main channel (mol) 
-conc_s_fe2, conc_s_fe3, conc_s_h, conc_s_so4, : np.ndarray (double)
-    concentrations of a chemical species in storage zone (mol)
-bedload_storage : np.ndarray (double)
-    concentration of precipitate chemical species on bedload (mol)
-Q : np.ndarray (float32)
-    streamflow array (m3/s)
-Q_lat_fe2, Q_lat_fe3, Q_lat_h, Q_lat_so4, Q_lat_precip : np.ndarray (float32)
-    arrays of streamflow from junction inflow per chemical species
-C_lat_fe2, C_lat_fe3, C_lat_h, C_lat_so4, C_lat_precip : np.ndarray (double) (mol)
-    concentrations of chemical species from junction inflow
-reaches : list
-    list of reaches in downstream order (up -> down), each reach is list of cell IDs
-id_to_row, id_to_col : np.ndarray (int32)
-    arrays of tuples mapping of cell ID to row/col
-tail_r, tail_c, dst_r, dst_c : np.ndarray (int32)
-    arrays of reach tail row/col, or destination row/col in downstream order (up -> down)
-n_junctions : int (Py_ssize_t)
-    amount of junctions
-dx : float (double)
-    distance (delta x) (m)
-S : np.ndarray (float32)
-    Slope
-dt : float (double)
-    timestep size (s)
-alpha_s : float (double)
-    storage exchange coefficient
-A_s_ratio : float (double)
-    ratio number of area * A_s_ratio = storage zone area
-mannings : float (double)
-    mannings roughness number
-wf : float (double)
-    settling velocity of precipitate material
-max_substeps : int 
-    maximimum amount of substeps used by the transport function
-xx_arr (a_arr, b_arr, c_arr, etc.) : np.ndarray
-    working arrays of multiple variables, see classes.py AMDModel __init__()
-rows, cols : np.ndarray (int64)
-    working arrays of all rows/cols
-max_reach_length : int (long)
-    maximum length of a reach, exceeding this causes a ValueError, 
-    used to catch unreasonable long reaches
+    Parameters:
+    -------------------------
+    conc_fe2, conc_fe3, conc_h, conc_so4, conc_precip : np.ndarray (double)
+        amount of a chemical species in main channel (mol) 
+    conc_s_fe2, conc_s_fe3, conc_s_h, conc_s_so4, : np.ndarray (double)
+        amount of a chemical species in storage zone (mol)
+    bedload_storage : np.ndarray (double)
+        amount of precipitate chemical species on bedload (mol)
+    Q : np.ndarray (float32)
+        streamflow array (m3/s)
+    Q_lat_fe2, Q_lat_fe3, Q_lat_h, Q_lat_so4, Q_lat_precip : np.ndarray (float32)
+        arrays of streamflow from junction inflow per chemical species
+    C_lat_fe2, C_lat_fe3, C_lat_h, C_lat_so4, C_lat_precip : np.ndarray (double) 
+        flux rates of chemical species from junction inflow (mol/s)
+    reaches : list
+        list of reaches in downstream order (up -> down), each reach is list of cell IDs
+    id_to_row, id_to_col : np.ndarray (int32)
+        arrays of tuples mapping of cell ID to row/col
+    tail_r, tail_c, dst_r, dst_c : np.ndarray (int32)
+        arrays of reach tail row/col, or destination row/col in downstream order (up -> down)
+    n_junctions : int (Py_ssize_t)
+        amount of junctions
+    dx : float (double)
+        distance (delta x) (m)
+    S : np.ndarray (float32)
+        Slope
+    dt : float (double)
+        timestep size (s)
+    alpha_s : float (double)
+        storage exchange coefficient (s**-1)
+    A_s_ratio : float (double)
+        ratio number of area * A_s_ratio = storage zone area
+    mannings : float (double)
+        mannings roughness number
+    wf : float (double)
+        settling velocity of precipitate material (m/s)
+    max_substeps : int 
+        maximimum amount of substeps used by the transport function
+    xx_arr (a_arr, b_arr, c_arr, etc.) : np.ndarray
+        working arrays of multiple variables, see classes.py AMDModel __init__()
+    rows, cols : np.ndarray (int64)
+        working arrays of all rows/cols
+    max_reach_length : int (long)
+        maximum length of a reach, exceeding this causes a ValueError, 
+        used to catch unreasonable long reaches
 
-"""
+    """
     cdef:
         I64 reach_id, i, r0, c0, sub, species_idx
         double Q_i, v_i, A_i, V_i, D_i, H_i, S_i, settling_loss
@@ -406,19 +406,19 @@ def _build_junction_inflows(
     I32[::1] dst_c,
     Py_ssize_t n_junctions,
 ):
-"""helper function to get the 'lateral' inflow, meaning the inflow into junction cells
+    """helper function to get the 'lateral' inflow, meaning the inflow into junction cells
 
-Parameters:
----------------------
-Q : np.ndarray (float32)
-    streamflow 
-Q_lat_out : np.ndarray (float32)
-    array of streamflow out from cells going into junctions 
-tail_r, tail_c, dst_r, dst_c : np.ndarray (int32)
-    arrays of reach tail row/col, or destination row/col in downstream order (up -> down)
-n_junctions : int (Py_ssize_t)
-    amount of junctions
-"""
+    Parameters:
+    ---------------------
+    Q : np.ndarray (float32)
+        streamflow 
+    Q_lat_out : np.ndarray (float32)
+        array of streamflow out from cells going into junctions 
+    tail_r, tail_c, dst_r, dst_c : np.ndarray (int32)
+        arrays of reach tail row/col, or destination row/col in downstream order (up -> down)
+    n_junctions : int (Py_ssize_t)
+        amount of junctions
+    """
     cdef Py_ssize_t k, tr, tc, dr, dc
     cdef double Q_t
 

@@ -44,7 +44,7 @@ class AMDModel:
         wf : float, optional
             settling velocity of iron hydroxides, by default 0.00142 m/s
         alpha_s : float, optional
-            storage exchange coefficient, by default 1e-5
+            storage exchange coefficient, by default 1e-5 (s**-1)
         A_s_ratio : float, optional
             storage zone cross sectional area ratio relative to main channel cross sectional area, by default 0.5
         buffer_capacity : float, optional, !!!!deprecated!!!!!
@@ -166,7 +166,7 @@ class AMDModel:
         Parameters
         ----------
         Q_2d : np.ndarray
-            2d array of streamflow
+            2d array of streamflow (m**3/s)
         """
 
         # calc velocity and volume
@@ -278,7 +278,7 @@ class AMDModel:
         Parameters
         ----------
         Q_2d : np.ndarray
-            2d array of streamflow
+            2d array of streamflow (m**3/s)
         """
 
         # zero the per‑species C_lat accumulators
@@ -564,6 +564,8 @@ class AMDModel:
             index of timestep
         nc : netCDF4.Dataset()
             the open netCDF dataset to write to, created in _create_output_file
+        Q_2d : np.ndarray
+            2d array of streamflow (m**3/s)
         """
         W = self.a * Q_2d**self.b
         H = self.c * Q_2d**self.f
@@ -624,7 +626,7 @@ class AMDModel:
         Returns
         -------
         np.ndarray
-            2d array of volumes
+            2d array of volumes (L)
         """
         W = self.a * self._Q_np[ti]**self.b
         H = self.c * self._Q_np[ti]**self.f
