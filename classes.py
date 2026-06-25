@@ -30,7 +30,7 @@ class AMDModel:
         t_unit : str
             time unit for the model: "month", "week", "day", "hour", or "minute", should align with timesteps of the dataset
         do : float, optional
-            dissolved oxygen concentration, by default 10/31998
+            dissolved oxygen concentration, by default 10/31998 (mol/L)
         output_path : str, optional
             path to the output netCDF file, by default "amdflow_output.nc"
         a : float, optional
