@@ -50,7 +50,7 @@ def _transport(
     I32[:] id_to_row,
     I32[:] id_to_col,
 
-    # Junction topology – NEW
+    # junction topology 
     I32[::1] tail_r, I32[::1] tail_c,
     I32[::1] dst_r,  I32[::1] dst_c,
     Py_ssize_t n_junctions,
@@ -74,6 +74,55 @@ def _transport(
     F64[::1] H_arr,
     long max_reach_length,
 ):
+"""main transport function. solves the transport equations from OTEQ/OTIS using Crank-Nicolson method of central finite differences
+
+Parameters:
+-------------------------
+conc_fe2, conc_fe3, conc_h, conc_so4, conc_precip : np.ndarray (double)
+    concentrations of a chemical species in main channel (mol) 
+conc_s_fe2, conc_s_fe3, conc_s_h, conc_s_so4, : np.ndarray (double)
+    concentrations of a chemical species in storage zone (mol)
+bedload_storage : np.ndarray (double)
+    concentration of precipitate chemical species on bedload (mol)
+Q : np.ndarray (float32)
+    streamflow array (m3/s)
+Q_lat_fe2, Q_lat_fe3, Q_lat_h, Q_lat_so4, Q_lat_precip : np.ndarray (float32)
+    arrays of streamflow from junction inflow per chemical species
+C_lat_fe2, C_lat_fe3, C_lat_h, C_lat_so4, C_lat_precip : np.ndarray (double) (mol)
+    concentrations of chemical species from junction inflow
+reaches : list
+    list of reaches in downstream order (up -> down), each reach is list of cell IDs
+id_to_row, id_to_col : np.ndarray (int32)
+    arrays of tuples mapping of cell ID to row/col
+tail_r, tail_c, dst_r, dst_c : np.ndarray (int32)
+    arrays of reach tail row/col, or destination row/col in downstream order (up -> down)
+n_junctions : int (Py_ssize_t)
+    amount of junctions
+dx : float (double)
+    distance (delta x) (m)
+S : np.ndarray (float32)
+    Slope
+dt : float (double)
+    timestep size (s)
+alpha_s : float (double)
+    storage exchange coefficient
+A_s_ratio : float (double)
+    ratio number of area * A_s_ratio = storage zone area
+mannings : float (double)
+    mannings roughness number
+wf : float (double)
+    settling velocity of precipitate material
+max_substeps : int 
+    maximimum amount of substeps used by the transport function
+xx_arr (a_arr, b_arr, c_arr, etc.) : np.ndarray
+    working arrays of multiple variables, see classes.py AMDModel __init__()
+rows, cols : np.ndarray (int64)
+    working arrays of all rows/cols
+max_reach_length : int (long)
+    maximum length of a reach, exceeding this causes a ValueError, 
+    used to catch unreasonable long reaches
+
+"""
     cdef:
         I64 reach_id, i, r0, c0, sub, species_idx
         double Q_i, v_i, A_i, V_i, D_i, H_i, S_i, settling_loss
@@ -87,22 +136,22 @@ def _transport(
         bint has_settling, has_storage
         I32[:] reach_ids
 
-        # Local memoryview variables bound per species
+        # local memoryview variables bound per species
         double[:, ::1] conc
         double[:, ::1] conc_s
         F32[:, ::1] Q_lat
         double[:, ::1] C_lat
 
-        # Buffer to store old concentrations for storage/settling calculations
+        # buffer to store old concentrations for storage/settling calculations
         double[:] C_old_arr = np.zeros(max_reach_length, dtype=np.float64)
 
-        # Junction mass outflow accumulators
+        # junction mass outflow accumulators
         double outflow_sum[5]
         bint last_is_tail
         Py_ssize_t dst_idx
         double v_tail, A_tail, mass_flux_sub
 
-    # Build mapping: tail cell position -> list of destination (dr, dc)
+    # build mapping: tail cell position -> list of destination (dr, dc)
     tail_to_dest = {}
     cdef Py_ssize_t k
     for k in range(n_junctions):
@@ -111,7 +160,7 @@ def _transport(
             tail_to_dest[tail_pos] = []
         tail_to_dest[tail_pos].append((dst_r[k], dst_c[k]))
 
-    # 1. Loop over each reach
+    # loop over each reach
     for reach_ids_py in reaches:
         reach_ids = np.asarray(reach_ids_py, dtype=np.int32)
         reach_len = len(reach_ids)
@@ -121,7 +170,7 @@ def _transport(
 
         max_C = 0.0
 
-        # 2. Pre‑compute hydraulics for the current reach EXACTLY ONCE
+        # pre‑compute hydraulics for the current reach 
         for i in range(reach_len):
             r0 = id_to_row[reach_ids[i]]
             c0 = id_to_col[reach_ids[i]]
@@ -137,7 +186,7 @@ def _transport(
             v_i = mannings**(-1.0) * RH**(2.0/3.0) * sqrt(fmax(S_i, 0.0))
 
             A_i = fmax(Q_i / v_i, 1e-6)
-            V_i = A_i * dx * 1000.0  # Volume in Liters
+            V_i = A_i * dx * 1000.0  # volume in Liters
 
             Re = (997.1 * v_i * 4.0 * RH) / 0.894e-3
             f_fric = 64.0 / (Re + 1e-30)
@@ -161,10 +210,10 @@ def _transport(
             n_sub = max_substeps
         dt_sub = dt / n_sub
 
-        # Determine if the last cell of this reach is a junction tail
+        # determine if the last cell of this reach is a junction tail
         last_is_tail = (rows[reach_len-1], cols[reach_len-1]) in tail_to_dest
 
-        # 3. Process each chemical species
+        # process each chemical species
         for species_idx in range(5):
             if species_idx == 0:
                 conc = conc_fe2
@@ -194,7 +243,7 @@ def _transport(
                 C_lat = C_lat_so4
                 has_settling = False
                 has_storage = True
-            else:  # species_idx == 4 ('precip')
+            else:  # species_idx == 4 ("precip")
                 conc = conc_precip
                 conc_s = None
                 Q_lat = Q_lat_precip
@@ -202,19 +251,19 @@ def _transport(
                 has_settling = True
                 has_storage = False
 
-            # Reset outflow accumulator for this species
+            # reset outflow accumulator for this species
             outflow_sum[species_idx] = 0.0
 
             for sub in range(n_sub):
                 bc_top = conc[rows[0], cols[0]] / fmax(V_i_arr[0], 1e-30)
 
-                # Save old concentrations for this substep
+                # save old concentrations for this substep
                 for i in range(reach_len):
                     r0 = rows[i]
                     c0 = cols[i]
                     C_old_arr[i] = conc[r0, c0] / fmax(V_i_arr[i], 1e-30)
 
-                # Build Crank‑Nicolson Matrix
+                # build Crank‑Nicolson matrix
                 for i in range(reach_len):
                     r0 = rows[i]
                     c0 = cols[i]
@@ -244,12 +293,12 @@ def _transport(
                     else:
                         C_ip1 = C_i
 
-                    # Standard CN Coefficients
+                    # CN Coefficients
                     ai = -(0.5 * r_coef + 0.5 * s_adv)
                     bi = 1.0 + 0.5 * (2.0 * r_coef + p) + 0.5 * s_adv
                     ci = -0.5 * r_coef
 
-                    # Base RHS vector assignment including direct lateral mass entry
+                    # RHS vector assignment including direct lateral mass entry
                     di = ((0.5 * r_coef + 0.5 * s_adv) * C_im1
                         + (1.0 - 0.5 * (2.0 * r_coef + p) - 0.5 * s_adv) * C_i
                         + 0.5 * r_coef * C_ip1
@@ -263,7 +312,7 @@ def _transport(
                         bi += ci
                         ci = 0.0
 
-                    # Transient storage (Runkel Eq. 17)
+                    # transient storage
                     if has_storage:
                         alpha_m = alpha_s
                         alpha_st = alpha_s / A_s_ratio
@@ -274,7 +323,7 @@ def _transport(
                         bi += (0.5 * alpha_m * dt_sub) / (1.0 + gamma)
                         di += (alpha_m * dt_sub * C_s_old) / (1.0 + gamma) - (0.5 * alpha_m * dt_sub * C_i) / (1.0 + gamma)
 
-                    # Settling loss
+                    # settling loss
                     if has_settling:
                         settling_term = wf / fmax(H_i, 0.1)
                         bi += 0.5 * settling_term * dt_sub
@@ -285,7 +334,7 @@ def _transport(
                     c_arr[i] = ci
                     d_arr[i] = di
 
-                # Solve Thomas Algorithm
+                # Thomas Algorithm
                 c_prime[0] = c_arr[0] / b_arr[0]
                 d_prime[0] = d_arr[0] / b_arr[0]
 
@@ -299,7 +348,7 @@ def _transport(
                 for i in range(reach_len-2, -1, -1):
                     x_arr[i] = d_prime[i] - c_prime[i] * x_arr[i+1]
 
-                # --- Compute outflow mass for the tail cell of this reach ---
+                # compute outflow mass for the tail cell of this reach
                 if last_is_tail:
                     i = reach_len - 1
                     v_tail = <double>v_arr[i]
@@ -308,7 +357,7 @@ def _transport(
                     mass_flux_sub = v_tail * A_tail * 1000.0 * 0.5 * (C_old_arr[i] + x_arr[i])
                     outflow_sum[species_idx] += mass_flux_sub * dt_sub
 
-                # Update Main Channel, Bedload, and Transient Storage
+                # update main channel, storage zone, bedload zone
                 for i in range(reach_len):
                     r0 = rows[i]
                     c0 = cols[i]
@@ -317,16 +366,16 @@ def _transport(
                     C_new = fmax(x_arr[i], 0.0)
                     C_old = C_old_arr[i]
 
-                    # Main channel update
+                    # main channel update
                     conc[r0, c0] = C_new * V_i
 
-                    # Settling / Bedload explicit update
+                    # settling / bedload explicit update
                     if has_settling:
                         settling_term = wf / fmax(H_arr[i], 0.1)
                         settled_moles = settling_term * ((C_old + C_new) / 2.0) * dt_sub * V_i
                         bedload_storage[r0, c0] += fmax(settled_moles, 0.0)
 
-                    # Storage zone update (Runkel Eq 25)
+                    # storage zone update
                     if has_storage:
                         alpha_st = alpha_s / A_s_ratio
                         gamma = (dt_sub * alpha_st) / 2.0
@@ -336,12 +385,12 @@ def _transport(
 
                         conc_s[r0, c0] = fmax(C_s_new * (A_s_ratio * V_i), 0.0)
 
-        # 4. After all species for this reach are solved, transfer accumulated outflow mass
-        #    to the downstream cells' C_lat arrays.
+        # after all species for this reach are solved, transfer accumulated outflow mass
+        # to the downstream cells' C_lat arrays.
         if last_is_tail:
             tail_key = (rows[reach_len-1], cols[reach_len-1])
             for (dr, dc) in tail_to_dest[tail_key]:
-                # Accumulate moles per second for each species
+                # accumulate moles per second for each species
                 C_lat_fe2[dr, dc] += outflow_sum[0] / dt
                 C_lat_fe3[dr, dc] += outflow_sum[1] / dt
                 C_lat_h[dr, dc]   += outflow_sum[2] / dt
@@ -357,6 +406,19 @@ def _build_junction_inflows(
     I32[::1] dst_c,
     Py_ssize_t n_junctions,
 ):
+"""helper function to get the 'lateral' inflow, meaning the inflow into junction cells
+
+Parameters:
+---------------------
+Q : np.ndarray (float32)
+    streamflow 
+Q_lat_out : np.ndarray (float32)
+    array of streamflow out from cells going into junctions 
+tail_r, tail_c, dst_r, dst_c : np.ndarray (int32)
+    arrays of reach tail row/col, or destination row/col in downstream order (up -> down)
+n_junctions : int (Py_ssize_t)
+    amount of junctions
+"""
     cdef Py_ssize_t k, tr, tc, dr, dc
     cdef double Q_t
 

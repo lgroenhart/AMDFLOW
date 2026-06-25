@@ -47,8 +47,8 @@ class AMDModel:
             storage exchange coefficient, by default 1e-5
         A_s_ratio : float, optional
             storage zone cross sectional area ratio relative to main channel cross sectional area, by default 0.5
-        buffer_capacity : float, optional, deprecated
-            buffer capacity for pH, non-physical instrument to buffer pH, by default 0.1
+        buffer_capacity : float, optional, !!!!deprecated!!!!!
+            buffer capacity for pH, non-physical instrument to buffer pH, by default 0.0
         mannings : float, optional
             mannings roughness coefficient for velocity from slope calculation, by default 0.044 (set for global)
         max_substeps : int, optional
