@@ -112,14 +112,44 @@ def load_datasets(amd_path, caravan_path, acc_path, rivers_path):
     
     caravan = xr.open_dataset(caravan_path, engine="zarr", chunks={})
     
-    def cell_area_km2(lat, lon):
-        """Return approximate area (km²) of a 30-arc-second cell at given latitude."""
-        deg_to_km = 111.32
-        cell_width_deg = 1/120.0   # 30 arc-seconds
-        km_per_deg_lon = deg_to_km * np.cos(np.radians(lat))
-        return (deg_to_km * cell_width_deg) * (km_per_deg_lon * cell_width_deg)
-    
-    return amd, caravan, acc_array, acc_transform, acc_nodata, rivers, cell_area_km2
+    return amd, caravan, acc_array, acc_transform, acc_nodata, rivers
+
+def cell_area(amd):
+
+    # adapted from: https://gis.stackexchange.com/questions/317392/determine-area-of-cell-in-raster-qgis 
+    lats_1d = amd["lat"].values
+    lons_1d = amd["lon"].values
+
+    rows = len(lats_1d)
+    cols = len(lons_1d)
+
+
+    pix_height = float(lats_1d[1] - lats_1d[0])
+    pix_width  = float(lons_1d[1] - lons_1d[0])
+
+
+    ulY_edge = float(lats_1d[0])  - pix_height / 2
+    lrY_edge = float(lats_1d[-1]) + pix_height / 2
+
+    a = 6378137
+    b = 6356752.3142
+
+    lats = np.linspace(ulY_edge, lrY_edge, rows + 1)
+    lats = lats * np.pi / 180
+
+    e       = np.sqrt(1 - (b/a)**2)
+    sinlats = np.sin(lats)
+    zm = 1 - e * sinlats
+    zp = 1 + e * sinlats
+
+    q = pix_width / 360
+
+    areas_to_equator   = np.pi * b**2 * (2*np.arctanh(e*sinlats) / (2*e) + sinlats / (zp*zm)) / 10**6
+    areas_between_lats = np.diff(areas_to_equator)
+    areas_cells        = np.abs(areas_between_lats) * q
+
+    areagrid = np.transpose(np.matlib.repmat(areas_cells, cols, 1))
+    return areagrid
 
 def wqms_stations_domain_filter(amd, caravan):
     """bounding box filter of caravan stations to be within general AMD region 
@@ -308,12 +338,14 @@ def snap_cells_to_river(amd_lat_2d, amd_lon_2d, valid_mask, rivers_gdf, target_c
             }
     return cell_to_river
 
-def assign_uparea_from_acc(amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_transform, acc_nodata, cell_area_func):
+def assign_uparea_from_acc(amd, amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_transform, acc_nodata, cell_area_func):
     """ Read upstream area (km²) for each valid AMDFLOW cell from ACC grid.
     acc_array is a 2D numpy array (already read).
 
     Parameters
     ----------
+    amd : xr.dataset
+        AMDFLOW output dataset
     amd_lat_2d : np.ndarray
         2D array of latitudes for AMDFLOW grid cells, shape (nlat, nlon)
     amd_lon_2d : np.ndarray
@@ -327,8 +359,6 @@ def assign_uparea_from_acc(amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_tr
     acc_nodata : float
         No-data value for the flow accumulation array
         _description_
-    cell_area_func : function (deprecated)
-        area calculation of raster cell, no longer used, 1 km2 cell assumed
 
     Returns
     -------
@@ -336,6 +366,7 @@ def assign_uparea_from_acc(amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_tr
     """
     print("Assigning upstream watershed area to cells from flow accumulation")
     uparea_dict = {}
+    cell_areas = cell_area(amd)
     for ilat, ilon in zip(*np.where(valid_mask)):
         lon = amd_lon_2d[ilat, ilon]
         lat = amd_lat_2d[ilat, ilon]
@@ -345,7 +376,7 @@ def assign_uparea_from_acc(amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_tr
         if 0 <= row_int < acc_array.shape[0] and 0 <= col_int < acc_array.shape[1]:
             acc_val = acc_array[row_int, col_int]
             if acc_val > 0 and acc_val != acc_nodata:
-                cell_area_km2 = 1.0
+                cell_area_km2 = cell_areas[ilat, ilon]
                 uparea_km2 = acc_val * cell_area_km2
                 uparea_dict[(ilat, ilon)] = uparea_km2
             else:
@@ -850,7 +881,7 @@ if __name__ == "__main__":
     print("against Caravan-Qual Lite using HydroSHEDS network + area ratio snapping.")
     
     # load everything
-    amd, caravan, acc_array, acc_transform, acc_nodata, rivers, cell_area_func = load_datasets(
+    amd, caravan, acc_array, acc_transform, acc_nodata, rivers = load_datasets(
         amd_path, caravan_path, acc_path, rivers_path
     )
     
@@ -870,8 +901,8 @@ if __name__ == "__main__":
     amd_lat_2d, amd_lon_2d = np.meshgrid(lat_vals, lon_vals, indexing="ij")
     
     # upstream areas from ACC
-    uparea_dict = assign_uparea_from_acc(amd_lat_2d, amd_lon_2d, valid_mask,
-                                         acc_array, acc_transform, acc_nodata, cell_area_func)
+    uparea_dict = assign_uparea_from_acc(amd, amd_lat_2d, amd_lon_2d, valid_mask,
+                                         acc_array, acc_transform, acc_nodata)
     
     # snap AMD cells to river network (once)
     cell_to_river = snap_cells_to_river(amd_lat_2d, amd_lon_2d, valid_mask, rivers, utm_crs)
