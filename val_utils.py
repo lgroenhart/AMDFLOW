@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from pyproj import Transformer
 from scipy.spatial import cKDTree
+from scipy.stats import iqr, pearsonr
 import os
 import scores as sc
 from sklearn.metrics import r2_score
@@ -743,7 +744,7 @@ def full_run(var_map, matches_ph, matches_iron, amd, caravan,
     return all_results
 
 def compute_metrics(obs, mod):
-    """Compute RMSE, bias, NSE, KGE, R for two pandas Series (aligned by time)
+    """Compute RMSE, bias, NSE, KGE, R, FZE for two pandas Series (aligned by time)
 
     Parameters
     ----------
@@ -755,7 +756,7 @@ def compute_metrics(obs, mod):
     Returns
     -------
     dict
-        Dictionary of metrics: n, RMSE, bias, NSE, KGE, R
+        Dictionary of metrics: n, RMSE, bias, NSE, KGE, R, FZE
     """
     o = obs.resample("W").mean()
     m = mod.resample("W").mean()
@@ -768,7 +769,7 @@ def compute_metrics(obs, mod):
     m = m[valid]
     n = len(o)
     if n < 3 or o.std() == 0 or m.std() == 0:
-        return {"n": n, "RMSE": np.nan, "bias": np.nan, "NSE": np.nan, "KGE": np.nan, "R": np.nan}
+        return {"n": n, "RMSE": np.nan, "bias": np.nan, "NSE": np.nan, "KGE": np.nan, "R": np.nan, "FZE": np.nan}
     
     # Use xarray for compat with scores
     o_da = xr.DataArray(o.values, dims=["time"])
@@ -778,7 +779,13 @@ def compute_metrics(obs, mod):
     nse = sc.continuous.nse(o_da, m_da).compute().values.item()
     r = r2_score(o, m)
     kge = sc.continuous.kge(o_da, m_da).compute().values.item()
-    return {"n": n, "RMSE": rmse, "bias": bias, "NSE": nse, "KGE": kge, "R": r}
+
+    beta = np.mean(mod) / np.mean(obs)
+    gamma = iqr(mod) / iqr(obs)
+    p_r, _ = pearsonr(obs, mod)
+    fze = 1 - np.sqrt((r - 1)**2 + (gamma - 1)**2 + (beta - 1) **2)
+
+    return {"n": n, "RMSE": rmse, "bias": bias, "NSE": nse, "KGE": kge, "R": r, "FZE": fze}
 
 def validation_metrics(ts, min_n=3):
     """Compute per-station metrics and return DataFrame.
@@ -792,10 +799,10 @@ def validation_metrics(ts, min_n=3):
     Returns
     -------
     pd.DataFrame
-        DataFrame with columns: wqms_id, n, RMSE, bias, NSE, KGE, R
+        DataFrame with columns: wqms_id, n, RMSE, bias, NSE, KGE, R, FZE
     """
     if ts.empty:
-        return pd.DataFrame(columns=["n", "RMSE", "bias", "NSE", "KGE", "R"]).set_index(pd.Index([], name="wqms_id"))
+        return pd.DataFrame(columns=["n", "RMSE", "bias", "NSE", "KGE", "R", "FZE"]).set_index(pd.Index([], name="wqms_id"))
 
     rows = []
     for sid, grp in ts.groupby("wqms_id"):
@@ -822,6 +829,7 @@ def validation_metrics(ts, min_n=3):
         NSE = np.nan
         KGE = np.nan
         R = np.nan
+        FZE = np.nan
         if n >= min_n and o.std() != 0 and m.std() != 0:
             # Use xarray for compatibility with scores
             o_da = xr.DataArray(o.values, dims=["time"])
@@ -842,8 +850,15 @@ def validation_metrics(ts, min_n=3):
                 R = r2_score(o, m)
             except Exception:
                 R = np.nan
+            try:
+                beta = np.mean(m) / np.mean(o)
+                gamma = iqr(m) / iqr(o)
+                r, _ = pearsonr(o, m)
+                fze = 1 - np.sqrt((r - 1)**2 + (gamma - 1)**2 + (beta - 1)**2)
+            except:
+                fze = np.nan
 
-        rows.append({"wqms_id": sid, "n": n, "RMSE": RMSE, "bias": bias, "NSE": NSE, "KGE": KGE, "R": R})
+        rows.append({"wqms_id": sid, "n": n, "RMSE": RMSE, "bias": bias, "NSE": NSE, "KGE": KGE, "R": R, "FZE": fze})
 
     df = pd.DataFrame(rows).set_index("wqms_id")
     
