@@ -339,7 +339,7 @@ def snap_cells_to_river(amd_lat_2d, amd_lon_2d, valid_mask, rivers_gdf, target_c
             }
     return cell_to_river
 
-def assign_uparea_from_acc(amd, amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_transform, acc_nodata, cell_area_func):
+def assign_uparea_from_acc(amd, amd_lat_2d, amd_lon_2d, valid_mask, acc_array, acc_transform, acc_nodata):
     """ Read upstream area (km²) for each valid AMDFLOW cell from ACC grid.
     acc_array is a 2D numpy array (already read).
 
@@ -359,7 +359,6 @@ def assign_uparea_from_acc(amd, amd_lat_2d, amd_lon_2d, valid_mask, acc_array, a
         Affine transformation for converting coordinates to grid indices
     acc_nodata : float
         No-data value for the flow accumulation array
-        _description_
 
     Returns
     -------
@@ -417,17 +416,10 @@ def compute_network_distance(seg_id_a, point_a_proj, seg_id_b, point_b_proj, riv
         pos_b = seg_geom.project(point_b_proj)
         return abs(pos_a - pos_b) / 1000.0   # metres -> km
     
-    # Different segments: need shortest path through graph.
-    # We approximate by using the endpoints of each segment, 
-    # which requires that we know the nodes of the network.
-    # For simplicity, we fall back to Euclidean distance if no path found,
-    # with a warning.
+
     try:
-        # Attempt to find path using segment IDs as nodes.
-        # This is incomplete (should use node-to-node distances) but works
-        # if the river network graph is built with segments as nodes and edge lengths.
+
         path = nx.shortest_path(graph, source=seg_id_a, target=seg_id_b, weight='length')
-        # We ignore the on-ramp/off-ramp distances at the ends (simplification)
         total_km = sum(graph[path[i]][path[i+1]]['length'] for i in range(len(path)-1))
         return total_km
     except (nx.NetworkXNoPath, nx.NodeNotFound):
@@ -854,11 +846,11 @@ def validation_metrics(ts, min_n=3):
                 beta = np.mean(m) / np.mean(o)
                 gamma = iqr(m) / iqr(o)
                 r, _ = pearsonr(o, m)
-                fze = 1 - np.sqrt((r - 1)**2 + (gamma - 1)**2 + (beta - 1)**2)
+                FZE = 1 - np.sqrt((r - 1)**2 + (gamma - 1)**2 + (beta - 1)**2)
             except:
-                fze = np.nan
+                FZE = np.nan
 
-        rows.append({"wqms_id": sid, "n": n, "RMSE": RMSE, "bias": bias, "NSE": NSE, "KGE": KGE, "R": R, "FZE": fze})
+        rows.append({"wqms_id": sid, "n": n, "RMSE": RMSE, "bias": bias, "NSE": NSE, "KGE": KGE, "R": R, "FZE": FZE})
 
     df = pd.DataFrame(rows).set_index("wqms_id")
     
@@ -873,6 +865,7 @@ def validation_metrics(ts, min_n=3):
     if few:
         print(f"  Included {few} station(s) with 0 < n < {min_n} — bias computed, other metrics NaN")
     return df
+    
 
 if __name__ == "__main__":
     case_study_nr = "CSIII"
