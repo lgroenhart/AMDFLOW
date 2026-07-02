@@ -16,6 +16,7 @@ import rasterio as rio
 import rasterio.features
 import rioxarray
 import pyflwdir
+from scipy.interpolate import CubicHermiteSpline
 
 def mindat_collector(region, material_id = 3314, mineral_strings = "(Fe|S)", material_name = "pyrite", path_str = "../data/", mindat_api_str = "mindat_API_key.txt"):
     """Mindat data collector, queries mindat API in specific region for a specific mineral and checks if those minerals are located at a mine/quarry, saves locations at lat/lon csv file
@@ -143,17 +144,28 @@ def vector_rasterisation(output_path="../data/mines_raster.tif",
 
     print(f"Raster saved to {output_path}")
 
-def flo1k_prep(flo1k_path = "../data/FLO1K.ts.1960.2015.qav.nc", 
+def flo1k_prep(flo1k_qav_path = "../data/FLO1K.ts.1960.2015.qav.nc", 
+               flo1k_qma_path = "../data/FLO1K.ts.1960.2015.qma.nc", 
+               flo1k_qmi_path = "../data/FLO1K.ts.1960.2015.qmi.nc", 
                basins_path = "../data/hybas_eu_lev01-04/hybas_eu_lev04_v1c.shp",
                basins_iloc = (45, 53),
                date = np.datetime64("2015-01-01"),
-               output_path = f"../data/flo_IPB_", aoi = None):
-    """Function to clip the full flo1k dataset to a specified area of interest and dates, saves clipped flo1k to new netcdf file
+               aoi = None,
+               length = 52,
+               frequency = "W",
+               time_first = "1960"):
+    """Function to clip the full flo1k dataset to a specified area of interest and dates, 
+    merges the qav, qmi and qma datasets and runs cubic hermite splining with max streamflow in winter,
+    minimum streamflow in summer and average streamflow in spring and autumn (splining is done in splining() func)
 
     Parameters
     ----------
-    flo1k_path : str, optional
-        string of where flo1k dataset is located, by default "../data/FLO1K.ts.1960.2015.qav.nc"
+    flo1k_qav_path : str, optional
+        string of where flo1k (qav: average) dataset is located, by default "../data/FLO1K.ts.1960.2015.qav.nc"
+    flo1k_qma_path : str, optional
+        string of where flo1k (qma: maximum) dataset is located, by default "../data/FLO1K.ts.1960.2015.qav.nc"
+    flo1k_qmi_path : str, optional
+        string of where flo1k (qmi: minimum) dataset is located, by default "../data/FLO1K.ts.1960.2015.qav.nc"
     basins_path : str, optional
         string of where HydroBASINC data is located, used for clipping of flo1k dataset to area of interest, by default "../data/hybas_eu_lev01-06_v1c/hybas_eu_lev04_v1c.shp"
     basins_iloc : tuple, optional
@@ -161,38 +173,159 @@ def flo1k_prep(flo1k_path = "../data/FLO1K.ts.1960.2015.qav.nc",
     date : np.datetime64 OR np.ndarray, optional
         np.datetime64 type object of what dates (1960-2015) the clipped flo1k dataset should save, if more than one should be used use np.ndarray, by default np.datetime64("2015-01-01") OR
         np.ndarray of np.datetime64 objects of what dates (1060-2015) the clipped flo1k dataset should save
-    output_path : str, optional
-        string of where the clipped flo1k dataset should be saved, date is used to append to this string to get full output path, by default f"../data/flo_IPB_"
     aoi : geopandas.GeoDataFrame, optional
         GeoDataFrame of area of interest to clip the flo1k dataset, if None the function uses basins_iloc, 
         the aoi can specify a more specific area of interest if needed
+    length : int
+        int of length of how many of the discrete timesteps in a year there are: e.g; 52 (weekly timesteps), 12 (monthly timesteps), (365) (daily timesteps)
+    frequency : str
+        str of what length type (weekly, monthly, daily, etc.) the discrete timestep is, see pandas.data_range() for options
+    time_first : str
+        string of the year where the dataset should start, by default "1960"
+
+    Returns:
+    ---------------------
+    flo_da : xarray.DataSet
+        dataset of streamflow (Q) splined to be seasonally distinct 
     """
     
     
-    flo_one_k = xr.open_dataset(flo1k_path)
+    flo_one_qav = xr.open_dataset(flo1k_qav_path)
+    flo_one_qma = xr.open_dataset(flo1k_qma_path)
+    flo_one_qmi = xr.open_dataset(flo1k_qmi_path)
     basins = gpd.read_file(basins_path)
-
     if aoi is None:
         aoi = basins.iloc[basins_iloc[0]:basins_iloc[1]]
     aoi_lat = [float(aoi.total_bounds[1]), float(aoi.total_bounds[3])]
     aoi_lon = [float(aoi.total_bounds[0]), float(aoi.total_bounds[2])]
 
     if isinstance(date, np.datetime64):
-        flo_aoi_date = flo_one_k["qav"].sel(time = date,
+        flo_qav = flo_one_qav["qav"].sel(time = date,
                                 lon = slice(aoi_lon[0], aoi_lon[1]),
                                 lat = slice(aoi_lat[0], aoi_lat[1]))
-    elif isinstance(date, np.ndarray):
-            flo_aoi_date = flo_one_k["qav"].sel(time = slice(date[0], date[-1]),
+        flo_min = flo_one_qmi["qmi"].sel(time = date,
                             lon = slice(aoi_lon[0], aoi_lon[1]),
                             lat = slice(aoi_lat[0], aoi_lat[1]))
+        flo_max = flo_one_qma["qma"].sel(time = date,
+                            lon = slice(aoi_lon[0], aoi_lon[1]),
+                            lat = slice(aoi_lat[0], aoi_lat[1]))
+    elif isinstance(date, np.ndarray):
+            flo_qav = flo_one_qav["qav"].sel(time = slice(date[0], date[-1]),
+                            lon = slice(aoi_lon[0], aoi_lon[1]),
+                            lat = slice(aoi_lat[0], aoi_lat[1]))
+            flo_min = flo_one_qmi["qmi"].sel(time = slice(date[0], date[-1]),
+                    lon = slice(aoi_lon[0], aoi_lon[1]),
+                    lat = slice(aoi_lat[0], aoi_lat[1]))
+            flo_max = flo_one_qma["qma"].sel(time = slice(date[0], date[-1]),
+                    lon = slice(aoi_lon[0], aoi_lon[1]),
+                    lat = slice(aoi_lat[0], aoi_lat[1]))
 
+    flo_aoi_date = xr.merge([flo_qav, flo_min, flo_max])
     flo_aoi_date.rio.write_crs(aoi.crs, inplace = True)
     flo_aoi_date = flo_aoi_date.rio.clip(aoi.geometry, aoi.crs)
-    if isinstance(date, np.datetime64):
-        output_path = f"{output_path}{pd.Timestamp(date).year}.nc"
-    if isinstance(date, np.ndarray):
-        output_path = f"{output_path}{pd.Timestamp(date[0]).year}-{pd.Timestamp(date[-1]).year}.nc"
-    flo_aoi_date.to_netcdf(output_path)
+
+    # Drop lat/lon bands that are entirely NaN after clipping into the polygon AOI.
+    # This removes the rectangular ocean padding before repeating and interpolation.
+    flo_aoi_date = flo_aoi_date.dropna(dim="lon", how="all", subset=["qav", "qmi", "qma"])
+    flo_aoi_date = flo_aoi_date.dropna(dim="lat", how="all", subset=["qav", "qmi", "qma"])
+
+    if len(flo_aoi_date.lat) == 0 or len(flo_aoi_date.lon) == 0:
+        raise ValueError("No valid land cells remain after dropping ocean-only rows/columns.")
+
+    
+    flo_da = splining(flo_aoi_date, time_first)
+    return flo_da.to_dataset(name="Q")
+
+def splining(flo, time_first):
+    lats = flo.lat
+    lons = flo.lon
+    n_years = len(flo.time)
+    years = pd.DatetimeIndex(flo.time.values)
+    # create continuous time anchors spanning the series (4 seasonal anchors per year)
+    time_anchors = []
+    for i in range(n_years):
+        offset = i * 52
+        # Week 2 (Peak), Week 15 (Mean), Week 28 (Trough), Week 41 (Mean)
+        time_anchors.extend([offset + 2, offset + 15, offset + 28, offset + 41])
+
+    # append the final wrap-around anchor to close the timeline smoothly
+    time_anchors.append(n_years * 52 + 2)
+    time_anchors = np.array(time_anchors)
+
+    # hemisphere-aware baseline mapping
+    # If Lat >= 0 (North): winter max occurs first, summer min occurs in the middle
+    # If Lat < 0 (South): summer min occurs first, winter max occurs in the middle
+    y_0 = xr.where(flo["qmi"].lat >= 0, flo["qma"], flo["qmi"])
+    y_2 = xr.where(flo["qmi"].lat >= 0, flo["qmi"], flo["qma"])
+    y_1 = flo["qav"]
+    y_3 = flo["qav"]
+
+    # only interpolate land cells with valid data for all three variables over time.
+    valid_mask = (
+        np.isfinite(flo["qav"]) &
+        np.isfinite(flo["qmi"]) &
+        np.isfinite(flo["qma"])
+    ).all(dim="time")
+    if valid_mask.sum().item() == 0:
+        raise ValueError("No valid land cells remain for interpolation.")
+
+    valid_points = valid_mask.stack(point=("lat", "lon"))
+    point_indices = np.where(valid_points.values)[0]
+
+    # stack seasonal coordinates sequentially and filter to land points only.
+    y_stacked = xr.concat([y_0, y_1, y_2, y_3], dim="season")
+    y_stacked = y_stacked.transpose("time", "season", "lat", "lon")
+    y_points = y_stacked.stack(point=("lat", "lon")).isel(point=point_indices)
+
+    y_flat = y_points.transpose("time", "season", "point").values.reshape(n_years * 4, -1)
+
+    # grab the final wrap-around value for the same valid land points.
+    wrap_y = y_0.isel(time=-1).stack(point=("lat", "lon")).isel(point=point_indices).values[np.newaxis, :]
+    y_final = np.concatenate([y_flat, wrap_y], axis=0)
+
+    # calculate Hermite Slopes (dydx) across the multi-year boundary
+    slopes = np.zeros_like(y_final)
+    odd_indices = np.arange(1, len(time_anchors), 2)
+
+    dy = y_final[odd_indices + 1] - y_final[odd_indices - 1]
+    dx = time_anchors[odd_indices + 1] - time_anchors[odd_indices - 1]
+
+
+    slopes[odd_indices] = dy / dx.reshape(-1, 1)
+
+    # build the 52-week per year target prediction timeline
+    total_weeks = n_years * 52
+    target_weeks = np.arange(1, total_weeks + 1)
+
+
+    spline = CubicHermiteSpline(x=time_anchors, y=y_final, dydx=slopes)
+    predicted_weekly = spline(target_weeks)
+
+    # clipping
+    predicted_weekly = np.clip(predicted_weekly, 0, None)
+
+    # back to rectangle raster
+    output = np.full((total_weeks, len(lats), len(lons)), np.nan, dtype=predicted_weekly.dtype)
+    lat_idx, lon_idx = np.where(valid_mask.values)
+    output[:, lat_idx, lon_idx] = predicted_weekly
+
+    # Generate a continuous weekly pandas date index starting at time_first
+    time_index = pd.date_range(start=f"{time_first}-01-01", periods=total_weeks, freq="W-MON")
+
+    flo_da = xr.DataArray(
+        output,
+        coords={
+            'time': time_index,
+            'lat': lats,
+            'lon': lons
+        },
+        dims=['time', 'lat', 'lon'],
+        name="Q"
+    )
+
+    print("Splining complete!")
+    print(f"Output shape: {flo_da.shape} (Weeks: {total_weeks}, Lats: {len(lats)}, Lons: {len(lons)})")
+    return flo_da
 
 def hydir_IDs(ds, aoi):
     """Function to convert HydroSHEDS direction dataset to dataset containing unique cell IDs per cell and the ID of where the outflow from that cell goes to
@@ -387,65 +520,6 @@ def cleanup_and_metadata(ds):
     ds["mines"] = ds["mines"].squeeze("band", drop=True)
     return ds
 
-def add_time(ds, length, frequency):
-    """Function to add more discrete timestep to dataset with flo1k annual streamflow (Q) data,
-        returns new dataset
-
-    Parameters
-    ----------
-    ds : xarray.Dataset
-        Dataset to add more discrete timestep to
-    length : int
-        int of length of how many of the discrete timesteps in a year there are: e.g; 52 (weekly timesteps), 12 (monthly timesteps), (365) (daily timesteps)
-    frequency : str
-        str of what length type (weekly, monthly, daily, etc.) the discrete timestep is, see pandas.data_range() for options
-
-    Returns
-    -------
-    ds_new : xarray.Dataset
-        Dataset with years divided into more discrete timesteps
-    """
-    start = ds.time.values[0]
-    n_years = len(ds.time)
-    date_range = pd.date_range(start, periods=n_years * length, freq=frequency)
-
-    Q_repeated = np.repeat(ds["qav"].values, length, axis=0)
-
-    Q_new = xr.DataArray(
-        Q_repeated,
-        dims=["time", "lat", "lon"],
-        coords={
-            "time": date_range,
-            "lat": ds.lat,
-            "lon": ds.lon,
-        },
-        attrs={
-            "units": "m3/s",
-            "description": f"annual average streamflow"
-        }
-    )
-
-    # start with Q, then add back every other data variable from the original
-    ds_new = xr.Dataset({"Q": Q_new})
-    for var in ds.data_vars:
-        if var != "qav":
-            # repeat static variables to match the new time dimension
-            if "time" in ds[var].dims:
-                var_repeated = np.repeat(ds[var].values, length, axis=0)
-                ds_new[var] = xr.DataArray(
-                    var_repeated,
-                    dims=["time", "lat", "lon"],
-                    coords={"time": date_range, "lat": ds.lat, "lon": ds.lon}
-                )
-            else:
-                ds_new[var] = ds[var]
-
-    # restore non-time scalar coordinates (
-    for coord in ds.coords:
-        if coord not in ("time", "lat", "lon") and coord not in ds_new.coords:
-            ds_new[coord] = ds[coord]
-
-    return ds_new
 
 def estimate_ore(ds, F, ox_range = 27):
     """Function convert a dataset with only if mines are there (dataset["mines"], 1 = mine, 0 = no mine) to a dataset containing variable "ore" which has an estimate ore amount in square metre 
