@@ -23,8 +23,8 @@ class AMDModel:
                     buffer_capacity = 0.0, mannings = 0.044, max_substeps = 100):
         """class initialisation
 
-        Parameters
-        ----------
+        Parameters:
+        -------------------
         dataset : xr.Dataset
             dataset containing variables: Q (time, lat, lon), ore (lat, lon), ID (lat, lon), outID (lat, lon), source (lat, lon), slope (lat, lon)
         t_unit : str
