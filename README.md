@@ -38,13 +38,13 @@ As the codebase uses a mixture of Python and Cython code the setup and compilati
 
 <!-- Data -->
 ## Data
-The AMDFLOW model needs a large amount of input data as a single xarray Dataset as input (this input into the AMDModel class). The used datasets will be shown here. 
+The AMDFLOW model needs a large amount of input data as a single xarray Dataset as input (input into the AMDModel class). The used datasets will be shown here. 
 
 Other data can also be used as long as they are input into the AMDModel class as an xarray Dataset with the variables: Q (time, lat, lon), ore (lat, lon), ID (lat, lon), outID (lat, lon), source (lat, lon), slope (lat, lon). These variables correspond to streamflow (Q m3/s), the amount of reactive surface area of pyrite (ore m2), unique ID per cell (ID), cell ID of where a cells flow goes to (outID), if the cell has no inflow (source), and the terrain/stream slope (slope) respectively. 
 
 ### The used data for the main model is as follows:
 
- - [FLO1K](https://springernature.figshare.com/collections/FLO1K_global_maps_of_mean_maximum_and_minimum_annual_streamflow_at_1_km_resolution_from_1960_through_2015/3890224): Global raster dataset at 30 arc seconds of annual average streamflow produced through machine learning methods (Barbarossa et al. 2018).
+ - [FLO1K](https://springernature.figshare.com/collections/FLO1K_global_maps_of_mean_maximum_and_minimum_annual_streamflow_at_1_km_resolution_from_1960_through_2015/3890224): Global raster dataset at 30 arc seconds of annual minimum, maximum, and average streamflow produced through machine learning methods (Barbarossa et al. 2018).
 
   - [HydroSHEDS con. DEM](https://www.hydrosheds.org/products/hydrosheds): Elevation data at 3 arc seconds (Lehner et al. 2008), is coarsened to 30 arc seconds in case study jupyter notebooks using bilinear resampling. Used to derive slope (see case studies).
 
